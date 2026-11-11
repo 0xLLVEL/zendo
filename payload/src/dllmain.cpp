@@ -43,6 +43,10 @@ struct Peb {
 
 namespace zendo {
 
+// The CRT normally provides this marker; a float in the profile needs it or
+// the linker refuses _fltused.
+extern "C" int _fltused = 1;
+
 constexpr DWORD fnv1a(const char* s, DWORD h = 2166136261u) {
     return *s ? fnv1a(s + 1, (h ^ static_cast<unsigned char>(*s)) * 16777619u) : h;
 }
@@ -120,6 +124,7 @@ struct Api {
     using FlushICache_t = BOOL(WINAPI*)(HANDLE, LPCVOID, SIZE_T);
     using AddVeh_t = void*(WINAPI*)(ULONG, void*);
     using RtlAddTable_t = unsigned char(WINAPI*)(void*, unsigned long, unsigned long long);
+    using SetCfgTargets_t = BOOL(WINAPI*)(HANDLE, void*, SIZE_T, ULONG, void*);
 
     CreateFileA_t CreateFileA;
     WriteFile_t WriteFile;
@@ -132,6 +137,7 @@ struct Api {
     FlushICache_t FlushInstructionCache;
     AddVeh_t AddVectoredExceptionHandler;
     RtlAddTable_t RtlAddFunctionTable;
+    SetCfgTargets_t SetProcessValidCallTargets;
 };
 
 inline Api& api() {
@@ -158,6 +164,12 @@ inline DWORD resolve_api() {
         reinterpret_cast<Api::AddVeh_t>(find_export(k32.base, fnv1a("AddVectoredExceptionHandler")));
     a.RtlAddFunctionTable =
         reinterpret_cast<Api::RtlAddTable_t>(find_export(k32.base, fnv1a("RtlAddFunctionTable")));
+    // Only KernelBase exports this one; Kernel32 does not forward it.
+    Module kbase = find_module(fnv1a_w(L"kernelbase.dll"));
+    if (kbase.base) {
+        a.SetProcessValidCallTargets = reinterpret_cast<Api::SetCfgTargets_t>(
+            find_export(kbase.base, fnv1a("SetProcessValidCallTargets")));
+    }
     if (!a.CreateFileA) return 11;
     if (!a.WriteFile) return 12;
     if (!a.ReadFile) return 13;
@@ -1685,6 +1697,15 @@ inline void dump_val(Out& o, const char* tag, unsigned long long slot) {
             o.str("'");
         }
     }
+    if (tt >= 4 && tt <= 8 && v && readable(reinterpret_cast<const void*>(v), 0x30)) {
+        unsigned char isC = *reinterpret_cast<unsigned char*>(v + 5);
+        unsigned long long boxed = 0;
+        read_u64(v + (isC ? 0x28 : 0x18), &boxed);
+        o.str(" isC=");
+        o.dec(isC);
+        o.str(isC ? " f=" : " proto=");
+        o.hex(boxed);
+    }
     o.nl();
 }
 
@@ -2355,6 +2376,300 @@ inline void close_upvals(unsigned long long L, unsigned long long level,
 // luaD_rawrunprotected (0x26360B0) catches the C++ throw, and its callback is
 // Roblox's CallContext::run (0x2632230), so control-flow guard accepts the
 // target. The chunk frame sits directly under the try block.
+// --- print capture ---------------------------------------------------------
+// The sandbox's `print` is a C closure inside the client image. We keep that
+// closure and swap its function pointer around every chunk, so whatever the
+// script prints also reaches the pipe as a `P` line.
+static const unsigned char kChunkPrint[] = {
+    0x0e, 0x03, 0x01, 0x05, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x00, 0x01, 0x21,
+    0x01, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x04, 0xa3, 0x00, 0x00, 0x00, 0x35,
+    0x00, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x82, 0x00, 0x02, 0x00, 0x01,
+    0x03, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+};
+static const unsigned int kChunkPrintLen = sizeof(kChunkPrint);
+
+// print("probe", 1, true, nil, 2.5) — used by the capture probes below.
+static const unsigned char kChunkProbe[] = {
+    0x0e, 0x03, 0x02, 0x05, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x05, 0x70, 0x72,
+    0x6f, 0x62, 0x65, 0x00, 0x01, 0x4d, 0x06, 0x00, 0x00, 0x01, 0x0a, 0x00,
+    0x0a, 0xa3, 0x00, 0x00, 0x00, 0x35, 0x00, 0x00, 0x46, 0x00, 0x00, 0x00,
+    0x00, 0x6f, 0x01, 0x01, 0x00, 0x6f, 0x02, 0x02, 0x00, 0xa9, 0x03, 0x01,
+    0x00, 0xc6, 0x04, 0x00, 0x00, 0x6f, 0x05, 0x03, 0x00, 0x9f, 0x00, 0x06,
+    0x01, 0x82, 0x00, 0x01, 0x00, 0x04, 0x03, 0x01, 0x03, 0x02, 0x02, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x02, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x04, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00,
+};
+static const unsigned int kChunkProbeLen = sizeof(kChunkProbe);
+
+// Print capture, Lua side. The C hook is dead: the client's CFG bitmap has no
+// valid bit for a manual-mapped page, so the VM's indirect call into our own
+// `print` hook is a guard violation that kills the process before the hook's
+// first instruction runs. Wrapping `print` in Lua instead costs nothing and
+// never leaves the VM.
+//
+// capi:   print = function(...) buffer the joined arguments end ; buffer global
+// flush:  join the buffer, clear it, return the text
+static const unsigned char kChunkCapi[] = {
+    0x0e, 0x03, 0x0d, 0x06, 0x73, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x01, 0x23,
+    0x08, 0x74, 0x6f, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x05, 0x74, 0x61,
+    0x62, 0x6c, 0x65, 0x06, 0x63, 0x6f, 0x6e, 0x63, 0x61, 0x74, 0x01, 0x09,
+    0x01, 0x20, 0x05, 0x77, 0x61, 0x72, 0x6e, 0x3a, 0x08, 0x5f, 0x5f, 0x7a,
+    0x6e, 0x64, 0x5f, 0x6f, 0x70, 0x05, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x04,
+    0x77, 0x61, 0x72, 0x6e, 0x08, 0x5f, 0x5f, 0x7a, 0x6e, 0x64, 0x5f, 0x6f,
+    0x77, 0x05, 0x5f, 0x5f, 0x7a, 0x6e, 0x64, 0x00, 0x04, 0xe1, 0x01, 0x0b,
+    0x02, 0x01, 0x01, 0x00, 0x00, 0x2e, 0xa3, 0x02, 0x00, 0x00, 0x35, 0x02,
+    0x00, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x6f, 0x03, 0x01, 0x00, 0xdd, 0x04,
+    0x00, 0x00, 0x9f, 0x02, 0x00, 0x02, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x6f, 0x06, 0x02, 0x00, 0x52, 0x04, 0x02, 0x00, 0x8c, 0x05,
+    0x01, 0x00, 0xa8, 0x04, 0x0b, 0x00, 0x35, 0x07, 0x00, 0x05, 0x03, 0x00,
+    0x00, 0x00, 0x35, 0x08, 0x00, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x52, 0x09,
+    0x06, 0x00, 0xdd, 0x0a, 0x00, 0x00, 0x9f, 0x08, 0x00, 0x02, 0x25, 0x07,
+    0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x07, 0x03, 0x06, 0x8b, 0x04,
+    0xf5, 0xff, 0x35, 0x04, 0x00, 0x4b, 0x04, 0x00, 0x00, 0x00, 0x4d, 0x04,
+    0x04, 0x1a, 0x05, 0x00, 0x00, 0x00, 0x52, 0x05, 0x03, 0x00, 0x6f, 0x06,
+    0x06, 0x00, 0x25, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00, 0x0e, 0x01,
+    0x04, 0x00, 0x52, 0x05, 0x01, 0x00, 0x6f, 0x06, 0x07, 0x00, 0x52, 0x07,
+    0x04, 0x00, 0x73, 0x04, 0x05, 0x07, 0xfb, 0x05, 0x00, 0x00, 0xfb, 0x08,
+    0x00, 0x00, 0x1c, 0x07, 0x08, 0x00, 0x6f, 0x08, 0x02, 0x00, 0x43, 0x06,
+    0x07, 0x08, 0x6a, 0x04, 0x05, 0x06, 0x52, 0x05, 0x00, 0x00, 0xdd, 0x06,
+    0x00, 0x00, 0x9f, 0x05, 0x00, 0x00, 0x82, 0x05, 0x00, 0x00, 0x08, 0x03,
+    0x01, 0x03, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f,
+    0x03, 0x03, 0x03, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x07, 0x00, 0x09,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x13, 0x00, 0x1d, 0x2a, 0x04, 0x00, 0x02,
+    0x01, 0x00, 0x00, 0x07, 0xa3, 0x00, 0x00, 0x00, 0xfb, 0x00, 0x00, 0x00,
+    0xfb, 0x01, 0x01, 0x00, 0xc6, 0x02, 0x00, 0x00, 0xdd, 0x03, 0x00, 0x00,
+    0x9f, 0x00, 0x00, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00,
+    0x00, 0x00, 0x00, 0x2c, 0x04, 0x00, 0x02, 0x01, 0x00, 0x00, 0x07, 0xa3,
+    0x00, 0x00, 0x00, 0xfb, 0x00, 0x00, 0x00, 0xfb, 0x01, 0x01, 0x00, 0x6f,
+    0x02, 0x00, 0x00, 0xdd, 0x03, 0x00, 0x00, 0x9f, 0x00, 0x00, 0x00, 0x82,
+    0x00, 0x00, 0x00, 0x01, 0x03, 0x08, 0x00, 0x13, 0x00, 0x00, 0x00, 0x00,
+    0xb5, 0x01, 0x05, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x24, 0xa3, 0x00, 0x00,
+    0x00, 0x35, 0x00, 0x00, 0xe7, 0x00, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x08,
+    0x00, 0x35, 0x00, 0x00, 0x46, 0x01, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00,
+    0xe7, 0x00, 0x00, 0x00, 0x00, 0x35, 0x01, 0x00, 0x83, 0x02, 0x00, 0x00,
+    0x00, 0x18, 0x01, 0x00, 0x8d, 0x03, 0x00, 0x00, 0x00, 0x35, 0x01, 0x00,
+    0x8d, 0x03, 0x00, 0x00, 0x00, 0x2b, 0x01, 0x02, 0x00, 0x35, 0x01, 0x00,
+    0x83, 0x02, 0x00, 0x00, 0x00, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xd9, 0x03, 0x00, 0x00, 0x12, 0x00, 0x02, 0x00, 0xd9, 0x04, 0x01,
+    0x00, 0x12, 0x00, 0x03, 0x00, 0x12, 0x01, 0x00, 0x00, 0x18, 0x04, 0x00,
+    0x46, 0x01, 0x00, 0x00, 0x00, 0xd9, 0x04, 0x02, 0x00, 0x12, 0x00, 0x03,
+    0x00, 0x12, 0x00, 0x01, 0x00, 0x18, 0x04, 0x00, 0x83, 0x02, 0x00, 0x00,
+    0x00, 0x18, 0x02, 0x00, 0xcb, 0x04, 0x00, 0x00, 0x00, 0x6f, 0x04, 0x05,
+    0x00, 0xc1, 0x00, 0x00, 0x00, 0x82, 0x04, 0x02, 0x00, 0x06, 0x03, 0x09,
+    0x03, 0x0a, 0x03, 0x0b, 0x03, 0x0c, 0x03, 0x0d, 0x02, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xf0, 0x3f, 0x03, 0x00, 0x01, 0x02, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x35, 0x03,
+};
+static const unsigned int kChunkCapiLen = sizeof(kChunkCapi);
+
+static const unsigned char kChunkFlush[] = {
+    0x0e, 0x03, 0x06, 0x05, 0x5f, 0x5f, 0x7a, 0x6e, 0x64, 0x04, 0x74, 0x79,
+    0x70, 0x65, 0x05, 0x74, 0x61, 0x62, 0x6c, 0x65, 0x00, 0x06, 0x63, 0x6f,
+    0x6e, 0x63, 0x61, 0x74, 0x01, 0x0a, 0x00, 0x01, 0x94, 0x01, 0x06, 0x00,
+    0x00, 0x01, 0x08, 0x00, 0x1c, 0xa3, 0x00, 0x00, 0x00, 0x35, 0x00, 0x00,
+    0xcb, 0x00, 0x00, 0x00, 0x00, 0x35, 0x01, 0x00, 0x71, 0x01, 0x00, 0x00,
+    0x00, 0x52, 0x02, 0x00, 0x00, 0x9f, 0x01, 0x02, 0x02, 0x6f, 0x02, 0x02,
+    0x00, 0xf1, 0x01, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x6f, 0x01, 0x03,
+    0x00, 0x82, 0x01, 0x02, 0x00, 0x35, 0x01, 0x00, 0x4b, 0x02, 0x00, 0x00,
+    0x00, 0x4d, 0x01, 0x01, 0x1a, 0x04, 0x00, 0x00, 0x00, 0x52, 0x02, 0x00,
+    0x00, 0x6f, 0x03, 0x05, 0x00, 0x9f, 0x01, 0x03, 0x02, 0x1c, 0x04, 0x00,
+    0x00, 0x6f, 0x02, 0x06, 0x00, 0x6f, 0x05, 0x06, 0x00, 0x39, 0x03, 0x05,
+    0x00, 0xa8, 0x02, 0x03, 0x00, 0xc6, 0x05, 0x00, 0x00, 0x6a, 0x05, 0x00,
+    0x04, 0x8b, 0x02, 0xfd, 0xff, 0x82, 0x01, 0x02, 0x00, 0x07, 0x03, 0x01,
+    0x03, 0x02, 0x03, 0x03, 0x03, 0x04, 0x03, 0x05, 0x03, 0x06, 0x02, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x16, 0x00,
+};
+static const unsigned int kChunkFlushLen = sizeof(kChunkFlush);
+
+static unsigned long long g_cap_closure = 0;
+static unsigned long long g_cap_f = 0;
+static HANDLE g_cap_pipe = INVALID_HANDLE_VALUE;
+static int g_cap_mode = 0;   // 0 = untouched, 1 = swap only, 2 = +read args, 3 = +pipe
+static unsigned int g_cap_calls = 0;
+
+inline void cap_put(const char* s, unsigned int n) {
+    if (g_cap_pipe == INVALID_HANDLE_VALUE) return;
+    static char line[4224];
+    unsigned int k = 0;
+    line[k++] = 'P';
+    for (unsigned int i = 0; i < n && k < sizeof(line) - 2; ++i) {
+        char c = s[i];
+        line[k++] = (c == '\n' || c == '\r') ? ' ' : c;
+    }
+    line[k++] = '\n';
+    DWORD w = 0;
+    api().WriteFile(g_cap_pipe, line, k, &w, nullptr);
+}
+
+inline void cap_double(char* d, unsigned int& n, double x) {
+    if (x != x) { d[n++] = 'n'; d[n++] = 'a'; d[n++] = 'n'; return; }
+    bool neg = x < 0.0;
+    if (neg) x = -x;
+    if (x > 1.0e15) { d[n++] = 'i'; d[n++] = 'n'; d[n++] = 'f'; return; }
+    unsigned long long ip = static_cast<unsigned long long>(x);
+    double frac = x - static_cast<double>(ip);
+    char tmp[24];
+    int td = 0;
+    if (!ip) tmp[td++] = '0';
+    while (ip) { tmp[td++] = static_cast<char>('0' + ip % 10ull); ip /= 10ull; }
+    if (neg) d[n++] = '-';
+    while (td) d[n++] = tmp[--td];
+    if (frac > 0.0) {
+        d[n++] = '.';
+        for (int k = 0; k < 6; ++k) {
+            frac *= 10.0;
+            int digit = static_cast<int>(frac);
+            if (digit < 0) digit = 0;
+            if (digit > 9) digit = 9;
+            d[n++] = static_cast<char>('0' + digit);
+            frac -= static_cast<double>(digit);
+            if (frac <= 0.0) break;
+        }
+    }
+}
+
+inline void cap_value(char* d, unsigned int& n, unsigned long long slot) {
+    if (n > 1900) return;
+    unsigned long long v = 0, w = 0;
+    if (!read_u64(slot, &v) || !read_u64(slot + 8, &w)) return;
+    unsigned int tt = static_cast<unsigned int>((w >> 32) & 0xff);
+    if (tt == 6 && v && readable(reinterpret_cast<const void*>(v + 0x18), 4)) {
+        unsigned int len = 0;
+        read_u32(v + 0x14, &len);
+        if (len > 1000) len = 1000;
+        for (unsigned int i = 0; i < len && n < 2040; ++i)
+            d[n++] = *reinterpret_cast<char*>(v + 0x18 + i);
+        return;
+    }
+    if (tt == 3) {
+        union { unsigned long long u; double f; } cv;
+        cv.u = v;
+        cap_double(d, n, cv.f);
+        return;
+    }
+    if (tt == 0) { d[n++] = 'n'; d[n++] = 'i'; d[n++] = 'l'; return; }
+    if (tt == 1) {
+        const char* b = (v & 0xffull) ? "true" : "false";
+        while (*b) d[n++] = *b++;
+        return;
+    }
+    if (tt == 8) {
+        const char* b = "function";
+        while (*b) d[n++] = *b++;
+        return;
+    }
+    d[n++] = '<';
+    d[n++] = static_cast<char>('0' + tt % 10);
+    d[n++] = '>';
+}
+
+inline int cap_print(void* L) {
+    stage_mark(api(), "H1");
+    ++g_cap_calls;
+    if (g_cap_mode >= 2) {
+        unsigned long long base = 0, top = 0;
+        read_u64(reinterpret_cast<unsigned long long>(L) + 0x58, &base);
+        read_u64(reinterpret_cast<unsigned long long>(L) + 0x60, &top);
+        static char d[2048];
+        unsigned int n = 0;
+        unsigned long long count = top > base ? (top - base) / 16ull : 0;
+        if (count > 24) count = 24;
+        for (unsigned long long i = 0; i < count && n < 1900; ++i) {
+            if (i) d[n++] = '\t';
+            cap_value(d, n, base + 16ull * i);
+        }
+        if (g_cap_mode >= 3) cap_put(d, n);
+    }
+    if (g_cap_f) {
+        stage_mark(api(), "H2");
+        int rc = reinterpret_cast<int (*)(void*)>(g_cap_f)(L);
+        stage_mark(api(), "H3");
+        return rc;
+    }
+    stage_mark(api(), "H4");
+    return 0;
+}
+
+struct CfgCallTargetInfo {
+    unsigned long long Offset;
+    unsigned long long Flags;
+};
+static int g_cfg_status = -99;
+
+// A manual map is invisible to the loader, so the CFG bitmap has no valid bit
+// for our pages. The first indirect call the client makes into the payload --
+// the VM invoking the swapped print pointer -- is then a control flow guard
+// violation, which terminates the process without a trace. Register the hook's
+// page as a legal call target.
+inline int cfg_register(void* target) {
+    Api& a = api();
+    if (!a.SetProcessValidCallTargets) return -1;
+    unsigned long long t = reinterpret_cast<unsigned long long>(target);
+    unsigned long long page = t & ~0xfffull;
+    static CfgCallTargetInfo info[256];
+    for (unsigned int i = 0; i < 256; ++i) {
+        info[i].Offset = 16ull * i;
+        info[i].Flags = 1;  // CFG_CALL_TARGET_VALID
+    }
+    HANDLE self = reinterpret_cast<HANDLE>(static_cast<long long>(-1));
+    if (a.SetProcessValidCallTargets(self, reinterpret_cast<void*>(page), 0x1000, 256, info)) return 0;
+    int err = static_cast<int>(a.GetLastError());
+    // Some builds insist the address be the allocation base; retry that way.
+    unsigned long long base = self_image_base();
+    unsigned long long size = self_image_size(base);
+    if (base && page >= base) {
+        unsigned long long off = page - base;
+        for (unsigned int i = 0; i < 256; ++i) info[i].Offset = off + 16ull * i;
+        if (a.SetProcessValidCallTargets(self, reinterpret_cast<void*>(base),
+                                         static_cast<SIZE_T>(size), 256, info))
+            return 0;
+        err = static_cast<int>(a.GetLastError());
+    }
+    return err;
+}
+
+inline void cap_install() {
+    if (g_cap_mode >= 1 && g_cap_closure && g_cap_f) {
+        g_cfg_status = cfg_register(reinterpret_cast<void*>(&cap_print));
+        wr64(g_cap_closure + 0x28, reinterpret_cast<unsigned long long>(&cap_print));
+    }
+}
+
+inline void cap_restore() {
+    if (g_cap_closure && g_cap_f) wr64(g_cap_closure + 0x28, g_cap_f);
+}
+
+static bool g_flush_next = false;
+
+// The `P` protocol: one line per captured print, written straight to the dev
+// pipe. The UI turns each into a `» ` line.
+inline void emit_capture(unsigned long long slot) {
+    unsigned long long v = 0, w = 0;
+    if (!read_u64(slot, &v) || !read_u64(slot + 8, &w)) return;
+    if (static_cast<unsigned int>((w >> 32) & 0xff) != 6 || !v) return;
+    unsigned int len = 0;
+    read_u32(v + 0x14, &len);
+    if (len > 65536) len = 65536;
+    static char line[4096];
+    unsigned int k = 0;
+    for (unsigned int i = 0; i < len; ++i) {
+        char c = *reinterpret_cast<char*>(v + 0x18 + i);
+        if (c == '\n') {
+            if (k) cap_put(line, k);
+            k = 0;
+            continue;
+        }
+        if (c == '\r') continue;
+        if (k + 1 >= sizeof(line)) {
+            cap_put(line, k);
+            k = 0;
+        }
+        line[k++] = c;
+    }
+    if (k) cap_put(line, k);
+}
+
 inline int exec_raw(Api& a, HANDLE pipe, Out& o, unsigned long long L,
                     unsigned long long base, const unsigned char* body,
                     unsigned int len, const char* tag) {
@@ -2474,8 +2789,11 @@ inline int exec_raw(Api& a, HANDLE pipe, Out& o, unsigned long long L,
     ProtFn prot = reinterpret_cast<ProtFn>(base + 0x26360B0);
 
     beacon(a, "PRE");
+    if (pipe != INVALID_HANDLE_VALUE) g_cap_pipe = pipe;
+    cap_install();
     int st = prot(reinterpret_cast<void*>(L),
                   reinterpret_cast<void*>(base + 0x2632230), &ctx);
+    cap_restore();
     beacon(a, "POST");
 
     wr64(L + 0x38, cc);
@@ -2515,6 +2833,7 @@ inline int exec_raw(Api& a, HANDLE pipe, Out& o, unsigned long long L,
         o.hex(after);
         o.nl();
         dump_val(o, "err", oldtop);
+        emit_capture(oldtop);
         wr64(L + 0x60, oldtop);
         flush_out(a, pipe, o);
         return 2;
@@ -2534,13 +2853,46 @@ inline int exec_raw(Api& a, HANDLE pipe, Out& o, unsigned long long L,
     unsigned long long n = (t2 - top0) / 16;
     if (n > 8) n = 8;
     for (unsigned long long k = 0; k < n; ++k) {
+        if (!g_cap_closure) {
+            unsigned long long cv = 0, cw = 0;
+            read_u64(top0 + 16ull * k, &cv);
+            read_u64(top0 + 16ull * k + 8, &cw);
+            unsigned int ctt = static_cast<unsigned int>((cw >> 32) & 0xff);
+            if (ctt == 8 && cv && readable(reinterpret_cast<const void*>(cv), 0x30) &&
+                *reinterpret_cast<unsigned char*>(cv + 5)) {
+                unsigned long long cf = 0;
+                read_u64(cv + 0x28, &cf);
+                if (cf) {
+                    g_cap_closure = cv;
+                    g_cap_f = cf;
+                    o.str(tag);
+                    o.str(" captured print clo=");
+                    o.hex(cv);
+                    o.str(" f=");
+                    o.hex(cf);
+                    o.nl();
+                }
+            }
+        }
         char tag2[8] = {tag[0], tag[1], ' ', 'r', 0, 0, 0, 0};
         tag2[4] = static_cast<char>('0' + static_cast<int>(k));
         dump_val(o, tag2, top0 + 16ull * k);
     }
+    if (g_flush_next && n > 0) emit_capture(top0);
     wr64(L + 0x60, top0);
     flush_out(a, pipe, o);
     return 1;
+}
+
+// Runs the flush chunk with the report pipe muted: the payload's chatter would
+// otherwise flood the UI on every script. Only `P` lines survive.
+inline void flush_capture(Api& a, Out& o, unsigned long long L, unsigned long long base) {
+    if (g_cap_pipe == INVALID_HANDLE_VALUE) return;
+    static Out quiet;
+    quiet.reset();
+    g_flush_next = true;
+    exec_raw(a, INVALID_HANDLE_VALUE, quiet, L, base, kChunkFlush, kChunkFlushLen, "flush");
+    g_flush_next = false;
 }
 
 inline DWORD run_pcall() {
@@ -6447,6 +6799,12 @@ inline DWORD run_repl() {
     g_veh_base = base;
     g_veh_L = L;
 
+    // Lua-side print capture. Every later chunk's `print` output lands in a
+    // buffer this same thread drains after the chunk returns.
+    g_cap_pipe = pipe;
+    exec_raw(a, pipe, o, L, base, kChunkCapi, kChunkCapiLen, "capi");
+    flush_capture(a, o, L, base);
+
     for (;;) {
         stage_mark(a, "RDY");
         o.str("RDY\n");
@@ -6480,7 +6838,29 @@ inline DWORD run_repl() {
             flush_out(a, pipe, o);
             stage_mark(a, "EXEC");
             exec_raw(a, pipe, o, L, base, lbuf, blen, "raw dyn");
+            flush_capture(a, o, L, base);
             stage_mark(a, "DONE");
+            continue;
+        }
+        if (cmd[0] == 'j' || cmd[0] == 'h' || cmd[0] == 'H' || cmd[0] == 'J') {
+            int saved = g_cap_mode;
+            g_cap_mode = (cmd[0] == 'j') ? 0 : (cmd[0] == 'h') ? 1 : (cmd[0] == 'H') ? 2 : 3;
+            o.str("probe mode=");
+            o.dec(g_cap_mode);
+            o.str(" clo=");
+            o.hex(g_cap_closure);
+            o.str(" f=");
+            o.hex(g_cap_f);
+            o.nl();
+            flush_out(a, pipe, o);
+            exec_raw(a, pipe, o, L, base, kChunkProbe, kChunkProbeLen, "probe");
+            o.str("probe calls=");
+            o.dec(g_cap_calls);
+            o.str(" cfg=");
+            o.dec(static_cast<unsigned int>(g_cfg_status));
+            o.nl();
+            flush_out(a, pipe, o);
+            g_cap_mode = saved;
             continue;
         }
         if (cmd[0] == 'P' || cmd[0] == 'E' || cmd[0] == 'S' || cmd[0] == 'T' || cmd[0] == 'R' || cmd[0] == 'V' || cmd[0] == 'F' || cmd[0] == 'C' || cmd[0] == 'D' || cmd[0] == 'W' || cmd[0] == 'X') {

@@ -33,8 +33,35 @@ function lineCount() {
   gutter.scrollTop = code.scrollTop;
 }
 
+// The pipe carries the payload's bring-up noise next to the script's own
+// output. Only the script's lines (» …) and real errors are worth showing.
+const NOISE = [
+  /^chunk \d+ bytes, injecting\s*$/,
+  /^zendo-inject\b/,
+  /^ {2}(remote image|reloc dir|resolved|wrote|DllMain|hijack)/,
+  /^\[z\] /,
+  /^\[pipe\] /,
+  /^(REPL|ZEND1|RDY|END|EXITCODE)\b/,
+  /^(capi|flush|raw dyn|probe|cap)\b.*\b(load ret|PROTO80|raw|done|st=|ci=|r\d|err)\b/,
+  /^(ca|ra) r\d /,
+  /^err tt=/,
+  /^RUN\b/,
+  /^f=0x[0-9a-f]+$/,
+  /^len=\d+/,
+];
+
+function clean(text) {
+  return text
+    .split("\n")
+    .filter((line) => line.length === 0 || !NOISE.some((re) => re.test(line)))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
 function append(text, cls) {
   const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
+  text = clean(text);
+  if (!text) return;
   if (cls) {
     const span = document.createElement("span");
     span.className = cls;

@@ -340,7 +340,7 @@ fn section_protections(bytes: &[u8]) -> Vec<(usize, usize, u32)> {
 
 /// Prefer a thread parked inside an ntdll wait: its stack is shallow and its
 /// user-mode state is a syscall return, so an abandoned frame costs nothing.
-fn pick_thread(pid: u32) -> Option<u32> {
+fn pick_threads(pid: u32) -> Vec<u32> {
     unsafe fn wait_ranges() -> Vec<(u64, u64)> {
         let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr() as *const i8);
         if ntdll.is_null() {
@@ -367,17 +367,14 @@ fn pick_thread(pid: u32) -> Option<u32> {
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if snap as usize == usize::MAX {
-            return None;
+            return Vec::new();
         }
         let mut te: ThreadEntry32 = std::mem::zeroed();
         te.dw_size = std::mem::size_of::<ThreadEntry32>() as u32;
-        let mut found: Option<u32> = None;
+        let mut out = Vec::new();
         let mut ok = Thread32First(snap, &mut te);
         while ok != 0 {
             if te.th32_owner_process_id == pid {
-                if found.is_none() {
-                    found = Some(te.th32_thread_id);
-                }
                 let ranges = wait_ranges();
                 let th = OpenThread(THREAD_ALL_ACCESS, 0, te.th32_thread_id);
                 if !th.is_null() {
@@ -386,9 +383,7 @@ fn pick_thread(pid: u32) -> Option<u32> {
                     if GetThreadContext(th, ctx.0.as_mut_ptr()) != 0 {
                         let rip = u64::from_le_bytes(ctx.0[0xF8..0x100].try_into().unwrap());
                         if ranges.iter().any(|&(a, b)| rip >= a && rip < b) {
-                            CloseHandle(th);
-                            CloseHandle(snap);
-                            return Some(te.th32_thread_id);
+                            out.push(te.th32_thread_id);
                         }
                     }
                     CloseHandle(th);
@@ -397,8 +392,12 @@ fn pick_thread(pid: u32) -> Option<u32> {
             ok = Thread32Next(snap, &mut te);
         }
         CloseHandle(snap);
-        found
+        out
     }
+}
+
+fn pick_thread(pid: u32) -> Option<u32> {
+    pick_threads(pid).into_iter().next()
 }
 
 fn pick_first(pid: u32) -> Option<u32> {
@@ -423,21 +422,24 @@ fn pick_first(pid: u32) -> Option<u32> {
     }
 }
 
-fn hijack(proc: Handle, pid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64,
-          prefer_main: bool) -> Result<u32, String> {
-    // Run the stub on a live thread of the target, then put its context back
-    // exactly as it was. No thread is created inside the game.
-    let tid = if prefer_main { pick_first(pid) } else { pick_thread(pid) }
-        .ok_or("no thread found")?;
+enum Attempt {
+    Finished(u32),
+    Running,
+    Retry(String),
+    Fatal(String),
+}
 
+fn hijack_on(proc: Handle, tid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64) -> Attempt {
     let th = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, tid) };
     if th.is_null() {
-        return Err(format!("OpenThread {tid}: {}", std::io::Error::last_os_error()));
+        return Attempt::Retry(format!("OpenThread {tid}: {}", std::io::Error::last_os_error()));
     }
-
     let mut wrote = 0usize;
     let ok = unsafe { WriteProcessMemory(proc, stub_addr as *mut c_void, stub.as_ptr() as *const c_void, stub.len(), &mut wrote) };
-    if ok == 0 { return Err("stub write failed".into()); }
+    if ok == 0 {
+        unsafe { CloseHandle(th); }
+        return Attempt::Fatal("stub write failed".into());
+    }
     let mut zero = [0u8; 16];
     unsafe { WriteProcessMemory(proc, flag_addr as *mut c_void, zero.as_ptr() as *const c_void, 16, &mut wrote); }
 
@@ -447,7 +449,7 @@ fn hijack(proc: Handle, pid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64,
     saved.0[0x30..0x34].copy_from_slice(&0x0010_000Bu32.to_le_bytes());
     if unsafe { GetThreadContext(th, saved.0.as_mut_ptr()) } == 0 {
         unsafe { ResumeThread(th); CloseHandle(th); }
-        return Err("GetThreadContext failed".into());
+        return Attempt::Retry("GetThreadContext failed".into());
     }
 
     let rip = u64::from_le_bytes(saved.0[0xF8..0x100].try_into().unwrap());
@@ -461,34 +463,62 @@ fn hijack(proc: Handle, pid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64,
     patched.0[0x30..0x34].copy_from_slice(&0x0010_000Bu32.to_le_bytes());
     if unsafe { SetThreadContext(th, patched.0.as_ptr()) } == 0 {
         unsafe { ResumeThread(th); CloseHandle(th); }
-        return Err("SetThreadContext failed".into());
+        return Attempt::Retry("SetThreadContext failed".into());
     }
     unsafe { ResumeThread(th); }
 
-    let mut done = [0u8; 16];
     let mut got = 0usize;
-    let mut finished = false;
-    for _ in 0..750 {
+    let mut state = 0u64;
+    let mut ret = 0u64;
+    for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut buf = [0u8; 16];
         let ok = unsafe { ReadProcessMemory(proc, flag_addr as *const c_void, buf.as_mut_ptr() as *mut c_void, 16, &mut got) };
-        if ok != 0 && u64::from_le_bytes(buf[..8].try_into().unwrap()) == 1 {
-            done = buf;
-            finished = true;
-            break;
+        if ok != 0 {
+            state = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            ret = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            if state == 1 {
+                unsafe { SuspendThread(th); }
+                unsafe { SetThreadContext(th, saved.0.as_ptr()) };
+                unsafe { ResumeThread(th); CloseHandle(th); }
+                return Attempt::Finished(ret as u32);
+            }
         }
     }
-
-    if finished {
-        unsafe { SuspendThread(th); }
-        unsafe { SetThreadContext(th, saved.0.as_ptr()) };
-        unsafe { ResumeThread(th); CloseHandle(th); }
-        return Ok(u32::from_le_bytes(done[8..12].try_into().unwrap()));
+    // A thread Hyperion has parked under its own suspension never runs the
+    // stub at all. Leave it alone and find another one.
+    if state == 0 {
+        unsafe { CloseHandle(th); }
+        return Attempt::Retry("stub never started".into());
     }
-    // DllMain is still running (long-lived REPL). Do not restore: the stub
-    // already overwrote part of this thread's stack.
+    // DllMain is long-lived (REPL). Do not restore: the stub already overwrote
+    // part of this thread's stack.
     unsafe { CloseHandle(th); }
-    Err("stub still running".into())
+    Attempt::Running
+}
+
+fn hijack(proc: Handle, pid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64,
+          prefer_main: bool) -> Result<Attempt, String> {
+    // Run the stub on a live thread of the target, then put its context back
+    // exactly as it was. No thread is created inside the game.
+    let candidates: Vec<u32> = if prefer_main {
+        pick_first(pid).into_iter().collect()
+    } else {
+        pick_threads(pid)
+    };
+    if candidates.is_empty() {
+        return Err("no thread found".into());
+    }
+    let mut last = String::from("no idle thread accepted the stub");
+    for &tid in candidates.iter().take(8) {
+        match hijack_on(proc, tid, stub_addr, stub, flag_addr) {
+            Attempt::Finished(code) => return Ok(Attempt::Finished(code)),
+            Attempt::Running => return Ok(Attempt::Running),
+            Attempt::Fatal(e) => return Err(e),
+            Attempt::Retry(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 fn main() {
@@ -654,14 +684,15 @@ fn main() {
     let flag_addr = stub_addr + 0x800;
 
     if hijack_mode {
-        // flags[0] = done, flags[8] = DllMain result. The injector restores
-        // the saved context once the flag flips. If nobody restores us (the
-        // injector timed out), sleep briefly and end this thread instead of
-        // spinning a core and freezing the game loop.
+        // flags[0]: 0 = untouched, 2 = DllMain started, 1 = returned.
+        // flags[8] = DllMain result. The injector restores the saved context
+        // once the flag flips. If nobody restores us (the injector timed out),
+        // sleep briefly and end this thread instead of spinning a core and
+        // freezing the game loop.
         let mut s: Vec<u8> = Vec::new();
         s.extend_from_slice(&[0x48, 0xB8]);
         s.extend_from_slice(&flag_addr.to_le_bytes());
-        s.extend_from_slice(&[0x48, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        s.extend_from_slice(&[0x48, 0xC7, 0x00, 0x02, 0x00, 0x00, 0x00]);
         s.extend_from_slice(&[0x48, 0xB9]);
         s.extend_from_slice(&remote_base.to_le_bytes());
         s.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
@@ -690,7 +721,9 @@ fn main() {
         s.extend_from_slice(&[0xFF, 0xD7]);
         s.extend_from_slice(&[0xCC]);
         match hijack(proc, target_pid, stub_addr, &s, flag_addr, main_thread) {
-            Ok(code) => println!("  hijack completed, DllMain returned {code}"),
+            Ok(Attempt::Finished(code)) => println!("  hijack completed, DllMain returned {code}"),
+            Ok(Attempt::Running) => println!("  hijack running (DllMain long-lived)"),
+            Ok(Attempt::Retry(_)) | Ok(Attempt::Fatal(_)) => {}
             Err(e) => println!("  hijack failed: {e}"),
         }
         unsafe { CloseHandle(proc); }

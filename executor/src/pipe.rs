@@ -110,52 +110,59 @@ pub enum Step<'a> {
 }
 
 /// Streams payload output into `sink` and answers RDY lines with `steps` in
-/// order, then `q` once the list is drained.
+/// order, then `q` once the list is drained. Lines the payload marks with a
+/// leading `P` are script output and reach the sink with a `» ` prefix so the
+/// UI can tell them apart from protocol chatter.
 pub fn drive(pipe: &Pipe, steps: &[Step], mut sink: impl Write) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     let mut acc = Vec::new();
     let mut idx = 0usize;
     let mut sent_quit = false;
+    let mut seen_end = false;
     loop {
         let n = match pipe.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(_) => break,
         };
-        eprintln!("[pipe] read {} bytes", n);
-        sink.write_all(&buf[..n])?;
-        sink.flush()?;
         acc.extend_from_slice(&buf[..n]);
-        while let Some(pos) = find(&acc, b"RDY\n") {
-            acc.drain(..pos + 4);
-            if idx < steps.len() {
-                match steps[idx] {
-                    Step::Cmd(c) => {
-                        eprintln!("[pipe] sending cmd {}", c as char);
-                        pipe.write_all(&[c])?;
+        while let Some(pos) = acc.iter().position(|&c| c == b'\n') {
+            let line: Vec<u8> = acc.drain(..=pos).collect();
+            let body = &line[..line.len() - 1];
+            if body == b"RDY" {
+                if idx < steps.len() {
+                    match steps[idx] {
+                        Step::Cmd(c) => {
+                            eprintln!("[pipe] sending cmd {}", c as char);
+                            pipe.write_all(&[c])?;
+                        }
+                        Step::Chunk(chunk) => {
+                            eprintln!("[pipe] sending chunk {} bytes", chunk.len());
+                            pipe.write_all(b"L")?;
+                            pipe.write_all(&(chunk.len() as u32).to_le_bytes())?;
+                            pipe.write_all(chunk)?;
+                        }
                     }
-                    Step::Chunk(chunk) => {
-                        eprintln!("[pipe] sending chunk {} bytes", chunk.len());
-                        pipe.write_all(b"L")?;
-                        pipe.write_all(&(chunk.len() as u32).to_le_bytes())?;
-                        pipe.write_all(chunk)?;
-                        eprintln!("[pipe] chunk written");
-                    }
+                    idx += 1;
+                } else if !sent_quit {
+                    eprintln!("[pipe] sending quit");
+                    pipe.write_all(b"q")?;
+                    sent_quit = true;
                 }
-                idx += 1;
-            } else if !sent_quit {
-                eprintln!("[pipe] sending quit");
-                pipe.write_all(b"q")?;
-                sent_quit = true;
+            } else if body == b"END" {
+                seen_end = true;
+            } else if body.first() == Some(&b'P') {
+                sink.write_all("\u{bb} ".as_bytes())?;
+                sink.write_all(&body[1..])?;
+                sink.write_all(b"\n")?;
+            } else {
+                sink.write_all(&line)?;
             }
+            sink.flush()?;
         }
-        if sent_quit && find(&acc, b"END\n").is_some() {
+        if seen_end && sent_quit {
             break;
         }
     }
     Ok(())
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }

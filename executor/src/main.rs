@@ -89,30 +89,17 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // Preferred: a thread of our own. Nothing of Roblox is borrowed, so no
-    // stack or lock of the game is touched and nothing has to be restored.
-    // If the client refuses thread creation, fall back to borrowing a thread.
-    let mut hijack_child: Option<std::process::Child> = None;
-    eprintln!("[z] pipe up, thread path");
-    match zendo_core::inject_blocking(&[]) {
-        Ok(out) => {
-            echo(&out);
-            if !out.status.success() {
-                eprintln!("thread path failed ({}), falling back to hijack", out.status);
-                match zendo_core::spawn_inject_stream(&["--hijack"]) {
-                    Ok(c) => hijack_child = Some(c),
-                    Err(e) => {
-                        eprintln!("inject failed: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
+    // A thread of our own dies at TLS init in this client, so borrow a parked
+    // thread instead. The failed attempt is not tried first any more: it left a
+    // second payload image behind and broke the borrow that followed.
+    eprintln!("[z] pipe up, hijacking");
+    let hijack_child = match zendo_core::spawn_inject_stream(&["--hijack"]) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("inject failed: {e}");
             std::process::exit(1);
         }
-    }
+    };
     eprintln!("[z] waiting for payload");
     if let Err(e) = server.accept() {
         eprintln!("accept failed: {e}");
@@ -131,6 +118,7 @@ fn main() {
                 "c" | "C" => steps.push(pipe::Step::Cmd(b'C')),
                 "chunk" | "L" => steps.push(pipe::Step::Chunk(&chunk)),
                 "none" | "" => {}
+                t if t.len() == 1 => steps.push(pipe::Step::Cmd(t.as_bytes()[0])),
                 other => eprintln!("unknown step {other}"),
             }
         }
@@ -140,11 +128,9 @@ fn main() {
     // borrowed thread never returns and its context can never be restored.
     let _ = server.write_all(b"ZEND1 ack\n");
     std::thread::sleep(std::time::Duration::from_millis(400));
-    if let Some(child) = hijack_child {
-        match child.wait_with_output() {
-            Ok(out) => echo(&out),
-            Err(e) => eprintln!("injector wait failed: {e}"),
-        }
+    match hijack_child.wait_with_output() {
+        Ok(out) => echo(&out),
+        Err(e) => eprintln!("injector wait failed: {e}"),
     }
     if let Err(e) = driven {
         eprintln!("pipe error: {e}");
