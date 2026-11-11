@@ -2982,20 +2982,36 @@ inline bool op_is(const char* s, unsigned int len, const char* want) {
 // them, and the next indirect call into that page would be rejected.
 inline bool api_write(unsigned long long addr, const char* src, unsigned int len) {
     if (!addr || !len || !src) return false;
+    // A page that is already writable needs no protection change. Asking for one
+    // on a plain data page with PAGE_TARGETS_NO_UPDATE is rejected outright by
+    // the kernel - that flag is only meaningful when the page is executable.
+    Mbi mbi;
     unsigned long long start = addr & ~0xfffull;
     unsigned long long end = (addr + len + 0xfffull) & ~0xfffull;
-    DWORD oldp = 0;
-    if (!api().VirtualProtect(reinterpret_cast<void*>(start), static_cast<SIZE_T>(end - start),
-                              PAGE_READWRITE | 0x40000000u, &oldp)) {
+    DWORD prot = 0;
+    if (api().VirtualQuery(reinterpret_cast<const void*>(start), &mbi, sizeof(mbi)) &&
+        mbi.State == MEM_COMMIT)
+        prot = mbi.Protect & 0xFF;
+    bool already = prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE;
+    if (!already) {
+        DWORD oldp = 0;
+        DWORD want = (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))
+                         ? (PAGE_EXECUTE_READWRITE | 0x40000000u)
+                         : PAGE_READWRITE;
         if (!api().VirtualProtect(reinterpret_cast<void*>(start), static_cast<SIZE_T>(end - start),
-                                  PAGE_EXECUTE_READWRITE | 0x40000000u, &oldp))
+                                  want, &oldp))
             return false;
     }
     for (unsigned int i = 0; i < len; ++i)
         *reinterpret_cast<volatile char*>(addr + i) = src[i];
-    DWORD tmp = 0;
-    api().VirtualProtect(reinterpret_cast<void*>(start), static_cast<SIZE_T>(end - start),
-                         oldp, &tmp);
+    if (!already) {
+        DWORD tmp = 0;
+        DWORD back = (prot == PAGE_EXECUTE) ? PAGE_EXECUTE
+                    : (prot & PAGE_EXECUTE) ? PAGE_EXECUTE_READ
+                                            : prot;
+        api().VirtualProtect(reinterpret_cast<void*>(start), static_cast<SIZE_T>(end - start),
+                             back, &tmp);
+    }
     return true;
 }
 
@@ -3499,7 +3515,10 @@ inline int native_api(void* L) {
             double addr = 0;
             unsigned int blen = 0;
             char* buf = lua_arg_str(l, 2, &blen);
-            if (!lua_arg_num(l, 1, &addr) || !buf || !blen) {
+            // Only a long string owns its bytes. A short one is interned and
+            // shared with every other literal of the same text, so writing into
+            // it would edit the whole string table instead of one buffer.
+            if (!lua_arg_num(l, 1, &addr) || !buf || blen <= 40) {
                 api_step('E', 4);
                 return lua_ret_num(l, 0);
             }
@@ -3527,6 +3546,91 @@ inline int native_api(void* L) {
             bool ok = api_write(static_cast<unsigned long long>(addr), src, slen);
             api_step('E', 5);
             return lua_ret_num(l, ok ? 1.0 : 0.0);
+        }
+
+        // Image base. Every other address a script derives starts here, so the
+        // RVAs from the disassembly become usable without hardcoding a mapping.
+        if (op_is(op, oplen, "zendo:base")) {
+            api_step('S', 14);
+            int r = lua_ret_num(l, static_cast<double>(g_base));
+            api_step('P', 14);
+            return r;
+        }
+
+        // DataModel. Two hops off a static: the static holds a pointer to a
+        // holder, the holder's +0x1F8 is the DataModel itself. Both offsets are
+        // the ones the loader already proved against this build.
+        if (op_is(op, oplen, "zendo:dm")) {
+            api_step('S', 15);
+            unsigned long long fake = 0, dm = 0;
+            if (g_base) read_u64(g_base + k_fake_dm_static, &fake);
+            if (fake && !read_u64(fake + k_fake_dm_to_dm, &dm)) dm = 0;
+            if (dm && !readable(reinterpret_cast<const void*>(dm), 0x10)) dm = 0;
+            int r = lua_ret_num(l, static_cast<double>(dm));
+            api_step(dm ? 'P' : 'E', 15);
+            return r;
+        }
+
+        // Service by vtable: walk the DataModel's class-id map and return the
+        // first instance whose [0] equals the vtable the script passed in.
+        // The script supplies the target because the map is keyed by class id,
+        // not by name, and a name lookup would need a per-class layout we have
+        // not measured.
+        if (op_is(op, oplen, "zendo:svc")) {
+            api_step('S', 16);
+            double vt = 0;
+            unsigned long long dm = 0, fake = 0;
+            if (lua_arg_num(l, 1, &vt) && g_base) {
+                read_u64(g_base + k_fake_dm_static, &fake);
+                read_u64(fake + k_fake_dm_to_dm, &dm);
+            }
+            unsigned long long hit = 0;
+            if (dm && vt) hit = find_service(g_base, static_cast<unsigned long long>(vt), dm);
+            int r = lua_ret_num(l, static_cast<double>(hit));
+            api_step(hit ? 'P' : 'E', 16);
+            return r;
+        }
+
+        // Map walk: pushes (instance, vtable) pairs in tree order. This is the
+        // discovery half of `svc` - a script lists what the DataModel holds,
+        // then matches the vtables it cares about.
+        if (op_is(op, oplen, "zendo:svcs")) {
+            api_step('S', 17);
+            double want = 0;
+            unsigned long long dm = 0, fake = 0;
+            if (g_base) {
+                read_u64(g_base + k_fake_dm_static, &fake);
+                read_u64(fake + k_fake_dm_to_dm, &dm);
+            }
+            int cap = lua_arg_num(l, 1, &want) ? static_cast<int>(want) : 8;
+            if (cap < 1) cap = 1;
+            if (cap > 16) cap = 16;
+            int pushed = 0;
+            unsigned long long head = 0, root = 0;
+            if (dm && read_u64(dm + 0xB0, &head) && head && read_u64(head + 8, &root) && root) {
+                unsigned long long stack[64];
+                int sp = 0, seen = 0;
+                stack[sp++] = root;
+                while (sp > 0 && pushed < cap * 2 && seen < 128) {
+                    unsigned long long n = stack[--sp];
+                    if (!n || n == head) continue;
+                    unsigned long long val = 0, left = 0, right = 0;
+                    read_u64(n + 0x28, &val);
+                    read_u64(n, &left);
+                    read_u64(n + 0x10, &right);
+                    if (left && left != head && sp < 64) stack[sp++] = left;
+                    if (right && right != head && sp < 64) stack[sp++] = right;
+                    ++seen;
+                    if (!val) continue;
+                    unsigned long long vt = 0;
+                    if (!read_u64(val, &vt) || !vt) continue;
+                    pushed += lua_ret_num(l, static_cast<double>(val));
+                    if (pushed >= cap * 2) break;
+                    pushed += lua_ret_num(l, static_cast<double>(vt));
+                }
+            }
+            api_step(pushed ? 'P' : 'E', 17);
+            return pushed;
         }
     }
 
