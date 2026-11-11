@@ -65,8 +65,8 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 2 then
-local api = { version = 2, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 3 then
+local api = { version = 3, missing = {} }
 local function put(name, value)
     if rawget(__znd_env, name) == nil then __znd_env[name] = value end
 end
@@ -148,6 +148,12 @@ end)
 put("islclosure", function(f)
     local _, _, exec = call("zendo:probe", f)
     return exec == 0
+end)
+
+-- A thread the session gate lifted carries identity 8; a callback the game
+-- invokes on its own runs at its own level. That is the whole test.
+put("checkcaller", function()
+    return call("zendo:caller") == 1
 end)
 
 -- Encoding runs in plain Luau, not in the client's memory. There is no string
@@ -290,6 +296,9 @@ for _, name in ipairs({ "getgc", "getreg", "getconnections" }) do
         api.missing[#api.missing + 1] = name
     end
 end
+-- Announce the state this prelude is running on, so checkcaller can tell our
+-- threads from the client's own.
+if type(zendo) == "function" then pcall(zendo, "zendo:mark") end
 __znd_env.__zendo_api = api
 end
 end

@@ -2722,6 +2722,12 @@ static const unsigned int kChunkFlushLen = sizeof(kChunkFlush);
 
 static unsigned long long g_cap_closure = 0;
 static unsigned long long g_cap_f = 0;
+// Threads we have actually run code on. `zendo:mark` records the calling
+// lua_State, `zendo:caller` answers whether the current one is in the list.
+// checkcaller built on this says "this thread is ours", not "this VM happens to
+// be elevated" - a game callback shares the identity but not the list.
+static unsigned long long g_ours[16] = {};
+static int g_ours_n = 0;
 static HANDLE g_cap_pipe = INVALID_HANDLE_VALUE;
 // Set by the `x` command. It means "detach for good": unwind out of the REPL
 // so DllMain can restore the borrowed thread. A payload that stays parked keeps
@@ -3340,6 +3346,43 @@ inline int native_api(void* L) {
             int r = lua_ret_num(l, static_cast<double>(scratch));
             api_step('E', 2);
             return r;
+        }
+
+        // The identity lives on the state's extras block, the same +0x70 the
+        // session gate writes 8 into. Reading it from the caller's own state is
+        // what checkcaller needs: a thread we lifted answers 8, a plain game
+        // callback answers its own level.
+        if (op_is(op, oplen, "zendo:caller")) {
+            api_step('S', 23);
+            for (int i = 0; i < g_ours_n; ++i) {
+                if (g_ours[i] == l) {
+                    api_step('E', 23);
+                    return lua_ret_num(l, 1.0);
+                }
+            }
+            unsigned long long ex = 0, ident = 0;
+            if (read_u64(l + 8, &ex) && ex) read_u64(ex + 0x70, &ident);
+            api_step('E', 23);
+            return lua_ret_num(l, ident >= 8.0 ? 2.0 : 0.0);
+        }
+
+        // Same op the other way round: the chunk announces the state it runs on.
+        if (op_is(op, oplen, "zendo:mark")) {
+            api_step('S', 24);
+            bool known = false;
+            for (int i = 0; i < g_ours_n; ++i) {
+                if (g_ours[i] == l) { known = true; break; }
+            }
+            if (!known) {
+                if (g_ours_n == 16) {
+                    for (int i = 1; i < 16; ++i) g_ours[i - 1] = g_ours[i];
+                    g_ours[15] = l;
+                } else {
+                    g_ours[g_ours_n++] = l;
+                }
+            }
+            api_step('E', 24);
+            return lua_ret_num(l, static_cast<double>(g_ours_n));
         }
 
         if (op_is(op, oplen, "zendo:strinfo")) {
