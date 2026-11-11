@@ -1062,6 +1062,7 @@ inline DWORD run_chunk() {
 #include "../chunks/c42.inc"
 #include "../chunks/kcapture.inc"
 #include "../chunks/knative.inc"
+#include "../chunks/z42.inc"
 
 inline DWORD run_bc() {
     DWORD st = resolve_api();
@@ -2696,18 +2697,80 @@ static unsigned long long g_base = 0;
 // 0: run the load. 1: prove entry only - the guard question and the load
 // question are different questions, and they cost a client relaunch each.
 static int g_native_mode = 0;
+static unsigned long long g_native_hits = 0;
+
+// stage_mark is overwritten by the runner when a session ends, so a function
+// that was entered and then killed leaves no trace there. This file is never
+// touched by the host: if it exists, the VM called in.
+inline void hit_mark() {
+    Api& a = api();
+    HANDLE f = a.CreateFileA("D:\\zendo\\work\\hit.bin", GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char b[32];
+    unsigned int n = 0;
+    b[n++] = static_cast<char>('0' + (g_native_mode % 10));
+    b[n++] = ' ';
+    char d[20];
+    unsigned int k = 0;
+    unsigned long long v = g_native_hits;
+    do {
+        d[k++] = static_cast<char>('0' + (v % 10));
+        v /= 10;
+    } while (v && k < sizeof(d));
+    while (k) b[n++] = d[--k];
+    DWORD w = 0;
+    a.WriteFile(f, b, n, &w, nullptr);
+    a.CloseHandle(f);
+}
 
 // A C closure is the only way Lua can reach native code, and the target of
 // every call it makes is an indirect call - which is exactly what CFG checks.
-// The bytes come from the client's own luau_load, so the address is inside the
-// image and no guard bitmap of ours is involved.
+// The guard bit for this function is set by stage U, so the call arrives.
+// Results are written straight into the frame: Luau's TValue is 16 bytes, the
+// number tag sits in the high dword of the second qword, and L->top is at 0x60
+// (the same field exec_protected uses). 42.0 is the wire test value.
 inline int native_loadstring(void* L) {
-    stage_mark(api(), "ENTER");
-    if (g_native_mode) {
-        stage_mark(api(), "ENTER-ONLY");
-        return 1;
-    }
     unsigned long long l = reinterpret_cast<unsigned long long>(L);
+    ++g_native_hits;
+    hit_mark();
+    stage_mark(api(), g_native_mode ? "ENTER-1" : "ENTER-42");
+    if (g_native_mode == 1) return 1;
+    // The client has no Luau compiler, so the only honest loadstring is one
+    // that was compiled somewhere else. This body is `return 42`, built by the
+    // same pipeline that makes every other chunk, with the guard magic in
+    // front. LuaVMLoad pushes the resulting function and we hand it back: the
+    // caller gets something it can call, which is what loadstring means.
+    static unsigned char buf[8 + sizeof(kZ42Body)];
+    static bool built = false;
+    if (!built) {
+        const unsigned long long magic = 0xE009325B4A107A52ull;
+        for (int i = 0; i < 8; ++i)
+            buf[i] = static_cast<unsigned char>(magic >> (8 * i));
+        for (unsigned int i = 0; i < sizeof(kZ42Body); ++i) buf[8 + i] = kZ42Body[i];
+        built = true;
+    }
+    if (!g_base) return 0;
+    ChunkName src;
+    src.data = reinterpret_cast<const char*>(buf);
+    src.pad = 0;
+    src.size = 8 + sizeof(kZ42Body);
+    src.cap = src.size;
+    typedef int (*LoadFn)(void*, void*, const char*, int);
+    LoadFn load = reinterpret_cast<LoadFn>(g_base + 0x426A570);
+    int ret = load(L, &src, "=z42", 0);
+    stage_mark(api(), ret == 0 ? "LOAD-OK" : "LOAD-ERR");
+    if (ret != 0) return 0;
+    return 1;
+}
+
+// The bytecode door, kept behind its own switch because the client carries no
+// Luau compiler: anything that is not already a container has to be rejected
+// before it reaches the undump, or the undump reads lengths out of prose.
+inline int native_loadbytecode(void* L) {
+    unsigned long long l = reinterpret_cast<unsigned long long>(L);
+    stage_mark(api(), "ENTER-BC");
     unsigned long long base = 0;
     read_u64(l + 0x58, &base);
     unsigned long long v = 0, w = 0;
@@ -2716,15 +2779,21 @@ inline int native_loadstring(void* L) {
     if (tt != 6 || !v) return 0;
     unsigned int len = 0;
     read_u32(v + 0x14, &len);
-    if (len > 1u << 20) return 0;
-    const char* data = reinterpret_cast<const char*>(v + 0x18);
+    if (len < 8 || len > 1u << 20) return 0;
+    unsigned long long magic = 0;
+    read_u64(v + 0x18, &magic);
+    if (magic != 0xE009325B4A107A52ull) {
+        stage_mark(api(), "BC-REJECT");
+        return 0;
+    }
     if (!g_base) return 0;
     using Load_t = int (*)(void*, const char*, const char*, unsigned long long, int);
     Load_t load = reinterpret_cast<Load_t>(g_base + 0x426A570);
-    int rc = load(L, "=zendo", data, len, 0);
-    (void)rc;
+    int rc = load(L, "=zendo", reinterpret_cast<const char*>(v + 0x18), len, 0);
+    stage_mark(api(), rc == 0 ? "BC-OK" : "BC-ERR");
     return 1;
 }
+
 
 inline int cap_print(void* L) {
     stage_mark(api(), "H1");
