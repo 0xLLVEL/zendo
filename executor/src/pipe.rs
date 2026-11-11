@@ -267,8 +267,8 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
         };
         if avail == 0 {
             if wait_done && !sent_quit && idx >= steps.len() && idle >= wait_limit {
-                eprintln!("[pipe] no done signal, closing");
-                pipe.write_all(b"q")?;
+                eprintln!("[pipe] no done signal, detaching");
+                pipe.write_all(b"x")?;
                 sent_quit = true;
                 break;
             }
@@ -342,16 +342,16 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                         // The script is still running on a scheduler thread and
                         // may call loadstring any moment. Stay silent.
                     } else {
-                        eprintln!("[pipe] sending quit");
-                        pipe.write_all(b"q")?;
+                        eprintln!("[pipe] detaching");
+                        pipe.write_all(b"x")?;
                         sent_quit = true;
                     }
                 }
             } else if body == b"END" {
                 seen_end = true;
                 if wait_done && !sent_quit {
-                    eprintln!("[pipe] script done, closing");
-                    pipe.write_all(b"q")?;
+                    eprintln!("[pipe] script done, detaching");
+                    pipe.write_all(b"x")?;
                     sent_quit = true;
                 }
             } else if body.first() == Some(&b'P') {
