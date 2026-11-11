@@ -57,6 +57,77 @@ extern "system" {
     fn OpenThread(access: u32, inherit: i32, tid: u32) -> Handle;
     fn Thread32First(snap: Handle, entry: *mut ThreadEntry32) -> i32;
     fn Thread32Next(snap: Handle, entry: *mut ThreadEntry32) -> i32;
+    fn CreateFileW(name: *const u16, access: u32, share: u32, sa: *mut c_void,
+                   disposition: u32, flags: u32, template: Handle) -> Handle;
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtCreateSection(section: *mut Handle, access: u32, attrs: *mut c_void,
+                       max_size: *const u64, protect: u32, allocation: u32,
+                       file: Handle) -> i32;
+    fn NtMapViewOfSection(section: Handle, process: Handle, base: *mut *mut c_void,
+                          zero_bits: usize, commit: usize, offset: *const u64,
+                          view_size: *mut usize, inherit: u32, allocation: u32,
+                          protect: u32) -> i32;
+    fn NtUnmapViewOfSection(process: Handle, base: *mut c_void) -> i32;
+}
+
+const SEC_IMAGE: u32 = 0x0100_0000;
+const SECTION_ALL_ACCESS: u32 = 0x000F_001F;
+const FILE_SHARE_RW: u32 = 0x0000_0003;
+const OPEN_EXISTING: u32 = 3;
+const FILE_ATTRIBUTE_NORMAL_F: u32 = 0x80;
+const GENERIC_READ: u32 = 0x8000_0000;
+
+/// Map the payload as a real image (`SEC_IMAGE`) instead of a private copy.
+///
+/// The difference that matters: pages become `MEM_IMAGE`, so the CFG bitmap
+/// covers them and an indirect call into our code from the client's VM is
+/// legal. A manual map is `MEM_PRIVATE`, and every indirect call into it is a
+/// guard violation - which is exactly what killed the native `print` hook.
+/// The kernel applies relocations for an image section; the payload resolves
+/// its own imports from the PEB, so there is nothing left to fix up.
+fn sec_image_map(proc: Handle, path: &str) -> Result<(u64, usize), String> {
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let file = unsafe {
+        CreateFileW(wide.as_ptr(), GENERIC_READ, FILE_SHARE_RW, ptr::null_mut(),
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL_F, ptr::null_mut())
+    };
+    if file as isize == -1 {
+        return Err(format!("CreateFileW: {}", std::io::Error::last_os_error()));
+    }
+    let mut section: Handle = ptr::null_mut();
+    let st = unsafe {
+        NtCreateSection(&mut section, SECTION_ALL_ACCESS, ptr::null_mut(), ptr::null(),
+                        2, SEC_IMAGE, file)
+    };
+    if st < 0 {
+        unsafe { CloseHandle(file) };
+        return Err(format!("NtCreateSection {st:#x}"));
+    }
+    let mut base: *mut c_void = ptr::null_mut();
+    let mut view: usize = 0;
+    let mut st = unsafe {
+        NtMapViewOfSection(section, proc, &mut base, 0, 0, ptr::null(),
+                           &mut view, 1, 0, 2)
+    };
+    if st < 0 {
+        // ViewShare is the documented choice for images; ViewUnmap works for
+        // some builds where the first call is refused.
+        st = unsafe {
+            NtMapViewOfSection(section, proc, &mut base, 0, 0, ptr::null(),
+                               &mut view, 2, 0, 2)
+        };
+    }
+    unsafe {
+        CloseHandle(section);
+        CloseHandle(file);
+    }
+    if st < 0 {
+        return Err(format!("NtMapViewOfSection {st:#x}"));
+    }
+    Ok((base as u64, view))
 }
 
 #[repr(C)]
@@ -836,8 +907,22 @@ fn main() {
         }
     }
 
+    let sec_image = std::env::var("ZENDO_SECIMAGE").map(|v| v == "1").unwrap_or(false);
     if reused {
         println!("  reusing image at {remote_base:#x}");
+    } else if sec_image {
+        // SEC_IMAGE: the kernel owns the mapping, so relocations, section
+        // protections and the import table are its job - the payload resolves
+        // API pointers itself from the PEB and never needs the IAT. Both
+        // remote_base and pe.entry stay valid for the hijack stub because the
+        // preferred base is honoured or the loader rebases the whole image.
+        match sec_image_map(proc, &dll_path) {
+            Ok((b, view)) => {
+                remote_base = b;
+                println!("  remote image (SEC_IMAGE) at {remote_base:#x} view={view:#x}");
+            }
+            Err(e) => { eprintln!("sec_image_map: {e}"); exit(10); }
+        }
     } else {
         let remote = unsafe { VirtualAllocEx(proc, ptr::null_mut(), pe.size_of_image, MEM_COMMIT_RESERVE, PAGE_READWRITE) };
         if remote.is_null() {

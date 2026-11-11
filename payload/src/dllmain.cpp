@@ -179,6 +179,8 @@ struct Api {
     AddVeh_t AddVectoredExceptionHandler;
     RtlAddTable_t RtlAddFunctionTable;
     SetCfgTargets_t SetProcessValidCallTargets;
+    using SetMitigation_t = BOOL(WINAPI*)(int, void*, SIZE_T);
+    SetMitigation_t SetProcessMitigationPolicy;
 };
 
 inline Api& api() {
@@ -214,6 +216,8 @@ inline DWORD resolve_api() {
     if (kbase.base) {
         a.SetProcessValidCallTargets = reinterpret_cast<Api::SetCfgTargets_t>(
             find_export(kbase.base, fnv1a("SetProcessValidCallTargets")));
+        a.SetProcessMitigationPolicy = reinterpret_cast<Api::SetMitigation_t>(
+            find_export(kbase.base, fnv1a("SetProcessMitigationPolicy")));
     }
     if (!a.CreateFileA) return 11;
     if (!a.WriteFile) return 12;
@@ -1050,6 +1054,8 @@ inline DWORD run_chunk() {
 #include "../chunks/c40.inc"
 #include "../chunks/c41.inc"
 #include "../chunks/c42.inc"
+#include "../chunks/kcapture.inc"
+#include "../chunks/knative.inc"
 
 inline DWORD run_bc() {
     DWORD st = resolve_api();
@@ -2678,6 +2684,32 @@ inline void cap_value(char* d, unsigned int& n, unsigned long long slot) {
     d[n++] = '<';
     d[n++] = static_cast<char>('0' + tt % 10);
     d[n++] = '>';
+}
+
+static unsigned long long g_base = 0;
+
+// A C closure is the only way Lua can reach native code, and the target of
+// every call it makes is an indirect call - which is exactly what CFG checks.
+// The bytes come from the client's own luau_load, so the address is inside the
+// image and no guard bitmap of ours is involved.
+inline int native_loadstring(void* L) {
+    unsigned long long l = reinterpret_cast<unsigned long long>(L);
+    unsigned long long base = 0;
+    read_u64(l + 0x58, &base);
+    unsigned long long v = 0, w = 0;
+    if (!base || !read_u64(base, &v) || !read_u64(base + 8, &w)) return 0;
+    unsigned int tt = static_cast<unsigned int>((w >> 32) & 0xff);
+    if (tt != 6 || !v) return 0;
+    unsigned int len = 0;
+    read_u32(v + 0x14, &len);
+    if (len > 1u << 20) return 0;
+    const char* data = reinterpret_cast<const char*>(v + 0x18);
+    if (!g_base) return 0;
+    using Load_t = int (*)(void*, const char*, const char*, unsigned long long, int);
+    Load_t load = reinterpret_cast<Load_t>(g_base + 0x426A570);
+    int rc = load(L, "=zendo", data, len, 0);
+    (void)rc;
+    return 1;
 }
 
 inline int cap_print(void* L) {
@@ -7026,6 +7058,74 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             }
             flush_capture(a, o, L, base);
             stage_mark(a, "DONE");
+            continue;
+        }
+        if (cmd[0] == 'k') {
+            // The whole question in one command: can Luau call into this
+            // payload at all? A C closure taken from the globals gets its
+            // function pointer swapped for native_loadstring and is then called
+            // from a chunk. That call is indirect, through the client image,
+            // into a manual-mapped page.
+            g_base = base;
+            g_cap_closure = 0;
+            exec_raw(a, pipe, o, L, base, kChunkKCaptureBody, kChunkKCaptureLen, "kcapture");
+            if (!g_cap_closure) {
+                o.str("native no C closure captured\n");
+                flush_out(a, pipe, o);
+                continue;
+            }
+            unsigned long long old_f = 0;
+            read_u64(g_cap_closure + 0x28, &old_f);
+            wr64(g_cap_closure + 0x28, reinterpret_cast<unsigned long long>(&native_loadstring));
+            o.str("native swapped clo=");
+            o.hex(g_cap_closure);
+            o.str(" f=");
+            o.hex(old_f);
+            o.nl();
+            flush_out(a, pipe, o);
+            stage_mark(a, "NATIVE");
+            exec_raw(a, pipe, o, L, base, kChunkKNativeBody, kChunkKNativeLen, "knative");
+            wr64(g_cap_closure + 0x28, old_f);
+            o.str("native restored\n");
+            flush_out(a, pipe, o);
+            stage_mark(a, "DONE");
+            continue;
+        }
+        if (cmd[0] == 'g') {
+            // Everything that decides whether the client VM may call our code:
+            // what kind of pages we live on, whether CFG accepts them, and
+            // whether the CFG policy can still be relaxed at runtime.
+            Mbi mbi{};
+            unsigned long long fn = reinterpret_cast<unsigned long long>(&cap_print);
+            if (a.VirtualQuery(reinterpret_cast<const void*>(fn), &mbi, sizeof(mbi))) {
+                o.str("mitig page state=");
+                o.hex(mbi.State);
+                o.str(" type=");
+                o.hex(mbi.Type);
+                o.str(" prot=");
+                o.hex(mbi.Protect);
+                o.str(" allocbase=");
+                o.hex(reinterpret_cast<unsigned long long>(mbi.AllocationBase));
+                o.nl();
+            }
+            int cfg_rc = cfg_register(reinterpret_cast<void*>(fn));
+            o.str("mitig cfg_register=");
+            o.dec(static_cast<unsigned int>(cfg_rc));
+            o.nl();
+            flush_out(a, pipe, o);
+            struct CfgFlags { unsigned int raw; };
+            CfgFlags off{0};
+            if (a.SetProcessMitigationPolicy) {
+                BOOL r = a.SetProcessMitigationPolicy(7, &off, sizeof(off));
+                o.str("mitig cfg_off rc=");
+                o.dec(r);
+                o.str(" err=");
+                o.dec(static_cast<unsigned int>(a.GetLastError()));
+                o.nl();
+            } else {
+                o.str("mitig cfg_off unavailable\n");
+            }
+            flush_out(a, pipe, o);
             continue;
         }
         if (cmd[0] == 'j' || cmd[0] == 'h' || cmd[0] == 'H' || cmd[0] == 'J') {

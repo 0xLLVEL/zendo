@@ -196,6 +196,15 @@ fn main() {
         for tok in mode.split(',') {
             match tok.trim() {
                 "c" | "C" => steps.push(pipe::Step::Cmd(b'C')),
+                // print-hook probe: payload swaps print for its own C closure
+                // and calls it from the Luau VM, which is an indirect call into
+                // our image - the CFG test in one command.
+                "probe" | "h" => steps.push(pipe::Step::Cmd(b'h')),
+                // page type + CFG registration + mitigation policy probe
+                "mitig" | "g" => steps.push(pipe::Step::Cmd(b'g')),
+                // native loadstring via a C closure whose c.f is our luau_load
+                // wrapper: the direct test of VM -> payload indirect calls.
+                "native" | "k" => steps.push(pipe::Step::Cmd(b'k')),
                 "chunk" | "L" => steps.push(pipe::Step::Chunk(&chunk)),
                 "ident" => {
                     let id: u8 = std::env::var("ZENDO_IDENT")
