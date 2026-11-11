@@ -5900,6 +5900,27 @@ inline void caps_open(unsigned long long base, unsigned long long L, Out& o,
         wr64(E + 0xA0, 0xFFFFFFFFFFFFFFFFull);
         wr64(E + 0x70, 8);
     }
+    // A proto decodes its capability qword at proto+0x80; an unpatched proto
+    // decodes to this global default, and the sandbox ANDs the thread mask with
+    // it. The deferred chunk runs inside a proto built after this session
+    // started, so the default is the one word that reaches it.
+    unsigned long long defaddr = base + 0x8D87878;
+    unsigned long long defold = 0, defnew = 0;
+    bool defw = false;
+    {
+        Mbi mbi;
+        if (a.VirtualQuery(reinterpret_cast<void*>(defaddr), &mbi, sizeof(mbi))) {
+            DWORD prot = mbi.Protect & 0xFF;
+            defw = mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) &&
+                   (prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+                    prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+        }
+    }
+    if (defw) {
+        read_u64(defaddr, &defold);
+        wr64(defaddr, 0xFFFFFFFFFFFFFFFFull);
+        read_u64(defaddr, &defnew);
+    }
     unsigned long long sm = 0, capsE = 0;
     if (slot) read_u64(slot + 0x30, &sm);
     if (E) read_u64(E + 0xA0, &capsE);
@@ -5912,6 +5933,13 @@ inline void caps_open(unsigned long long base, unsigned long long L, Out& o,
     o.hex(E);
     o.str(" capsE=");
     o.hex(capsE);
+    o.str(" def=");
+    o.hex(defaddr);
+    o.str("/");
+    o.hex(defold);
+    o.str("/");
+    o.hex(defnew);
+    o.str(defw ? "/w" : "/no");
     o.nl();
     flush_out(a, pipe, o);
 }
@@ -6803,6 +6831,10 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         }
         cmd[1] = 0;
         stage_mark(a, cmd);
+        // Session over. Return from DllMain so the stub restores this thread's
+        // saved context. A thread parked in the REPL forever is one the client's
+        // scheduler never gets back, and two of those stop the game's loop: the
+        // window still paints the last frame but stops answering input.
         if (cmd[0] == 'q') break;
         if (cmd[0] == 'L') {
             unsigned int blen = 0;

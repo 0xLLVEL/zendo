@@ -368,27 +368,52 @@ fn section_protections(bytes: &[u8]) -> Vec<(usize, usize, u32)> {
     out
 }
 
+/// Threads parked inside this ntdll wait never wake on our resume: the wait has
+/// no timeout, so the patched RIP is never reached and the client stops
+/// responding. Skipping them is the difference between a clean hijack and a
+/// frozen process. Kept as a range so nearby instructions in the same helper are
+/// covered; other builds simply do not match it, and the fallback keeps the
+/// candidate list non-empty.
+unsafe fn dead_wait(rip: u64) -> bool {
+    let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr() as *const i8);
+    if ntdll.is_null() {
+        return false;
+    }
+    let base = ntdll as u64;
+    rip >= base + 0x16_5900 && rip < base + 0x16_5A80
+}
+
 /// Prefer a thread parked inside an ntdll wait: its stack is shallow and its
 /// user-mode state is a syscall return, so an abandoned frame costs nothing.
-fn pick_threads(pid: u32) -> Vec<u32> {
-    unsafe fn wait_ranges() -> Vec<(u64, u64)> {
+fn pick_threads(pid: u32) -> Vec<(u32, u8, &'static str)> {
+    /// (start, end, priority, name). Lower priority wins: a thread we can always
+    /// wake is worth more than one we merely hope will wake.
+    unsafe fn wait_ranges() -> Vec<(u64, u64, u8, &'static str)> {
         let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr() as *const i8);
         if ntdll.is_null() {
             return Vec::new();
         }
-        let names: [&[u8]; 5] = [
-            b"NtWaitForSingleObject\0",
-            b"NtWaitForMultipleObjects\0",
-            b"NtDelayExecution\0",
-            b"NtWaitForAlertByThreadId\0",
-            b"ZwWaitForSingleObject\0",
+        // Narrow on purpose. Widening this to kernelbase/user32 waits picked up
+        // busy worker threads (the SignalR socket thread among them): holding one
+        // of those in the REPL loop drops the client's websocket and the process
+        // dies seconds later. Only genuine scheduler idlers belong here.
+        let names: [(&[u8], u8, &'static str); 5] = [
+            // Alertable by definition: NtAlertThread wakes it every time.
+            (b"NtWaitForAlertByThreadId\0", 0, "alerted"),
+            // A delay always carries a timeout, even if it is a long one.
+            (b"NtDelayExecution\0", 0, "delay"),
+            // Usually a finite timeout, and it returns to user mode on its own.
+            (b"NtWaitForMultipleObjects\0", 1, "multi"),
+            // Often an infinite, non-alertable wait: the wedge class.
+            (b"NtWaitForSingleObject\0", 2, "single"),
+            (b"ZwWaitForSingleObject\0", 2, "single"),
         ];
         let mut out = Vec::new();
-        for n in names {
+        for (n, prio, label) in names {
             let f = GetProcAddress(ntdll, n.as_ptr() as *const i8);
             if !f.is_null() {
                 let a = f as u64;
-                out.push((a, a + 0x40));
+                out.push((a, a + 0x40, prio, label));
             }
         }
         out
@@ -401,7 +426,8 @@ fn pick_threads(pid: u32) -> Vec<u32> {
         }
         let mut te: ThreadEntry32 = std::mem::zeroed();
         te.dw_size = std::mem::size_of::<ThreadEntry32>() as u32;
-        let mut out = Vec::new();
+        let mut out: Vec<(u8, u32, &'static str)> = Vec::new();
+        let mut spare: Vec<(u8, u32, &'static str)> = Vec::new();
         let mut ok = Thread32First(snap, &mut te);
         while ok != 0 {
             if te.th32_owner_process_id == pid {
@@ -412,8 +438,16 @@ fn pick_threads(pid: u32) -> Vec<u32> {
                     ctx.0[0x30..0x34].copy_from_slice(&0x0010_000Bu32.to_le_bytes());
                     if GetThreadContext(th, ctx.0.as_mut_ptr()) != 0 {
                         let rip = u64::from_le_bytes(ctx.0[0xF8..0x100].try_into().unwrap());
-                        if ranges.iter().any(|&(a, b)| rip >= a && rip < b) {
-                            out.push(te.th32_thread_id);
+                        for &(a, b, prio, label) in ranges.iter() {
+                            if rip < a || rip >= b {
+                                continue;
+                            }
+                            if dead_wait(rip) {
+                                spare.push((9, te.th32_thread_id, "dead"));
+                            } else {
+                                out.push((prio, te.th32_thread_id, label));
+                            }
+                            break;
                         }
                     }
                     CloseHandle(th);
@@ -422,12 +456,16 @@ fn pick_threads(pid: u32) -> Vec<u32> {
             ok = Thread32Next(snap, &mut te);
         }
         CloseHandle(snap);
-        out
+        out.sort_by_key(|c| c.0);
+        if out.is_empty() {
+            out = spare;
+        }
+        out.into_iter().map(|(p, t, l)| (t, p, l)).collect()
     }
 }
 
 fn pick_thread(pid: u32) -> Option<u32> {
-    pick_threads(pid).into_iter().next()
+    pick_threads(pid).into_iter().next().map(|c| c.0)
 }
 
 fn pick_first(pid: u32) -> Option<u32> {
@@ -522,6 +560,29 @@ fn hijack_on(proc: Handle, tid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64
     }
     unsafe { ResumeThread(th); }
 
+    // A wait with no timeout keeps the thread asleep even with RIP patched, so
+    // the stub never runs. NtAlertThread wakes an alertable wait for free and is
+    // harmless otherwise, so try it before declaring the thread dead.
+    if let Some(alert) = unsafe {
+        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr() as *const i8);
+        let p = GetProcAddress(ntdll, b"NtAlertThread\0".as_ptr() as *const i8);
+        if p.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, unsafe extern "system" fn(*mut c_void) -> i32>(p))
+        }
+    } {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let mut buf = [0u8; 16];
+        let mut got = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(proc, flag_addr as *const c_void, buf.as_mut_ptr() as *mut c_void, 16, &mut got)
+        };
+        if ok == 0 || u64::from_le_bytes(buf[..8].try_into().unwrap()) == 0 {
+            unsafe { alert(th) };
+        }
+    }
+
     // Prove whether the patched thread ever reached user mode at all. A thread
     // still sitting at our stub was never scheduled; one that is gone was killed
     // the moment it touched the stub page.
@@ -587,8 +648,10 @@ fn hijack(proc: Handle, pid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64,
           prefer_main: bool) -> Result<Attempt, String> {
     // Run the stub on a live thread of the target, then put its context back
     // exactly as it was. No thread is created inside the game.
-    let candidates: Vec<u32> = if prefer_main {
-        pick_first(pid).into_iter().collect()
+    let candidates: Vec<(u32, u8, &'static str)> = if prefer_main {
+        pick_first(pid)
+            .map(|t| vec![(t, 0u8, "main")])
+            .unwrap_or_default()
     } else {
         pick_threads(pid)
     };
@@ -596,7 +659,10 @@ fn hijack(proc: Handle, pid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64,
         return Err("no thread found".into());
     }
     let mut last = String::from("no idle thread accepted the stub");
-    for &tid in candidates.iter().take(8) {
+    // Four attempts is the whole budget. Every miss leaves a thread parked on
+    // our stub page for a while, and a long list of those is itself a wedge.
+    for &(tid, prio, label) in candidates.iter().take(4) {
+        println!("  candidate {tid} ({label}, prio {prio})");
         match hijack_on(proc, tid, stub_addr, stub, flag_addr) {
             Attempt::Finished(code) => return Ok(Attempt::Finished(code)),
             Attempt::Running => return Ok(Attempt::Running),
@@ -675,7 +741,7 @@ fn main() {
                         ctx.0[0x30..0x34].copy_from_slice(&0x0010_000Bu32.to_le_bytes());
                         if GetThreadContext(th, ctx.0.as_mut_ptr()) != 0 {
                             let rip = u64::from_le_bytes(ctx.0[0xF8..0x100].try_into().unwrap());
-                            let mark = if cands.contains(&te.th32_thread_id) { "*" } else { " " };
+                            let mark = if cands.iter().any(|c| c.0 == te.th32_thread_id) { "*" } else { " " };
                             match module_offset(proc, rip) {
                                 Some((n, o)) => println!("{mark} tid {:>6} {n}{o:+#x}", te.th32_thread_id),
                                 None => println!("{mark} tid {:>6} {rip:#x}", te.th32_thread_id),

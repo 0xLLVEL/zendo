@@ -149,7 +149,10 @@ fn main() {
     // instead of a second image.
     let pending = server.begin_accept();
     let mut hijack_child: Option<Child> = None;
-    let mut connected = match pending.wait(600) {
+    // A live payload only lasts as long as its session: it restores the borrowed
+    // thread on 'q' rather than parking it. So this wait is about not racing a
+    // dying server, not about finding a reusable one.
+    let mut connected = match pending.wait(900) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("accept failed: {e}");
