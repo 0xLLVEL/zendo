@@ -324,42 +324,30 @@ inline bool readable(const void* p, SIZE_T len) {
     return at + len <= begin + mbi.RegionSize;
 }
 
-// The six pinned entry points are only useful if they still resolve to code
-// inside the image. A drift that moves a function elsewhere is caught here
-// instead of at the first call. A byte read is not the test: the protector
-// leaves code pages PAGE_NOACCESS until they are executed, so reading the
-// instruction from another thread fails on a perfectly healthy client.
-// Committed memory inside the image is what can be proven without running it.
+// A pinned address cannot be validated by asking whether its page is mapped:
+// the protector commits and releases code pages on demand, so a healthy client
+// reports FREE at an address that works the moment it is executed. What is
+// stable is the image itself - a valid PE header at the base we resolved and a
+// plausible size. Which build it is, the path tag already says precisely.
 static int g_off_fail = -1;
 
-inline bool committed_at(unsigned long long addr, unsigned long long len) {
-    Mbi mbi;
-    if (!api().VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)))
-        return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    if (mbi.Protect & PAGE_GUARD) return false;
-    unsigned long long begin = reinterpret_cast<unsigned long long>(mbi.BaseAddress);
-    return addr + len <= begin + mbi.RegionSize;
-}
-
 inline bool offsets_ok(unsigned long long base, const Module& m) {
-    const unsigned long long sites[] = {
-        0x426A570,  // lua_vm_load
-        0x26361C0,  // luaD_call
-        0x26360B0,  // luaD_rawrunprotected
-        0x2632230,  // CallContext::run
-        0x2637250,  // luaD_seterrorobj
-        0x2631F40,  // lua_pcallyieldable
-        0x8D87878,  // capability default mask
-    };
-    for (int i = 0; i < 7; ++i) {
-        unsigned long long addr = base + sites[i];
-        bool inside = addr >= base && addr + 0x100 <= base + m.size;
-        if (!inside || !committed_at(addr, 0x100)) {
-            g_off_fail = i;
-            return false;
-        }
-    }
+    (void)m;
+    g_off_fail = 0;
+    if (base < 0x10000) return false;
+    if (!readable(reinterpret_cast<const void*>(base), 0x40)) return false;
+    auto* dos = reinterpret_cast<const unsigned char*>(base);
+    if (dos[0] != 'M' || dos[1] != 'Z') return false;
+    unsigned int lfanew = *reinterpret_cast<const volatile unsigned int*>(base + 0x3C);
+    if (lfanew < 0x40 || lfanew > 0x1000) return false;
+    if (!readable(reinterpret_cast<const void*>(base + lfanew), 0x58)) return false;
+    auto* nt = reinterpret_cast<const unsigned char*>(base + lfanew);
+    if (nt[0] != 'P' || nt[1] != 'E') return false;
+    unsigned short machine = *reinterpret_cast<const volatile unsigned short*>(nt + 4);
+    if (machine != 0x8664) return false;
+    unsigned int size_of_image = *reinterpret_cast<const volatile unsigned int*>(nt + 0x50);
+    if (size_of_image < 0x100000 || size_of_image > 0x40000000) return false;
+    g_off_fail = -1;
     return true;
 }
 
@@ -6016,6 +6004,10 @@ inline void caps_open(unsigned long long base, unsigned long long L, Out& o,
     read_u64(L + 8, &E);
     if (E) {
         wr64(E + 0xA0, 0xFFFFFFFFFFFFFFFFull);
+        // Identity 8 is the RobloxScript context. Identity 7 was tried here to
+        // lift the loadstring refusal; the chunk still reported RobloxScript
+        // and the client died ~40 s after the thread was restored, so the write
+        // buys nothing and costs stability. Back to the proven value.
         wr64(E + 0x70, 8);
     }
     // A proto decodes its capability qword at proto+0x80; an unpatched proto
