@@ -3389,7 +3389,9 @@ inline int native_api(void* L) {
         }
 
         if (op_is(op, oplen, "zendo:file") || op_is(op, oplen, "zendo:filew") ||
-            op_is(op, oplen, "zendo:isfile") || op_is(op, oplen, "zendo:listfiles")) {
+            op_is(op, oplen, "zendo:isfile") || op_is(op, oplen, "zendo:listfiles") ||
+            op_is(op, oplen, "zendo:isfolder") || op_is(op, oplen, "zendo:mkdir") ||
+            op_is(op, oplen, "zendo:del")) {
             api_step('S', 25);
             int r = zendo_file_op(l, op, oplen);
             api_step('E', 25);
@@ -4371,6 +4373,9 @@ int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen) {
 
     char cmd = 'F';
     if (op_is(op, oplen, "zendo:isfile")) cmd = 'S';
+    else if (op_is(op, oplen, "zendo:isfolder")) cmd = 'T';
+    else if (op_is(op, oplen, "zendo:mkdir")) cmd = 'M';
+    else if (op_is(op, oplen, "zendo:del")) cmd = 'D';
     else if (op_is(op, oplen, "zendo:listfiles")) cmd = 'L';
     else if (op_is(op, oplen, "zendo:filew")) cmd = 'G';
 

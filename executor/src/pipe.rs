@@ -348,6 +348,8 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
             }
             if body.first() == Some(&b'F') || body.first() == Some(&b'G')
                 || body.first() == Some(&b'S') || body.first() == Some(&b'L')
+                || body.first() == Some(&b'T') || body.first() == Some(&b'M')
+                || body.first() == Some(&b'D')
             {
                 // Filesystem request from inside the client. The payload cannot
                 // build a Luau string, so the answer is not raw bytes: it is a
@@ -386,6 +388,17 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                             Err(e) => reply = Some(format!("E {}\n", e.to_string().replace('\n', " "))),
                         },
                         (b'S', Some(p)) => ok = if p.is_file() { 1 } else { 0 },
+                        (b'T', Some(p)) => ok = if p.is_dir() { 1 } else { 0 },
+                        (b'M', Some(p)) => {
+                            ok = if std::fs::create_dir_all(&p).is_ok() { 1 } else { 0 };
+                        }
+                        (b'D', Some(p)) => {
+                            ok = if p.is_dir() {
+                                std::fs::remove_dir_all(&p).is_ok() as u8
+                            } else {
+                                std::fs::remove_file(&p).is_ok() as u8
+                            };
+                        }
                         (b'L', Some(p)) => match std::fs::read_dir(&p) {
                             Ok(rd) => {
                                 let mut names: Vec<String> = Vec::new();

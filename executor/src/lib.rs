@@ -65,8 +65,8 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 6 then
-local api = { version = 6, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 7 then
+local api = { version = 7, missing = {} }
 local function put(name, value)
     if rawget(__znd_env, name) == nil then __znd_env[name] = value end
 end
@@ -183,19 +183,22 @@ end)
 
 put("isfolder", function(path)
     if type(path) ~= "string" then return false end
-    local list = call("zendo:listfiles", path)
-    return type(list) == "table"
+    return call("zendo:isfolder", path) == 1
 end)
 
 put("makefolder", function(path)
     if type(path) ~= "string" then return nil end
-    if call("zendo:listfiles", path) ~= nil then return true end
-    return call("zendo:filew", path .. "/.keep", "") == 1
+    return call("zendo:mkdir", path) == 1
 end)
 
 put("delfile", function(path)
     if type(path) ~= "string" then return nil, "bad path" end
-    return call("zendo:filew", path, "") == 1
+    return call("zendo:del", path) == 1
+end)
+
+put("delfolder", function(path)
+    if type(path) ~= "string" then return nil, "bad path" end
+    return call("zendo:del", path) == 1
 end)
 
 put("listfiles", function(path)
@@ -241,6 +244,25 @@ put("getinfo", function(f)
         numk = w[4],
     }
 end)
+
+-- sUNC scores `debug.getconstants`; the native read behind `getconstants` is
+-- the same one. The debug table the client ships may be read-only, so a denied
+-- rawset falls back to a proxy that keeps every other debug field reachable.
+local dbg = rawget(__znd_env, "debug")
+if type(dbg) == "table" and rawget(dbg, "getconstants") == nil then
+    local gc = rawget(__znd_env, "getconstants")
+    local one = function(f, i)
+        local k = gc(f)
+        return k[i]
+    end
+    local ok = pcall(function() rawset(dbg, "getconstants", gc); rawset(dbg, "getconstant", one) end)
+    if not ok then
+        local proxy = setmetatable({}, { __index = dbg })
+        proxy.getconstants = gc
+        proxy.getconstant = one
+        rawset(__znd_env, "debug", proxy)
+    end
+end
 
 put("cloneref", function(ref)
     return ref
