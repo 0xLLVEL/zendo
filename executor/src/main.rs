@@ -207,6 +207,8 @@ fn main() {
                 "native" | "k" => steps.push(pipe::Step::Cmd(b'k')),
                 // ntdll CFG dispatch stub patch, then the same native test
                 "guard" | "x" => steps.push(pipe::Step::Cmd(b'x')),
+                // read GuardCFDispatchFunctionPointer from the client load config
+                "loadcfg" | "y" => steps.push(pipe::Step::Cmd(b'y')),
                 "chunk" | "L" => steps.push(pipe::Step::Chunk(&chunk)),
                 "ident" => {
                     let id: u8 = std::env::var("ZENDO_IDENT")

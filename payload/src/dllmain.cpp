@@ -1063,6 +1063,9 @@ inline DWORD run_chunk() {
 #include "../chunks/kcapture.inc"
 #include "../chunks/knative.inc"
 #include "../chunks/z42.inc"
+#include "../chunks/zapi.inc"
+#include "../chunks/zbind.inc"
+#include "../chunks/zcall.inc"
 
 inline DWORD run_bc() {
     DWORD st = resolve_api();
@@ -2209,9 +2212,75 @@ inline void stage_mark(Api& a, const char* s) {
     a.CloseHandle(f);
 }
 
+// Every function we point a captured closure at has to pass the same CFG check
+// the dispatcher performs, so its map bit is armed here instead of relying on a
+// previous stage having done it. The page is brought in only when the map has
+// not committed it: reading a reserved page is what killed the client once.
+inline bool arm_cfg(Api& a, Out& o, unsigned long long target, const char* tag) {
+    Module dll = find_module(fnv1a_w(L"RobloxPlayerBeta.dll"));
+    if (!dll.base) {
+        o.str(tag);
+        o.str(" no dll\n");
+        return false;
+    }
+    unsigned long long db = reinterpret_cast<unsigned long long>(dll.base);
+    unsigned long long bitmap = 0;
+    read_u64(db + 0x4c9376ull + 0x9f9622ull, &bitmap);
+    if (!bitmap) {
+        o.str(tag);
+        o.str(" no map\n");
+        return false;
+    }
+    unsigned long long slotp = bitmap + (target >> 15);
+    unsigned long long page = slotp & ~0xfffull;
+    unsigned int bit = static_cast<unsigned int>((target >> 12) & 7);
+    Mbi q{};
+    a.VirtualQuery(reinterpret_cast<const void*>(page), &q, sizeof(q));
+    if (q.State != MEM_COMMIT) {
+        void* got = a.VirtualAlloc ? a.VirtualAlloc(reinterpret_cast<void*>(page), 0x1000,
+                                                    MEM_COMMIT, PAGE_READWRITE)
+                                   : nullptr;
+        if (!got) {
+            o.str(tag);
+            o.str(" commit err=");
+            o.dec(static_cast<unsigned int>(a.GetLastError()));
+            o.nl();
+            return false;
+        }
+        a.VirtualQuery(reinterpret_cast<const void*>(page), &q, sizeof(q));
+    }
+    if (q.State != MEM_COMMIT || (q.Protect & 0xff) != PAGE_READWRITE) {
+        o.str(tag);
+        o.str(" page bad state=");
+        o.hex(q.State);
+        o.str(" prot=");
+        o.hex(q.Protect);
+        o.nl();
+        return false;
+    }
+    unsigned char b0 = *reinterpret_cast<unsigned char*>(slotp);
+    *reinterpret_cast<volatile unsigned char*>(slotp) =
+        static_cast<unsigned char>(b0 | (1u << bit));
+    o.str(tag);
+    o.str(" bit ");
+    o.hex(b0);
+    o.str(" -> ");
+    o.hex(*reinterpret_cast<unsigned char*>(slotp));
+    o.str(" want=");
+    o.hex(1u << bit);
+    o.nl();
+    return true;
+}
+
+// bind_clo: when nonzero, the closure is pushed as a second argument and the
+// wrapper forwards it to the chunk (`local f, a = ... pcall(f, a)`). That is the
+// only way to reach a specific C closure from Lua without naming it: the object
+// we swapped travels as a value, not through a global that may resolve to a
+// different function of the same name.
 inline int exec_protected(Api& a, HANDLE pipe, Out& o, unsigned long long L,
                           unsigned long long base, const unsigned char* body,
-                          unsigned int len, const char* tag) {
+                          unsigned int len, const char* tag,
+                          unsigned long long bind_clo = 0) {
     static unsigned char container[4096];
     if (len + 8u > sizeof(container)) {
         o.str(tag);
@@ -2288,12 +2357,13 @@ inline int exec_protected(Api& a, HANDLE pipe, Out& o, unsigned long long L,
     }
 
     static unsigned char wcontainer[256];
-    const unsigned int wlen = kChunkC34Len;
+    const unsigned char* wbody = bind_clo ? kZBindBody : kChunkC34Body;
+    const unsigned int wlen = bind_clo ? kZBindLen : kChunkC34Len;
     for (int i = 0; i < 8; ++i)
         *reinterpret_cast<volatile unsigned char*>(wcontainer + i) =
             static_cast<unsigned char>(magic >> (8 * i));
     for (unsigned int i = 0; i < wlen; ++i)
-        *reinterpret_cast<volatile unsigned char*>(wcontainer + 8 + i) = kChunkC34Body[i];
+        *reinterpret_cast<volatile unsigned char*>(wcontainer + 8 + i) = wbody[i];
 
     ChunkName wsrc;
     wsrc.data = reinterpret_cast<const char*>(wcontainer);
@@ -2344,7 +2414,16 @@ inline int exec_protected(Api& a, HANDLE pipe, Out& o, unsigned long long L,
         }
     }
 
-    wr64(L + 0x60, top0 + 32);
+    if (bind_clo) {
+        // [wrapper][chunk][closure] - the wrapper takes both varargs and hands
+        // the closure to the chunk. Written after the wrapper load so no other
+        // load can overwrite the slot before the call.
+        wr64(top0 + 32, bind_clo);
+        wr64(top0 + 40, 0x8ull << 32);
+        wr64(L + 0x60, top0 + 48);
+    } else {
+        wr64(L + 0x60, top0 + 32);
+    }
 
     // The protected-error callback is the debugger hook Roblox installs. If it
     // is armed, luaD_pcall runs it on any caught error, and its own stack walk
@@ -2391,15 +2470,22 @@ inline int exec_protected(Api& a, HANDLE pipe, Out& o, unsigned long long L,
 
     unsigned long long t2 = 0;
     read_u64(L + 0x60, &t2);
+    // The stack can be reallocated by the call itself (a deeper frame grew it),
+    // and then top0 points into the old block: n computed from it is garbage.
+    // Treat anything outside the reservation as "moved" instead of trusting it.
+    unsigned long long n = 0;
+    if (t2 > top0 && (t2 - top0) < 0x1000)
+        n = (t2 - top0) / 16;
+    else
+        o.str(" STACKMOVED");
     o.str(tag);
     o.str(" done top=");
     o.hex(t2);
     o.str(" n=");
-    o.dec(static_cast<unsigned int>((t2 - top0) / 16));
+    o.dec(static_cast<unsigned int>(n));
     o.nl();
     flush_out(a, pipe, o);
 
-    unsigned long long n = (t2 - top0) / 16;
     if (n > 8) n = 8;
     for (unsigned long long k = 0; k < n; ++k) {
         char tag2[8] = {tag[0], tag[1], ' ', 'p', 0, 0, 0, 0};
@@ -2698,6 +2784,7 @@ static unsigned long long g_base = 0;
 // question are different questions, and they cost a client relaunch each.
 static int g_native_mode = 0;
 static unsigned long long g_native_hits = 0;
+static unsigned long long g_api_hits = 0;
 
 // stage_mark is overwritten by the runner when a session ends, so a function
 // that was entered and then killed leaves no trace there. This file is never
@@ -2763,6 +2850,465 @@ inline int native_loadstring(void* L) {
     stage_mark(api(), ret == 0 ? "LOAD-OK" : "LOAD-ERR");
     if (ret != 0) return 0;
     return 1;
+}
+
+// The dispatcher behind a captured closure. `print` has to keep working for
+// the game, so the sentinel string decides: first argument equal to the ping
+// op is ours, anything else is passed straight to the original print. This is
+// the shape the rest of the API takes - one door, a name in front, native work
+// behind it.
+// Argument and result marshalling for the dispatcher. Everything below was
+// measured against a live frame: arguments start at L->base (+0x58), 16 bytes
+// each; a string is a TString* with its byte length at +0x14 and data at +0x18;
+// a number is a raw double in the value qword with tag 3 in the high dword of
+// the second qword. The Lua layer never sees any of this - it only calls a
+// function with ordinary values, exactly as it would call print.
+struct LuaArg {
+    unsigned long long v;
+    unsigned long long w;
+};
+
+inline bool lua_arg(unsigned long long L, int i, LuaArg* out) {
+    unsigned long long base = 0;
+    if (!read_u64(L + 0x58, &base) || !base) return false;
+    unsigned long long slot = base + 16ull * static_cast<unsigned int>(i);
+    return read_u64(slot, &out->v) && read_u64(slot + 8, &out->w);
+}
+
+inline bool lua_arg_num(unsigned long long L, int i, double* out) {
+    LuaArg a{};
+    if (!lua_arg(L, i, &a) || ((a.w >> 32) & 0xff) != 3) return false;
+    *out = *reinterpret_cast<const double*>(&a.v);
+    return true;
+}
+
+// Returns the byte pointer, not a copy: a script argument is a live TString and
+// its buffer is used in place. Length is a 32-bit field, so the cap is a sanity
+// bound, not a policy.
+inline char* lua_arg_str(unsigned long long L, int i, unsigned int* len) {
+    LuaArg a{};
+    if (!lua_arg(L, i, &a) || ((a.w >> 32) & 0xff) != 6 || !a.v) return nullptr;
+    unsigned int n = 0;
+    if (!read_u32(a.v + 0x14, &n) || n > (1u << 24)) return nullptr;
+    *len = n;
+    return reinterpret_cast<char*>(a.v + 0x18);
+}
+
+inline unsigned long long lua_arg_tstr(unsigned long long L, int i, unsigned int* len) {
+    LuaArg a{};
+    if (!lua_arg(L, i, &a) || ((a.w >> 32) & 0xff) != 6 || !a.v) return 0;
+    unsigned int n = 0;
+    if (!read_u32(a.v + 0x14, &n) || n > (1u << 24)) return 0;
+    *len = n;
+    return a.v;
+}
+
+// Stack-frame headroom, written to work/api_stk.bin: top, stack_last, ci->top.
+// A C call frame gets no reserved result slots, so a push past stack_last writes
+// outside the stack block and the next GC walk dies on the smashed heap. This
+// report says how much room a handler actually has.
+// Appends one tagged line of addresses to work/api_stk.bin. Because entries from
+// consecutive script calls land in the same file, a single run shows whether a
+// frame is still sane *after* the previous native call returned - which is the
+// only way to tell "the op broke the frame" from "the return path broke it".
+inline void api_line(char tag, unsigned long long a, unsigned long long b,
+                     unsigned long long c, unsigned long long d) {
+    HANDLE f = api().CreateFileA("D:\\zendo\\work\\api_stk.bin", FILE_APPEND_DATA,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    const char* hex = "0123456789abcdef";
+    unsigned long long v[4] = {a, b, c, d};
+    char line[128];
+    unsigned int n = 0;
+    line[n++] = tag;
+    line[n++] = ' ';
+    for (int q = 0; q < 4; ++q) {
+        for (int bb = 15; bb >= 0; --bb) line[n++] = hex[(v[q] >> (4 * bb)) & 0xf];
+        line[n++] = q == 3 ? '\n' : ' ';
+    }
+    DWORD w = 0;
+    api().WriteFile(f, line, n, &w, nullptr);
+    api().CloseHandle(f);
+}
+
+inline void api_stk(unsigned long long L, unsigned long long top, unsigned long long last,
+                    unsigned long long citop, int pushed) {
+    unsigned long long base = 0;
+    read_u64(L + 0x58, &base);
+    api_line(static_cast<char>('0' + (pushed & 0xf)), L, top, citop, base);
+}
+
+// Results are read back from L->top - n, so every push must land inside the
+// frame the call actually reserved. Refuse the push instead of writing past it:
+// a missing value becomes nil, which a script can see, while a heap smash only
+// shows up as a dead client minutes later.
+inline int lua_ret_num(unsigned long long L, double x) {
+    unsigned long long top = 0;
+    if (!read_u64(L + 0x60, &top) || !top) return 0;
+    unsigned long long last = 0, ci = 0, citop = 0;
+    read_u64(L + 0x68, &last);
+    if (read_u64(L + 0x70, &ci) && ci) read_u64(ci + 0x8, &citop);
+    unsigned long long limit = last;
+    if (citop && citop < limit) limit = citop;
+    if (limit && top + 16 > limit) {
+        api_stk(L, top, last, citop, 0);
+        return 0;
+    }
+    *reinterpret_cast<double*>(top) = x;
+    *reinterpret_cast<unsigned long long*>(top + 8) = 0x3ull << 32;
+    wr64(L + 0x60, top + 16);
+    api_stk(L, top, last, citop, 1);
+    return 1;
+}
+
+inline bool op_is(const char* s, unsigned int len, const char* want) {
+    unsigned int i = 0;
+    while (want[i]) ++i;
+    if (len != i) return false;
+    for (unsigned int k = 0; k < i; ++k)
+        if (s[k] != want[k]) return false;
+    return true;
+}
+
+// Writes through WinAPI so a script can patch read-only data as well as code.
+// PAGE_TARGETS_NO_UPDATE keeps the CFG bitmap for these pages intact: changing
+// protection on a page that holds valid call targets would otherwise reset
+// them, and the next indirect call into that page would be rejected.
+inline bool api_write(unsigned long long addr, const char* src, unsigned int len) {
+    if (!addr || !len || !src) return false;
+    unsigned long long start = addr & ~0xfffull;
+    unsigned long long end = (addr + len + 0xfffull) & ~0xfffull;
+    DWORD oldp = 0;
+    if (!api().VirtualProtect(reinterpret_cast<void*>(start), static_cast<SIZE_T>(end - start),
+                              PAGE_READWRITE | 0x40000000u, &oldp)) {
+        if (!api().VirtualProtect(reinterpret_cast<void*>(start), static_cast<SIZE_T>(end - start),
+                                  PAGE_EXECUTE_READWRITE | 0x40000000u, &oldp))
+            return false;
+    }
+    for (unsigned int i = 0; i < len; ++i)
+        *reinterpret_cast<volatile char*>(addr + i) = src[i];
+    DWORD tmp = 0;
+    api().VirtualProtect(reinterpret_cast<void*>(start), static_cast<SIZE_T>(end - start),
+                         oldp, &tmp);
+    return true;
+}
+
+// Survives a dead process, like the other markers: the last op reached is the
+// last thing in the file, so a fault can be pinned to an operation without a
+// debugger attached.
+inline void api_step(char phase, int op) {
+    HANDLE f = api().CreateFileA("D:\\zendo\\work\\api_step.bin", GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char b[3] = {phase, static_cast<char>('0' + op), '\n'};
+    DWORD w = 0;
+    api().WriteFile(f, b, 3, &w, nullptr);
+    api().CloseHandle(f);
+}
+
+// Layout report for a script string: writes the header qwords and the first 32
+// data bytes to work/strinfo.bin. Used to settle whether long strings carry
+// their bytes inline at +0x18 or point somewhere else, which decides whether a
+// script string can be used as an output buffer at all.
+inline void api_strinfo(unsigned long long tstr, unsigned int len) {
+    HANDLE f = api().CreateFileA("D:\\zendo\\work\\strinfo.bin", GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char line[256];
+    unsigned int n = 0;
+    const char* hex = "0123456789abcdef";
+    line[n++] = 'l';
+    line[n++] = 'e';
+    line[n++] = 'n';
+    line[n++] = ' ';
+    char d[12];
+    unsigned int k = 0, v = len;
+    do { d[k++] = static_cast<char>('0' + v % 10); v /= 10; } while (v);
+    while (k) line[n++] = d[--k];
+    line[n++] = '\n';
+    for (int q = 0; q < 6; ++q) {
+        unsigned long long x = 0;
+        read_u64(tstr + 8ull * q, &x);
+        line[n++] = 'p';
+        line[n++] = static_cast<char>('0' + q);
+        line[n++] = ' ';
+        for (int b = 15; b >= 0; --b) line[n++] = hex[(x >> (4 * b)) & 0xf];
+        line[n++] = '\n';
+    }
+    DWORD w = 0;
+    api().WriteFile(f, line, n, &w, nullptr);
+    api().CloseHandle(f);
+}
+
+// One captured closure is the whole native surface. The first argument picks
+// the operation; anything unrecognised is handed to the original f, so the
+// game's own print keeps working while we live inside its object.
+//
+//   zendo:ping                 -> 4080
+//   zendo:scratch              -> address of a writable byte buffer in payload
+//   zendo:read   (addr, buf)   -> bytes copied into the caller's string buffer
+//   zendo:write  (addr, src)   -> bytes copied out of a script string, 1 or 0
+//
+// read/write take a Lua string as the buffer. Writing into a long string
+// (length > 40) is safe: Luau only interns short strings, so no hash table is
+// touched. The chunk test uses 64-byte buffers for that reason.
+inline int native_api(void* L) {
+    unsigned long long l = reinterpret_cast<unsigned long long>(L);
+    // A dedicated page, not a static in the image: the write op changes page
+    // protection, and touching the page our own code lives on is a variable
+    // this test does not need.
+    static unsigned long long scratch = 0;
+    if (!scratch) {
+        void* p = api().VirtualAlloc ? api().VirtualAlloc(nullptr, 0x1000,
+                                                          MEM_COMMIT | MEM_RESERVE,
+                                                          PAGE_READWRITE)
+                                     : nullptr;
+        if (p) {
+            scratch = reinterpret_cast<unsigned long long>(p);
+            const char init[] = "ZENDO-API-OK";
+            for (unsigned int i = 0; i < sizeof(init); ++i)
+                *reinterpret_cast<char*>(scratch + i) = init[i];
+        }
+    }
+    // Every entry is recorded, matched or not: the fallback prints, so the log
+    // cannot tell "dispatcher ran and fell through" from "never called".
+    {
+        HANDLE f = api().CreateFileA("D:\\zendo\\work\\api.bin", GENERIC_WRITE,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            char b[4] = {'A', ' ', static_cast<char>('0' + (g_api_hits % 10)), '\n'};
+            DWORD w = 0;
+            ++g_api_hits;
+            api().WriteFile(f, b, 4, &w, nullptr);
+            api().CloseHandle(f);
+        }
+    }
+
+    unsigned int oplen = 0;
+    char* op = lua_arg_str(l, 0, &oplen);
+    if (op) {
+        if (op_is(op, oplen, "zendo:ping")) {
+            api_step('S', 1);
+            int r = lua_ret_num(l, 4080.0);
+            api_step('E', 1);
+            return r;
+        }
+        if (op_is(op, oplen, "zendo:scratch")) {
+            api_step('S', 2);
+            int r = lua_ret_num(l, static_cast<double>(scratch));
+            api_step('E', 2);
+            return r;
+        }
+
+        if (op_is(op, oplen, "zendo:strinfo")) {
+            api_step('S', 3);
+            unsigned int slen = 0;
+            unsigned long long t = lua_arg_tstr(l, 1, &slen);
+            if (t) api_strinfo(t, slen);
+            int r = lua_ret_num(l, static_cast<double>(slen));
+            api_step('E', 3);
+            return r;
+        }
+
+        // Chunk-side reporting. The script hands the values it wants recorded to
+        // this op, so the numbers are read from a live call frame instead of from
+        // the pcall result area, which can sit in a stack block that was
+        // reallocated by the call.
+        if (op_is(op, oplen, "zendo:logv")) {
+            unsigned long long raw[4] = {0, 0, 0, 0};
+            for (int i = 1; i <= 4; ++i) {
+                LuaArg a{};
+                if (!lua_arg(l, i, &a)) continue;
+                raw[i - 1] = a.v;
+            }
+            api_line('V', raw[0], raw[1], raw[2], raw[3]);
+            return lua_ret_num(l, 1.0);
+        }
+
+        // Frame probe: records L, base, top, ci->top as the script sees the call
+        // arrive. Runs before and after other ops in a chunk, so a frame that
+        // goes bad can be pinned to the call that broke it.
+        if (op_is(op, oplen, "zendo:mark")) {
+            unsigned long long top = 0, base = 0, ci = 0, citop = 0;
+            read_u64(l + 0x60, &top);
+            read_u64(l + 0x58, &base);
+            if (read_u64(l + 0x70, &ci) && ci) read_u64(ci + 0x8, &citop);
+            api_line('M', l, base, top, citop);
+            return 0;
+        }
+
+        // Reads five numeric arguments and returns their sum. No memory access
+        // at all: this isolates argument marshalling from the store itself.
+        if (op_is(op, oplen, "zendo:argsum")) {
+            api_step('S', 9);
+            double sum = 0, v = 0;
+            int got = 0;
+            for (int i = 1; i <= 5; ++i) {
+                if (!lua_arg_num(l, i, &v)) break;
+                sum += v;
+                ++got;
+            }
+            int r = lua_ret_num(l, sum);
+            api_step('P', 9);
+            return r;
+        }
+
+        // Plain write, no protection change: this is the same store the poke op
+        // does, with VirtualProtect taken out of the picture, so a crash can be
+        // blamed on one of the two.
+        if (op_is(op, oplen, "zendo:wr8")) {
+            api_step('S', 8);
+            double addr = 0;
+            if (!lua_arg_num(l, 1, &addr)) {
+                api_step('E', 8);
+                return 0;
+            }
+            unsigned long long a = static_cast<unsigned long long>(addr);
+            if (!readable(reinterpret_cast<const void*>(a), 4)) {
+                api_step('E', 8);
+                return 0;
+            }
+            int written = 0;
+            for (int i = 2; i <= 9; ++i) {
+                double v = 0;
+                if (!lua_arg_num(l, i, &v)) break;
+                *reinterpret_cast<volatile unsigned char*>(a + written) =
+                    static_cast<unsigned char>(static_cast<unsigned long long>(v) & 0xff);
+                ++written;
+            }
+            int r = lua_ret_num(l, static_cast<double>(written));
+            api_step('P', 8);
+            return r;
+        }
+
+        // The output path that matters: copy memory into a caller-supplied
+        // script string. A long string stores its bytes inline at +0x18, so this
+        // is a straight memcpy into the GC heap - no allocation, no interning,
+        // no return marshalling for strings.
+        if (op_is(op, oplen, "zendo:readn")) {
+            api_step('S', 10);
+            double addr = 0;
+            unsigned int blen = 0;
+            unsigned long long t = lua_arg_tstr(l, 2, &blen);
+            if (!lua_arg_num(l, 1, &addr) || !t || !blen || blen <= 40) {
+                api_step('E', 10);
+                return lua_ret_num(l, 0);
+            }
+            unsigned long long src = static_cast<unsigned long long>(addr);
+            if (!readable(reinterpret_cast<const void*>(src), blen) ||
+                !readable(reinterpret_cast<const void*>(t + 0x18), blen)) {
+                api_step('E', 10);
+                return lua_ret_num(l, 0);
+            }
+            char* dst = reinterpret_cast<char*>(t + 0x18);
+            for (unsigned int i = 0; i < blen; ++i)
+                dst[i] = *reinterpret_cast<const char*>(src + i);
+            int r = lua_ret_num(l, static_cast<double>(blen));
+            api_step('P', 10);
+            return r;
+        }
+
+        if (op_is(op, oplen, "zendo:peek")) {
+            api_step('S', 6);
+            double addr = 0, cnt = 0;
+            if (!lua_arg_num(l, 1, &addr) || !lua_arg_num(l, 2, &cnt)) {
+                api_step('E', 6);
+                return 0;
+            }
+            unsigned long long a = static_cast<unsigned long long>(addr);
+            int n = static_cast<int>(cnt);
+            if (n < 0) n = 0;
+            if (n > 8) n = 8;
+            if (!readable(reinterpret_cast<const void*>(a), static_cast<SIZE_T>(n))) {
+                api_step('E', 6);
+                return 0;
+            }
+            int pushed = 0;
+            for (int i = 0; i < n; ++i)
+                pushed += lua_ret_num(l, static_cast<double>(
+                                             *reinterpret_cast<const unsigned char*>(a + i)));
+            api_step('P', 6);
+            return pushed;
+        }
+
+        if (op_is(op, oplen, "zendo:poke")) {
+            api_step('S', 7);
+            double addr = 0;
+            if (!lua_arg_num(l, 1, &addr)) {
+                api_step('E', 7);
+                return 0;
+            }
+            unsigned long long a = static_cast<unsigned long long>(addr);
+            if (!readable(reinterpret_cast<const void*>(a), 4)) {
+                api_step('E', 7);
+                return 0;
+            }
+            unsigned long long start = a & ~0xfffull;
+            unsigned long long end = (a + 4 + 0xfffull) & ~0xfffull;
+            DWORD oldp = 0;
+            if (!api().VirtualProtect(reinterpret_cast<void*>(start),
+                                      static_cast<SIZE_T>(end - start),
+                                      PAGE_READWRITE | 0x40000000u, &oldp)) {
+                api_step('E', 7);
+                return lua_ret_num(l, 0);
+            }
+            int written = 0;
+            for (int i = 2; i <= 5; ++i) {
+                double v = 0;
+                if (!lua_arg_num(l, i, &v)) break;
+                *reinterpret_cast<volatile unsigned char*>(a + written) =
+                    static_cast<unsigned char>(static_cast<unsigned long long>(v) & 0xff);
+                ++written;
+            }
+            DWORD tmp = 0;
+            api().VirtualProtect(reinterpret_cast<void*>(start),
+                                 static_cast<SIZE_T>(end - start), oldp, &tmp);
+            api_step('P', 7);
+            return lua_ret_num(l, static_cast<double>(written));
+        }
+
+        if (op_is(op, oplen, "zendo:read")) {
+            api_step('S', 4);
+            double addr = 0;
+            unsigned int blen = 0;
+            char* buf = lua_arg_str(l, 2, &blen);
+            if (!lua_arg_num(l, 1, &addr) || !buf || !blen) {
+                api_step('E', 4);
+                return lua_ret_num(l, 0);
+            }
+            unsigned long long src = static_cast<unsigned long long>(addr);
+            if (!readable(reinterpret_cast<const void*>(src), blen) ||
+                !readable(reinterpret_cast<const void*>(buf), blen)) {
+                api_step('E', 4);
+                return lua_ret_num(l, 0);
+            }
+            for (unsigned int i = 0; i < blen; ++i) buf[i] = *reinterpret_cast<const char*>(src + i);
+            int r = lua_ret_num(l, static_cast<double>(blen));
+            api_step('P', 4);
+            return r;
+        }
+
+        if (op_is(op, oplen, "zendo:write")) {
+            api_step('S', 5);
+            double addr = 0;
+            unsigned int slen = 0;
+            char* src = lua_arg_str(l, 2, &slen);
+            if (!lua_arg_num(l, 1, &addr) || !src || !slen) {
+                api_step('E', 5);
+                return lua_ret_num(l, 0);
+            }
+            bool ok = api_write(static_cast<unsigned long long>(addr), src, slen);
+            api_step('E', 5);
+            return lua_ret_num(l, ok ? 1.0 : 0.0);
+        }
+    }
+
+    if (g_cap_f) return reinterpret_cast<int (*)(void*)>(g_cap_f)(L);
+    return 0;
 }
 
 // The bytecode door, kept behind its own switch because the client carries no
@@ -7432,6 +7978,37 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
                 o.ch(' ');
             }
             o.nl();
+            flush_out(a, pipe, o);
+            stage_mark(a, "DONE");
+            continue;
+        }
+        if (cmd[0] == 'z') {
+            // Capture print's closure, leave its f pointing at the dispatcher,
+            // then hand the same object to a chunk as an argument. The chunk
+            // calls it with the sentinel; if 4080 comes back, the loop is
+            // closed: Lua -> value -> closure -> CFG dispatcher -> our page.
+            g_base = base;
+            g_cap_closure = 0;
+            exec_raw(a, pipe, o, L, base, kChunkKCaptureBody, kChunkKCaptureLen, "zcapture");
+            if (!g_cap_closure) {
+                o.str("api no closure\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            wr64(g_cap_closure + 0x28, reinterpret_cast<unsigned long long>(&native_api));
+            o.str("api swapped clo=");
+            o.hex(g_cap_closure);
+            o.str(" f=");
+            o.hex(g_cap_f);
+            o.nl();
+            flush_out(a, pipe, o);
+            stage_mark(a, "API");
+            if (!arm_cfg(a, o, reinterpret_cast<unsigned long long>(&native_api), "api cfg"))
+                o.str("api cfg unarmed, calling anyway\n");
+            flush_out(a, pipe, o);
+            exec_protected(a, pipe, o, L, base, kZCallBody, kZCallLen, "zapi", g_cap_closure);
+            o.str("api left in place\n");
             flush_out(a, pipe, o);
             stage_mark(a, "DONE");
             continue;
