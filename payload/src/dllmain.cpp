@@ -7060,6 +7060,131 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             stage_mark(a, "DONE");
             continue;
         }
+        if (cmd[0] == 'x') {
+            // CFG has no bitmap entry for MEM_PRIVATE pages, and the policy
+            // cannot be relaxed at runtime (err 5). The check itself lives in
+            // ntdll's dispatch stub: every instrumented indirect call is a
+            // `call qword ptr [rip+x]` to one shared pointer. Find that pointer
+            // by counting which ntdll address the client's call sites point at
+            // most often, then replace the stub body with `jmp rax` - the
+            // target already arrives in rax.
+            Module ntdll = find_module(fnv1a_w(L"ntdll.dll"));
+            o.str("guard ntdll=");
+            o.hex(reinterpret_cast<unsigned long long>(ntdll.base));
+            o.nl();
+            flush_out(a, pipe, o);
+            if (!ntdll.base) { stage_mark(a, "DONE"); continue; }
+            unsigned long long lo = reinterpret_cast<unsigned long long>(ntdll.base);
+            unsigned long long hi = lo + ntdll.size;
+            unsigned long long cbase = base;
+            unsigned long long cend = base + 0x1000000ull;
+            unsigned long long hit = 0;
+            static unsigned long long cand_p[192];
+            static unsigned int cand_n[192];
+            unsigned int ncand = 0;
+            auto* p = reinterpret_cast<const unsigned char*>(cbase);
+            unsigned long long n = cend - cbase;
+            // The protector leaves whole pages PAGE_NOACCESS until they run, so
+            // a linear read crashes. Walk one page at a time and only touch
+            // pages that are actually readable.
+            for (unsigned long long i = 0; i + 6 < n; ++i) {
+                if ((i & 0xfff) == 0) {
+                    Mbi mbi{};
+                    if (!a.VirtualQuery(p + i, &mbi, sizeof(mbi))) { i += 0xfff; continue; }
+                    DWORD prot = mbi.Protect & 0xff;
+                    bool okp = mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) &&
+                               (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                                prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                                prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+                    if (!okp) {
+                        unsigned long long skip = 0x1000 - (i & 0xfff);
+                        i += skip - 1;
+                        continue;
+                    }
+                }
+                if (p[i] != 0xff || p[i + 1] != 0x15) continue;
+                int disp = *reinterpret_cast<const int*>(p + i + 2);
+                unsigned long long slot = cbase + i + 6 + static_cast<long long>(disp);
+                if (slot < cbase || slot + 8 > cend) continue;
+                unsigned long long tgt = 0;
+                if (!read_u64(slot, &tgt)) continue;
+                if (tgt < lo || tgt >= hi) continue;
+                unsigned int j = 0;
+                for (; j < ncand; ++j) {
+                    if (cand_p[j] == tgt) { ++cand_n[j]; break; }
+                }
+                if (j == ncand && ncand < 192) {
+                    cand_p[ncand] = tgt;
+                    cand_n[ncand] = 1;
+                    ++ncand;
+                }
+                // The dispatch stub always ends in `jmp rax`. A target that has
+                // one near its head is the stub itself, so stop right there
+                // instead of scanning the rest of the image.
+                bool has = false;
+                for (int k = 0; k < 0x40; ++k) {
+                    unsigned char b0 = *reinterpret_cast<unsigned char*>(tgt + k);
+                    unsigned char b1 = *reinterpret_cast<unsigned char*>(tgt + k + 1);
+                    if (b0 == 0xff && b1 == 0xe0) { has = true; break; }
+                }
+                if (has) { hit = tgt; break; }
+            }
+            unsigned int best = 0;
+            for (unsigned int j = 1; j < ncand; ++j)
+                if (cand_n[j] > cand_n[best]) best = j;
+            if (!hit && !ncand) {
+                o.str("guard no candidate\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            unsigned long long fn = hit ? hit : cand_p[best];
+            o.str("guard fn=");
+            o.hex(fn);
+            o.str(" hits=");
+            o.dec(cand_n[best]);
+            o.str(" cands=");
+            o.dec(ncand);
+            o.str(" bytes=");
+            unsigned char pb[8] = {0};
+            for (int k = 0; k < 8; ++k) pb[k] = *reinterpret_cast<unsigned char*>(fn + k);
+            for (int k = 0; k < 8; ++k) { o.hex(pb[k]); o.str(" "); }
+            o.nl();
+            flush_out(a, pipe, o);
+            // Sanity: a guarded dispatch stub must jump through rax somewhere
+            // near its head. Anything else means the histogram picked noise.
+            bool looks = false;
+            for (int k = 0; k < 0x40; ++k) {
+                unsigned char b0 = *reinterpret_cast<unsigned char*>(fn + k);
+                unsigned char b1 = *reinterpret_cast<unsigned char*>(fn + k + 1);
+                if (b0 == 0xff && b1 == 0xe0) { looks = true; break; }
+            }
+            if (!looks) {
+                o.str("guard no jmp rax in head, not patching\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            DWORD oldp = 0;
+            if (!a.VirtualProtect(reinterpret_cast<void*>(fn), 0x1000,
+                                  PAGE_EXECUTE_READWRITE, &oldp)) {
+                o.str("guard protect failed=");
+                o.dec(static_cast<unsigned int>(a.GetLastError()));
+                o.nl();
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            *reinterpret_cast<unsigned char*>(fn) = 0x48;
+            *reinterpret_cast<unsigned char*>(fn + 1) = 0xff;
+            *reinterpret_cast<unsigned char*>(fn + 2) = 0xe0;
+            DWORD tmp = 0;
+            a.VirtualProtect(reinterpret_cast<void*>(fn), 0x1000, oldp, &tmp);
+            o.str("guard patched\n");
+            flush_out(a, pipe, o);
+            stage_mark(a, "GUARD");
+            cmd[0] = 'k';
+        }
         if (cmd[0] == 'k') {
             // The whole question in one command: can Luau call into this
             // payload at all? A C closure taken from the globals gets its
