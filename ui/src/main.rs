@@ -165,7 +165,16 @@ fn steps_of<'a>(spec: &str, chunk: &'a [u8]) -> Result<Vec<pipe::Step<'a>>, Stri
 fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, String> {
     let t0 = Instant::now();
     let path = temp_script(&source)?;
-    let chunk = build(&path)?;
+    // A script that talks to the native surface has to run synchronously on the
+    // borrowed thread: `zendo:loadstring` blocks inside the client until the
+    // executor answers on the session pipe, and the deferred wrapper would move
+    // the body onto a scheduler thread that outlives the pipe. Everything else
+    // keeps the wrapper, so yielding stays legal for ordinary scripts.
+    let chunk = if source.contains("zendo:") {
+        zendo_core::compile_str(&source)?
+    } else {
+        build(&path)?
+    };
 
     let server =
         pipe::Pipe::create(r"\\.\pipe\zendo-dev").map_err(|e| format!("pipe: {e}"))?;
