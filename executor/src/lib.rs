@@ -65,8 +65,8 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 5 then
-local api = { version = 5, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 6 then
+local api = { version = 6, missing = {} }
 local function put(name, value)
     if rawget(__znd_env, name) == nil then __znd_env[name] = value end
 end
@@ -218,6 +218,28 @@ end)
 
 put("compareinstances", function(a, b)
     return a == b
+end)
+
+-- A constant already lives in the VM heap as a TValue, so it can be moved onto
+-- the stack as-is: no string constructor needed, and the value keeps its type.
+put("getconstants", function(f)
+    local w = table.pack(call("zendo:proto", f, 160))
+    local sizek = w[4]
+    if type(sizek) ~= "number" then return {} end
+    local out = {}
+    for i = 0, sizek - 1 do
+        out[#out + 1] = call("zendo:kget", f, i)
+    end
+    return out
+end)
+
+put("getinfo", function(f)
+    local w = table.pack(call("zendo:proto", f, 160))
+    return {
+        linedefined = w[2],
+        maxstacksize = w[3],
+        numk = w[4],
+    }
 end)
 
 put("cloneref", function(ref)

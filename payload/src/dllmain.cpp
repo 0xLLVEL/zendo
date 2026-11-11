@@ -3420,6 +3420,66 @@ inline int native_api(void* L) {
             return pushed;
         }
 
+        // Copy a TValue out of the proto's constants array. The value already
+        // lives in the VM heap, so moving its 16 bytes onto the result stack
+        // gives the script a real string or number without constructing one.
+        if (op_is(op, oplen, "zendo:kget")) {
+            api_step('S', 28);
+            LuaArg a{};
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v) return 0;
+            double idxf = 0;
+            if (!lua_arg_num(l, 2, &idxf) || idxf < 0 || idxf > 4096) return 0;
+            unsigned long long proto = 0, k = 0;
+            if (!read_u64(a.v + 0x18, &proto) || !proto) return 0;
+            if (!read_u64(proto + 0x60, &k) || !k) return 0;
+            unsigned int sizek = 0;
+            read_u32(proto + 0xac, &sizek);
+            unsigned int i = static_cast<unsigned int>(idxf);
+            if (i >= sizek) return 0;
+            unsigned long long src = k + 16ull * i;
+            unsigned long long v = 0, w = 0;
+            if (!read_u64(src, &v) || !read_u64(src + 8, &w)) return 0;
+
+            unsigned long long top = 0;
+            if (!read_u64(l + 0x60, &top) || !top) return 0;
+            unsigned long long last = 0, ci = 0, citop = 0;
+            read_u64(l + 0x68, &last);
+            if (read_u64(l + 0x70, &ci) && ci) read_u64(ci + 0x8, &citop);
+            unsigned long long limit = last;
+            if (citop && citop < limit) limit = citop;
+            if (limit && top + 16 > limit) return 0;
+            wr64(top, v);
+            wr64(top + 8, w);
+            wr64(l + 0x60, top + 16);
+            api_step('E', 28);
+            return 1;
+        }
+        // the tag found at each pointer, so the constants array can be found by
+        // looking for tag 6 at the address a word holds - not by assuming an
+        // offset from a layout doc.
+        if (op_is(op, oplen, "zendo:protoscan")) {
+            api_step('S', 27);
+            LuaArg a{};
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v) return 0;
+            unsigned long long proto = 0;
+            if (!read_u64(a.v + 0x18, &proto) || !proto) return 0;
+            int pushed = 0;
+            for (unsigned int i = 0; i < 24; ++i) {
+                unsigned long long word = 0;
+                if (!read_u64(proto + 8ull * i, &word)) break;
+                unsigned int code = 0;
+                if (word && readable(reinterpret_cast<const void*>(word), 16)) {
+                    unsigned long long w2 = 0;
+                    read_u64(word + 8, &w2);
+                    unsigned int tt = static_cast<unsigned int>((w2 >> 32) & 0xff);
+                    code = 1u | (tt << 1);
+                }
+                pushed += lua_ret_num(l, static_cast<double>(code));
+            }
+            api_step('E', 27);
+            return pushed;
+        }
+
         if (op_is(op, oplen, "zendo:strinfo")) {
             api_step('S', 3);
             unsigned int slen = 0;
