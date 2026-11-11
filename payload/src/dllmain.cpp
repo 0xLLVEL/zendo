@@ -7060,6 +7060,162 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             stage_mark(a, "DONE");
             continue;
         }
+        if (cmd[0] == 'N') {
+            // Run 1 of the guard work: read only. The CFG dispatch stub is a
+            // fixed byte pattern in ntdll, not something to guess. Take the
+            // address from the image's own load config, then confirm it against
+            // every `jmp rax` in .text so the patch target in stage 'x' is
+            // picked from bytes instead of a histogram of call sites. Nothing
+            // is written here - no VirtualProtect, no store.
+            Module ntdll = find_module(fnv1a_w(L"ntdll.dll"));
+            if (!ntdll.base) {
+                o.str("ntdll missing\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            unsigned long long nb = reinterpret_cast<unsigned long long>(ntdll.base);
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(ntdll.base);
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(nb + dos->e_lfanew);
+            o.str("ntdll base=");
+            o.hex(nb);
+            o.str(" image=");
+            o.hex(nt->OptionalHeader.SizeOfImage);
+            o.str(" sections=");
+            o.dec(nt->FileHeader.NumberOfSections);
+            o.nl();
+
+            unsigned long long check = 0, dispatch = 0, table = 0, count = 0;
+            unsigned int gflags = 0, lsz = 0;
+            auto& lc = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+            if (!lc.VirtualAddress) {
+                o.str("ldcfg none\n");
+            } else {
+                auto* lp = reinterpret_cast<unsigned char*>(nb + lc.VirtualAddress);
+                lsz = *reinterpret_cast<unsigned int*>(lp);
+                if (lsz > lc.Size) lsz = lc.Size;
+                o.str("ldcfg rva=");
+                o.hex(lc.VirtualAddress);
+                o.str(" size=");
+                o.dec(lsz);
+                o.nl();
+                if (lsz >= 0x80) {
+                    check = *reinterpret_cast<unsigned long long*>(lp + 0x70);
+                    dispatch = *reinterpret_cast<unsigned long long*>(lp + 0x78);
+                }
+                if (lsz >= 0x88) table = *reinterpret_cast<unsigned long long*>(lp + 0x80);
+                if (lsz >= 0x90) count = *reinterpret_cast<unsigned long long*>(lp + 0x88);
+                if (lsz >= 0x94) gflags = *reinterpret_cast<unsigned int*>(lp + 0x90);
+            }
+
+            const unsigned long long ptrs[2] = {check, dispatch};
+            const char* names[2] = {"cf_check   ", "cf_dispatch"};
+            for (int i = 0; i < 2; ++i) {
+                o.str("guard ");
+                o.str(names[i]);
+                o.str("=");
+                o.hex(ptrs[i]);
+                if (ptrs[i] >= nb && ptrs[i] < nb + ntdll.size) {
+                    o.str(" rva=");
+                    o.hex(ptrs[i] - nb);
+                }
+                o.str(" head=");
+                for (int k = 0; k < 24; ++k) {
+                    unsigned char b = 0;
+                    if (readable(reinterpret_cast<const void*>(ptrs[i] + k), 1))
+                        b = *reinterpret_cast<unsigned char*>(ptrs[i] + k);
+                    o.hex(b);
+                    o.ch(' ');
+                }
+                o.nl();
+            }
+            o.str("guard flags=");
+            o.hex(gflags);
+            o.str(" table=");
+            o.hex(table);
+            o.str(" count=");
+            o.dec(static_cast<unsigned int>(count));
+            o.nl();
+            flush_out(a, pipe, o);
+
+            auto* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+                reinterpret_cast<unsigned char*>(&nt->OptionalHeader) +
+                nt->FileHeader.SizeOfOptionalHeader);
+            unsigned char* text = nullptr;
+            unsigned int text_rva = 0, text_sz = 0;
+            for (unsigned int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+                const char* nm = reinterpret_cast<const char*>(sec->Name);
+                if (nm[0] == '.' && nm[1] == 't' && nm[2] == 'e' && nm[3] == 'x' && nm[4] == 't') {
+                    text = reinterpret_cast<unsigned char*>(nb + sec->VirtualAddress);
+                    text_rva = sec->VirtualAddress;
+                    text_sz = sec->Misc.VirtualSize;
+                    break;
+                }
+            }
+            if (!text || !text_sz) {
+                o.str("text missing\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            o.str("text rva=");
+            o.hex(text_rva);
+            o.str(" size=");
+            o.hex(text_sz);
+            o.nl();
+            flush_out(a, pipe, o);
+
+            unsigned int hits = 0, rex = 0, shown = 0, first = 0;
+            for (unsigned int i = 0; i + 1 < text_sz; ++i) {
+                if (text[i] != 0xff || text[i + 1] != 0xe0) continue;
+                if (!hits) first = text_rva + i;
+                ++hits;
+                bool has_rex = i > 0 && text[i - 1] == 0x48;
+                if (has_rex) ++rex;
+                if (shown >= 40) continue;
+                ++shown;
+                o.str("  hit rva=");
+                o.hex(text_rva + i);
+                o.str(" va=");
+                o.hex(nb + text_rva + i);
+                o.str(" rex=");
+                o.dec(has_rex ? 1 : 0);
+                o.str(" pre=");
+                for (int k = 16; k >= 1; --k) {
+                    if (i < static_cast<unsigned int>(k)) continue;
+                    o.hex(text[i - k]);
+                    o.ch(' ');
+                }
+                o.nl();
+            }
+            o.str("scan_ff_e0 total=");
+            o.dec(hits);
+            o.str(" rex=");
+            o.dec(rex);
+            o.str(" first=");
+            o.hex(first);
+            o.nl();
+            // Which of these hits is the load config's own dispatch pointer?
+            // The one whose VA matches is the stub the compiler's guarded
+            // indirect calls go through; anything else is an ordinary thunk.
+            if (dispatch) {
+                bool found = false;
+                for (unsigned int i = 0; i + 1 < text_sz; ++i) {
+                    if (text[i] != 0xff || text[i + 1] != 0xe0) continue;
+                    if (nb + text_rva + i != dispatch) continue;
+                    found = true;
+                    break;
+                }
+                o.str("dispatch_is_jmp_rax=");
+                o.dec(found ? 1 : 0);
+                o.str(" dispatch_rva=");
+                o.hex(dispatch >= nb ? dispatch - nb : 0);
+                o.nl();
+            }
+            flush_out(a, pipe, o);
+            stage_mark(a, "DONE");
+            continue;
+        }
         if (cmd[0] == 'x') {
             // CFG has no bitmap entry for MEM_PRIVATE pages, and the policy
             // cannot be relaxed at runtime (err 5). The check itself lives in
