@@ -331,14 +331,42 @@ that has not been measured are simply absent, and the API table records them in
 
 ## Build
 
+Four artifacts, three toolchains, no package manager. Everything is built from
+source on the machine that runs it.
+
 ### Prerequisites
 
-- Windows 11 x64
-- Visual Studio 2022 Build Tools (MSVC 14.44) — for the payload
-- Rust (stable, edition 2021) — for the injector, executor and UI
-- `luau-compile.exe` — default path `D:\zend\test\luau\luau-compile.exe`,
-  override with `ZENDO_COMPILER`
-- A Roblox client executable matching the target build
+| Tool | Needed for | Notes |
+|---|---|---|
+| Windows 11 x64 | everything | the target is a Windows-only process |
+| Visual Studio 2022 with **Desktop development with C++** | payload | any edition — BuildTools, Community, Enterprise. `build.bat` finds it with `vswhere`; no PATH setup required |
+| Rust stable, edition 2021 (`x86_64-pc-windows-msvc`) | injector, executor, UI | no external crates in the injector; executor and UI pull from crates.io |
+| WebView2 runtime | UI | preinstalled on Windows 11, and on `windows-latest` runners |
+| `luau-compile.exe` | executor at runtime | default `D:\zend\test\luau\luau-compile.exe`; override with `ZENDO_COMPILER`. Not needed to *build*, only to *run* a script |
+| Roblox client matching the target build | running | `0.746.0.7461267` / `f0ea5da9412f4e35` |
+
+Nothing else is vendored: the injector declares its own `kernel32` externs, and
+the payload resolves every Win32 entry point from the PEB at runtime, so it has
+no import table at all.
+
+### Payload stages
+
+`ZENDO_STAGE` is a compile-time switch (`/DZENDO_STAGE=...`). The whole payload
+is one translation unit; the stage selects which entry behaviour and which
+probe chunks are compiled in.
+
+| Stage | Entry | Use |
+|---|---|---|
+| `4` (default) | hello stub | a build sanity check. **Do not inject it into a running client expecting a session** — it does not serve the pipe |
+| `11`–`15` | `run_probe`, `run_tree`, `run_load` | instance tree and loader measurements |
+| `16`–`19` | `run_ls`, `run_chunk`, `run_bc`, `run_exec` | compile/load/execute path, one step per stage |
+| `50`–`62` | `run_verify`, `run_loadtest`, `run_unseal`, `run_src`, `run_bigexec`, `run_optable`, `run_dispatch`, `run_opmap*`, `run_rawexec` | opcode table, dispatch and loader experiments |
+| `63` | `run_batch` | one script, then leave |
+| `64` | `run_repl` | **the long-lived dispatcher.** This is the build every verified run in `docs/sunc.md` used: connects to the pipe, serves ops until detached |
+| `65` | returns `111` after the mutex check | liveness/`dead_wait` instrumentation only |
+
+The lower stages are instruments, not products. If a run behaves like the
+payload is dead, check the stage before checking the code.
 
 ### Commands
 
@@ -358,16 +386,67 @@ cargo build --release --manifest-path ui\Cargo.toml
 
 Artifacts:
 
-| Artifact | Path |
-|---|---|
-| payload DLL | `payload/build/zendo.dll` |
-| injector | `injector/target/release/zendo-inject.exe` |
-| CLI | `executor/target/release/zendo-exec.exe` |
-| UI | `ui/target/release/zendo-ui.exe` |
+| Artifact | Path | Size (this build) |
+|---|---|---|
+| payload DLL | `payload/build/zendo.dll` | ~133 KB |
+| injector | `injector/target/release/zendo-inject.exe` | ~207 KB |
+| CLI | `executor/target/release/zendo-exec.exe` | ~373 KB |
+| UI | `ui/target/release/zendo-ui.exe` | ~7.9 MB (Tauri + WebView2 bindings) |
 
-The payload is built with `/NODEFAULTLIB /ENTRY:DllMain /FIXED:NO`. `ZENDO_STAGE`
-selects which probe/feature set is compiled in; `64` is the long-lived
-dispatcher build used by every verified run in `docs/sunc.md`.
+### What the payload build does
+
+`payload/build.bat` locates `vcvars64.bat` through `vswhere`
+(`-latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64`),
+falls back to the two paths that exist on most machines, and fails loudly if no
+x64 toolset is present. Then one `cl` invocation:
+
+```bat
+cl /nologo /LD /O2 /GS- /GR- /EHs-c- /EHa- /DYNAMICBASE /DZENDO_STAGE=64 ^
+   /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 ^
+   /Fo:build\ /Fe:build\zendo.dll src\dllmain.cpp ^
+   /link /FIXED:NO /NODEFAULTLIB /ENTRY:DllMain /SUBSYSTEM:WINDOWS /MACHINE:X64 /INCREMENTAL:NO
+```
+
+Why each flag is there:
+
+| Flag | Reason |
+|---|---|
+| `/LD` | DLL |
+| `/O2` | the payload runs inside the client's frame budget |
+| `/GS- /GR- /EHs-c- /EHa-` | no stack cookies, no RTTI, no exceptions — no CRT support code is linked |
+| `/DYNAMICBASE` + `/FIXED:NO` | relocations are kept, so the image can be mapped anywhere (required for `SEC_IMAGE`) |
+| `/NODEFAULTLIB` | nothing from the CRT; the payload is self-contained |
+| `/ENTRY:DllMain` | no `_DllMainCRTStartup`, no CRT init |
+| `/SUBSYSTEM:WINDOWS` | no console window when the image is mapped |
+
+A successful build prints `BUILT ...\zendo.dll`. The result is a PE32+ image
+with an **empty import directory** — every Win32 function is resolved from the
+PEB by export hash, which is why it can be mapped without touching the loader.
+
+Clean builds: `target/` and `build/` are ignored. Deleting
+`payload\build\zendo.dll` and rebuilding takes a few seconds; the payload has no
+generated sources to regenerate.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on `windows-latest` for every push to `main`, on
+pull requests, and on demand. It:
+
+1. checks out the repo and installs stable Rust with a cache keyed on
+   `executor`, `injector`, `ui`;
+2. builds the **payload** with `payload\build.bat 64` — on a runner the toolset
+   is the Enterprise install, which is exactly why the script searches instead
+   of hardcoding a path;
+3. inspects `zendo.dll` as bytes: PE32+ magic (`0x20B`), size over 10 KB, and
+   **import directory RVA `0`**. That last check is what protects the "no CRT,
+   no imports" invariant from a stray `#include` or an accidental
+   `/NODEFAULTLIB` deletion;
+4. builds executor, injector and UI in release mode;
+5. uploads the four binaries as the `zendo-win64` artifact.
+
+CI does **not** inject into a client, run Luau, or need a Roblox build — those
+steps need an elevated live process and are done by hand, one client per run
+(see [Verification rules](#verification-rules)).
 
 ---
 
@@ -586,6 +665,8 @@ These exist because each one was learned the hard way.
 
 ```
 zendo/
+├── README.md                  this file
+├── .github/workflows/ci.yml   payload + rust builds, import-table check
 ├── payload/
 │   ├── build.bat              cl, /NODEFAULTLIB, /ENTRY:DllMain
 │   ├── src/dllmain.cpp        the whole payload: PEB, ops, Lua reader/writer

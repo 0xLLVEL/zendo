@@ -21,6 +21,30 @@ jobs:
             injector
             ui
 
+      # build.bat finds the MSVC toolset through vswhere, so the same script
+      # works on a runner (Enterprise) and on a dev box (BuildTools/Community).
+      # Stage 64 is the long-lived dispatcher build; the default stage 4 is a
+      # hello stub and is not what any verified run uses.
+      - name: payload
+        shell: cmd
+        run: payload\build.bat 64
+
+      - name: payload artifact check
+        shell: pwsh
+        run: |
+          $dll = Get-Item payload\build\zendo.dll
+          if ($dll.Length -lt 10kb) { throw "payload too small: $($dll.Length) bytes" }
+          $pe = [System.IO.File]::ReadAllBytes($dll.FullName)
+          $lfanew = [BitConverter]::ToUInt32($pe, 0x3C)
+          $opt = $lfanew + 0x18
+          $magic = [BitConverter]::ToUInt16($pe, $opt)
+          if ($magic -ne 0x20B) { throw ("not PE32+: magic 0x{0:x}" -f $magic) }
+          # data directory 1 is the import table; it must be empty, the payload
+          # resolves every Win32 entry itself from the PEB
+          $impRva = [BitConverter]::ToUInt32($pe, $opt + 0x78)
+          if ($impRva -ne 0) { throw ("payload has an import directory at RVA 0x{0:x}" -f $impRva) }
+          "payload ok: {0} bytes, PE32+, no imports" -f $dll.Length
+
       - name: executor
         run: cargo build --release --manifest-path executor/Cargo.toml
 
@@ -29,3 +53,13 @@ jobs:
 
       - name: ui
         run: cargo build --release --manifest-path ui/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zendo-win64
+          if-no-files-found: error
+          path: |
+            payload/build/zendo.dll
+            injector/target/release/zendo-inject.exe
+            executor/target/release/zendo-exec.exe
+            ui/target/release/zendo-ui.exe
