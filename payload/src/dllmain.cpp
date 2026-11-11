@@ -3396,6 +3396,30 @@ inline int native_api(void* L) {
             return r;
         }
 
+        // A raw window into a closure's Proto. Nothing here interprets the
+        // fields - it hands back the first words so a script can show which
+        // offset is which, and the reading is decided from that, not guessed.
+        if (op_is(op, oplen, "zendo:proto")) {
+            api_step('S', 26);
+            LuaArg a{};
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v) return 0;
+            unsigned long long proto = 0;
+            if (!read_u64(a.v + 0x18, &proto) || !proto) return 0;
+            double startf = 0;
+            unsigned int start = 0;
+            if (lua_arg_num(l, 2, &startf) && startf > 0 && startf < 0x200) {
+                start = static_cast<unsigned int>(startf) & ~3u;
+            }
+            int pushed = 0;
+            for (unsigned int i = 0; i < 24; ++i) {
+                unsigned int w = 0;
+                if (!read_u32(proto + start + 4ull * i, &w)) break;
+                pushed += lua_ret_num(l, static_cast<double>(w));
+            }
+            api_step('E', 26);
+            return pushed;
+        }
+
         if (op_is(op, oplen, "zendo:strinfo")) {
             api_step('S', 3);
             unsigned int slen = 0;
