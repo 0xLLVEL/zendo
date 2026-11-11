@@ -65,8 +65,8 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 3 then
-local api = { version = 3, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 4 then
+local api = { version = 4, missing = {} }
 local function put(name, value)
     if rawget(__znd_env, name) == nil then __znd_env[name] = value end
 end
@@ -154,6 +154,58 @@ end)
 -- invokes on its own runs at its own level. That is the whole test.
 put("checkcaller", function()
     return call("zendo:caller") == 1
+end)
+
+-- Filesystem lives on the host. The payload cannot build a Luau string, so the
+-- answer arrives as a chunk that returns the bytes; `call` runs it and the VM
+-- hands back a real string.
+put("readfile", function(path)
+    if type(path) ~= "string" then return nil end
+    return call("zendo:file", path)
+end)
+
+put("writefile", function(path, data)
+    if type(path) ~= "string" then return nil, "bad path" end
+    return call("zendo:filew", path, tostring(data or "")) == 1
+end)
+
+put("appendfile", function(path, data)
+    if type(path) ~= "string" then return nil, "bad path" end
+    local old = call("zendo:file", path)
+    local body = (type(old) == "string" and old or "") .. tostring(data or "")
+    return call("zendo:filew", path, body) == 1
+end)
+
+put("isfile", function(path)
+    if type(path) ~= "string" then return false end
+    return call("zendo:isfile", path) == 1
+end)
+
+put("isfolder", function(path)
+    if type(path) ~= "string" then return false end
+    local list = call("zendo:listfiles", path)
+    return type(list) == "table"
+end)
+
+put("makefolder", function(path)
+    if type(path) ~= "string" then return nil end
+    if call("zendo:listfiles", path) ~= nil then return true end
+    return call("zendo:filew", path .. "/.keep", "") == 1
+end)
+
+put("delfile", function(path)
+    if type(path) ~= "string" then return nil, "bad path" end
+    return call("zendo:filew", path, "") == 1
+end)
+
+put("listfiles", function(path)
+    local raw = call("zendo:listfiles", type(path) == "string" and path or "")
+    local out = {}
+    if type(raw) ~= "table" then return out end
+    for _, entry in ipairs(raw) do
+        out[#out + 1] = entry[1]
+    end
+    return out
 end)
 
 -- Encoding runs in plain Luau, not in the client's memory. There is no string

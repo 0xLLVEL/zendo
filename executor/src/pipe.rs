@@ -208,7 +208,37 @@ impl Pending {
     }
 }
 
-/// Fill `dst` from bytes already buffered in `acc` first, then from the pipe.
+/// A Luau string literal for arbitrary bytes. Everything outside printable
+/// ASCII goes out as a three digit decimal escape, which the parser turns back
+/// into the exact byte; three digits is why a following literal digit cannot be
+/// swallowed by the escape.
+fn luau_literal(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2 + 2);
+    s.push('"');
+    for &b in bytes {
+        match b {
+            b'"' => s.push_str("\\\""),
+            b'\\' => s.push_str("\\\\"),
+            0x20..=0x7e => s.push(b as char),
+            _ => s.push_str(&format!("\\{:03}", b)),
+        }
+    }
+    s.push('"');
+    s
+}
+
+/// Everything a script names lives under one directory. A path that climbs out
+/// with `..` is rejected rather than resolved: the client is not a shell.
+fn fs_path(raw: &[u8]) -> Option<std::path::PathBuf> {
+    let text = std::str::from_utf8(raw).ok()?;
+    if text.is_empty() || text.contains("..") {
+        return None;
+    }
+    let root = std::path::PathBuf::from(r"D:\zendo\work\fs");
+    let joined = root.join(text.trim_start_matches(['/', '\\']));
+    Some(joined)
+}
+
 /// A request header and its body travel together, so a single read can pull
 /// part of the body into the line buffer before the header is parsed.
 fn take_bytes(pipe: &Pipe, acc: &mut Vec<u8>, dst: &mut [u8]) -> io::Result<()> {
@@ -311,6 +341,89 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                             pipe.write_all(format!("E {}\n", msg.len()).as_bytes())?;
                             pipe.write_all(&msg)?;
                         }
+                    }
+                }
+                sink.flush()?;
+                continue;
+            }
+            if body.first() == Some(&b'F') || body.first() == Some(&b'G')
+                || body.first() == Some(&b'S') || body.first() == Some(&b'L')
+            {
+                // Filesystem request from inside the client. The payload cannot
+                // build a Luau string, so the answer is not raw bytes: it is a
+                // chunk that returns the bytes as a literal, which the VM turns
+                // into a real string on the other side.
+                let cmd = body[0];
+                let fields: Vec<&[u8]> = body[1..]
+                    .split(|&c| c == b' ')
+                    .filter(|f| !f.is_empty())
+                    .collect();
+                let num = |i: usize| -> usize {
+                    fields.get(i).and_then(|f| std::str::from_utf8(f).ok())
+                        .and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+                };
+                let plen = num(0);
+                let dlen = if cmd == b'G' { num(1) } else { 0 };
+                let mut path = vec![0u8; plen.min(4096)];
+                let mut data = vec![0u8; dlen.min(1 << 20)];
+                if plen == 0 || plen > 4096 || dlen > (1 << 20) {
+                    pipe.write_all(b"E 0\n")?;
+                } else {
+                    take_bytes(pipe, &mut acc, &mut path)?;
+                    if dlen > 0 {
+                        take_bytes(pipe, &mut acc, &mut data)?;
+                    }
+                    let target = fs_path(&path);
+                    let mut reply: Option<String> = None;
+                    let mut blob_src: Option<String> = None;
+                    let mut ok = 0u8;
+                    match (cmd, target) {
+                        (_, None) => {
+                            reply = Some("E bad path\n".to_string());
+                        }
+                        (b'F', Some(p)) => match std::fs::read(&p) {
+                            Ok(bytes) => blob_src = Some(format!("return {}", luau_literal(&bytes))),
+                            Err(e) => reply = Some(format!("E {}\n", e.to_string().replace('\n', " "))),
+                        },
+                        (b'S', Some(p)) => ok = if p.is_file() { 1 } else { 0 },
+                        (b'L', Some(p)) => match std::fs::read_dir(&p) {
+                            Ok(rd) => {
+                                let mut names: Vec<String> = Vec::new();
+                                for ent in rd.flatten() {
+                                    let name = ent.file_name().to_string_lossy().to_string();
+                                    let is_dir = ent.path().is_dir();
+                                    names.push(format!("{{\"{}\",{}}}", name.replace('\\', "\\\\").replace('"', "\\\""),
+                                                        if is_dir { "true" } else { "false" }));
+                                }
+                                blob_src = Some(format!("return {{{}}}", names.join(",")));
+                            }
+                            Err(e) => reply = Some(format!("E {}\n", e.to_string().replace('\n', " "))),
+                        },
+                        (b'G', Some(p)) => {
+                            if let Some(parent) = p.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            ok = if std::fs::write(&p, &data).is_ok() { 1 } else { 0 };
+                        }
+                        _ => reply = Some("E bad cmd\n".to_string()),
+                    }
+                    if let Some(src) = blob_src {
+                        match crate::compile_str(&src) {
+                            Ok(blob) => {
+                                eprintln!("[pipe] fs reply {} bytes", blob.len());
+                                pipe.write_all(format!("K {}\n", blob.len()).as_bytes())?;
+                                pipe.write_all(&blob)?;
+                            }
+                            Err(e) => {
+                                let msg = e.into_bytes();
+                                pipe.write_all(format!("E {}\n", msg.len()).as_bytes())?;
+                                pipe.write_all(&msg)?;
+                            }
+                        }
+                    } else if let Some(line) = reply {
+                        pipe.write_all(line.as_bytes())?;
+                    } else {
+                        pipe.write_all(format!("A {}\n", ok).as_bytes())?;
                     }
                 }
                 sink.flush()?;

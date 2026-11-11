@@ -3299,6 +3299,9 @@ inline int lua_compile_remote(unsigned long long l, const char* src, unsigned in
     return 0;
 }
 
+// Defined after exec_raw, next to the call machinery it borrows.
+int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen);
+
 inline int native_api(void* L) {
     unsigned long long l = reinterpret_cast<unsigned long long>(L);
     // A dedicated page, not a static in the image: the write op changes page
@@ -3383,6 +3386,14 @@ inline int native_api(void* L) {
             }
             api_step('E', 24);
             return lua_ret_num(l, static_cast<double>(g_ours_n));
+        }
+
+        if (op_is(op, oplen, "zendo:file") || op_is(op, oplen, "zendo:filew") ||
+            op_is(op, oplen, "zendo:isfile") || op_is(op, oplen, "zendo:listfiles")) {
+            api_step('S', 25);
+            int r = zendo_file_op(l, op, oplen);
+            api_step('E', 25);
+            return r;
         }
 
         if (op_is(op, oplen, "zendo:strinfo")) {
@@ -4260,6 +4271,121 @@ inline int exec_raw(Api& a, HANDLE pipe, Out& o, unsigned long long L,
     wr64(L + 0x60, top0);
     flush_out(a, pipe, o);
     return 1;
+}
+
+// A filesystem answer crosses the pipe as a compiled chunk, never as raw
+// bytes: the payload still has no way to build a Luau string, but the VM builds
+// one from a literal. This op sends the request, loads the reply, calls it, and
+// leaves the result where the caller expects one.
+int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen) {
+    HANDLE pipe = g_cap_pipe;
+    Api& a = api();
+    if (pipe == INVALID_HANDLE_VALUE || !g_base) return 0;
+    unsigned int plen = 0;
+    char* path = lua_arg_str(l, 1, &plen);
+    if (!path || !plen || plen > 4096) return 0;
+
+    char cmd = 'F';
+    if (op_is(op, oplen, "zendo:isfile")) cmd = 'S';
+    else if (op_is(op, oplen, "zendo:listfiles")) cmd = 'L';
+    else if (op_is(op, oplen, "zendo:filew")) cmd = 'G';
+
+    unsigned int dlen = 0;
+    char* data = nullptr;
+    if (cmd == 'G') {
+        data = lua_arg_str(l, 2, &dlen);
+        if (!data) dlen = 0;
+    }
+
+    char head[48];
+    unsigned int n = 0, q = 0;
+    char digits[12];
+    unsigned int v = 0;
+    head[n++] = cmd;
+    head[n++] = ' ';
+    v = plen;
+    do { digits[q++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v);
+    while (q) head[n++] = digits[--q];
+    if (cmd == 'G') {
+        head[n++] = ' ';
+        v = dlen;
+        do { digits[q++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v);
+        while (q) head[n++] = digits[--q];
+    }
+    head[n++] = '\n';
+
+    DWORD w = 0;
+    if (!a.WriteFile(pipe, head, n, &w, nullptr)) return 0;
+    if (!a.WriteFile(pipe, path, plen, &w, nullptr)) return 0;
+    if (cmd == 'G' && dlen && !a.WriteFile(pipe, data, dlen, &w, nullptr)) return 0;
+
+    char line[64];
+    if (!pipe_line(a, pipe, line, sizeof(line))) return 0;
+    if (line[0] == 'A') return lua_ret_num(l, parse_dec(line + 2) ? 1.0 : 0.0);
+    if (line[0] != 'K') return 0;
+    unsigned int rlen = parse_dec(line + 2);
+    if (!rlen || rlen > (1u << 20) - 8) return 0;
+    unsigned long long buf = load_stage(rlen + 8);
+    if (!buf) return 0;
+    if (!read_all(a, pipe, reinterpret_cast<void*>(buf + 8), rlen)) return 0;
+
+    unsigned long long top0 = 0;
+    read_u64(l + 0x60, &top0);
+    if (!lua_load_stage(l, buf, rlen)) return 0;
+
+    struct CallCtx {
+        unsigned long long func;
+        int nresults;
+        int pad;
+    } ctx;
+    ctx.func = top0;
+    ctx.nresults = -1;
+    ctx.pad = 0;
+
+    unsigned long long ci = 0, bci = 0, cc = 0, hdr = 0, stk = 0;
+    read_u64(l + 0x70, &ci);
+    read_u64(l + 0x28, &bci);
+    read_u64(l + 0x38, &cc);
+    read_u64(l, &hdr);
+    read_u64(l + 0x48, &stk);
+    const unsigned long long ci_off = ci - bci;
+    const unsigned long long func_off = top0 - stk;
+    const unsigned short bcc = static_cast<unsigned short>((cc >> 16) & 0xffffull);
+    const unsigned char oldactive = static_cast<unsigned char>((hdr >> 40) & 0xff);
+
+    wr64(l + 0x38, (cc & ~0xffffull) | static_cast<unsigned long long>(bcc + 1));
+    *reinterpret_cast<volatile unsigned char*>(l + 3) = 0;
+
+    typedef int (*ProtFn)(void*, void*, void*);
+    ProtFn prot = reinterpret_cast<ProtFn>(g_base + 0x26360B0);
+    int st = prot(reinterpret_cast<void*>(l), reinterpret_cast<void*>(g_base + 0x2632230), &ctx);
+    wr64(l + 0x38, cc);
+
+    if (st != 0) {
+        unsigned long long stk2 = 0, nbase = 0, curtop = 0;
+        read_u64(l + 0x48, &stk2);
+        unsigned long long oldtop = stk2 + func_off;
+        read_u64(l + 0x60, &curtop);
+        close_upvals(l, oldtop, g_base);
+        typedef void (*SetErrFn)(void*, int, void*);
+        SetErrFn seterr = reinterpret_cast<SetErrFn>(g_base + 0x2637250);
+        seterr(reinterpret_cast<void*>(l), st, reinterpret_cast<void*>(oldtop));
+        unsigned long long nci = bci + ci_off;
+        wr64(l + 0x70, nci);
+        read_u64(nci, &nbase);
+        wr64(l + 0x58, nbase);
+        if (!oldactive) *reinterpret_cast<volatile unsigned char*>(l + 5) = 0;
+        wr64(l + 0x60, oldtop);
+        return 0;
+    }
+
+    unsigned long long stk2 = 0, t2 = 0;
+    read_u64(l + 0x48, &stk2);
+    read_u64(l + 0x60, &t2);
+    unsigned long long base_top = stk2 + func_off;
+    unsigned long long got = (t2 - base_top) / 16;
+    if (got > 4) got = 4;
+    return static_cast<int>(got);
 }
 
 // Runs the flush chunk with the report pipe muted: the payload's chatter would
