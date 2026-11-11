@@ -386,6 +386,27 @@ inline void wr64(unsigned long long addr, unsigned long long v) {
     *reinterpret_cast<volatile unsigned long long*>(addr) = v;
 }
 
+// Every offset the payload writes to belongs to an object the game's own GC
+// owns. Between two sessions that object can be collected and the page handed
+// to something else, so a blind store is a write into whatever lives there now
+// - a crash the client reports as nothing at all. This variant refuses unless
+// the page is committed and writable, and says whether it wrote.
+inline bool wr64_live(unsigned long long addr, unsigned long long v) {
+    if (addr < 0x10000) return false;
+    Mbi mbi;
+    if (!api().VirtualQuery || !api().VirtualQuery(reinterpret_cast<void*>(addr), &mbi,
+                                                   sizeof(mbi)))
+        return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    DWORD prot = mbi.Protect & 0xff;
+    if (prot != PAGE_READWRITE && prot != PAGE_WRITECOPY &&
+        prot != PAGE_EXECUTE_READWRITE && prot != PAGE_EXECUTE_WRITECOPY)
+        return false;
+    *reinterpret_cast<volatile unsigned long long*>(addr) = v;
+    return true;
+}
+
 inline void wr32(unsigned long long addr, unsigned int v) {
     *reinterpret_cast<volatile unsigned int*>(addr) = v;
 }
@@ -1333,6 +1354,7 @@ static volatile long g_veh_depth = 0;
 static unsigned long long g_veh_tid = 0;
 
 inline void stage_mark(Api& a, const char* s);
+inline void loop_mark(Api& a, unsigned int n);
 
 inline bool str_eq(const char* a, const char* b) {
     if (!a || !b) return false;
@@ -2701,6 +2723,14 @@ static const unsigned int kChunkFlushLen = sizeof(kChunkFlush);
 static unsigned long long g_cap_closure = 0;
 static unsigned long long g_cap_f = 0;
 static HANDLE g_cap_pipe = INVALID_HANDLE_VALUE;
+// Set by the `x` command. It means "detach for good": unwind out of the REPL
+// so DllMain can restore the borrowed thread. A payload that stays parked keeps
+// the process in a state the anti-cheat refuses to terminate - the window dies
+// but the pid survives, and only a reboot clears it.
+static int g_leave = 0;
+// Counts completed sessions. Written to work/loop.bin after each one, which is
+// how "the seek loop is alive" is proven instead of assumed.
+static unsigned int g_loop_n = 0;
 static int g_cap_mode = 0;   // 0 = untouched, 1 = swap only, 2 = +read args, 3 = +pipe
 static int g_api_live = 0;   // the closure slot carries native_api for this session
 static unsigned int g_cap_calls = 0;
@@ -3338,6 +3368,50 @@ inline int native_api(void* L) {
             int pushed = lua_ret_num(l, static_cast<double>(a.v));
             pushed += lua_ret_num(l, static_cast<double>((a.w >> 32) & 0xff));
             api_step('P', 21);
+            return pushed;
+        }
+
+        // Closure shape, for the layout probe. A C closure and a Luau closure
+        // are different objects behind the same type tag, and the only honest
+        // way to tell them apart is to look: the entry candidate at +0x28 and
+        // the proto candidate at +0x18 are checked against the page protection
+        // they point into. Executable means C; a mapped, non-executable heap
+        // page means a proto. The three header bytes go back untouched so the
+        // script can print them next to a known C closure and a known Luau one
+        // and read the real layout off the two rows.
+        if (op_is(op, oplen, "zendo:probe")) {
+            api_step('S', 22);
+            LuaArg a{};
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v) {
+                api_step('E', 22);
+                return 0;
+            }
+            unsigned long long entry = 0, proto = 0;
+            read_u64(a.v + 0x28, &entry);
+            read_u64(a.v + 0x18, &proto);
+            int entry_exec = 0;
+            if (entry) {
+                Mbi mbi{};
+                if (api().VirtualQuery(reinterpret_cast<void*>(entry), &mbi,
+                                       sizeof(mbi)) &&
+                    mbi.State == MEM_COMMIT) {
+                    DWORD prot = mbi.Protect & 0xff;
+                    if (prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
+                        prot == PAGE_EXECUTE_READWRITE ||
+                        prot == PAGE_EXECUTE_WRITECOPY)
+                        entry_exec = 1;
+                }
+            }
+            unsigned int head = 0;
+            read_u32(a.v + 4, &head);
+            int pushed = lua_ret_num(l, static_cast<double>(a.v));
+            pushed += lua_ret_num(l, static_cast<double>(entry));
+            pushed += lua_ret_num(l, static_cast<double>(entry_exec));
+            pushed += lua_ret_num(l, static_cast<double>(proto));
+            pushed += lua_ret_num(l, static_cast<double>(head & 0xff));
+            pushed += lua_ret_num(l, static_cast<double>((head >> 8) & 0xff));
+            pushed += lua_ret_num(l, static_cast<double>((head >> 16) & 0xff));
+            api_step('P', 22);
             return pushed;
         }
 
@@ -8116,10 +8190,15 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         }
         cmd[1] = 0;
         stage_mark(a, cmd);
-        // Session over. Return from DllMain so the stub restores this thread's
-        // saved context. A thread parked in the REPL forever is one the client's
-        // scheduler never gets back, and two of those stop the game's loop: the
-        // window still paints the last frame but stops answering input.
+        // Detach: leave the client with no payload thread parked inside it.
+        if (cmd[0] == 'x') {
+            g_leave = 1;
+            break;
+        }
+        // Session over. Unwind back to the seek loop so this payload thread can
+        // serve the next run instead of forcing a second image into the same
+        // client. Only the idle timeout leaves DllMain for good, and that path
+        // restores the borrowed thread's saved context on the way out.
         if (cmd[0] == 'q') break;
         if (cmd[0] == 'L' || cmd[0] == 'i') {
             unsigned int want_id = 7;
@@ -9260,11 +9339,16 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     }
 
     // Session over: the closure slot goes back to the game's own print, and the
-    // capture mode is retired with it.
+    // capture mode is retired with it. The store is guarded: this object is a
+    // GC closure, and between sessions the collector may already have taken it
+    // back. A blind store there is what ended the payload thread right after
+    // `q` and left the client alive with an abandoned mutex.
     if (g_api_live && g_cap_closure && g_cap_f)
-        wr64(g_cap_closure + 0x28, g_cap_f);
+        wr64_live(g_cap_closure + 0x28, g_cap_f);
     g_api_live = 0;
     g_cap_mode = 0;
+    g_cap_closure = 0;
+    g_cap_f = 0;
 
     g_declared_size = 0;
     g_patch_proto = 0;
@@ -9345,7 +9429,12 @@ inline DWORD run_repl() {
                                     OPEN_EXISTING, 0, nullptr);
         if (pipe == INVALID_HANDLE_VALUE) {
             if ((idle++ % 100) == 0) stage_mark(a, "SEEK");
-            if (idle > 20) {
+            // Twenty minutes, not one second. A session is one run; the next run
+            // creates a new server and this loop is what connects to it. Bailing
+            // out early is what forced a fresh injection (and a fresh image) for
+            // every script, which is the opposite of what a repeated test loop
+            // needs.
+            if (idle > 24000) {
                 // Leave DllMain: the stub restores the borrowed thread's
                 // original context, so nothing is left parked inside this
                 // client for a watchdog to find.
@@ -9363,15 +9452,112 @@ inline DWORD run_repl() {
         beacon(a, "PIPE");
         serve_session(a, pipe, base, L);
         g_cap_pipe = INVALID_HANDLE_VALUE;
+        stage_mark(a, "PRE-CLOSE");
         a.CloseHandle(pipe);
+        stage_mark(a, "POST");
+        loop_mark(a, ++g_loop_n);
+        if (g_leave) {
+            stage_mark(a, "EXIT-DETACH");
+            return 111;
+        }
         // The server that just ended is still closing its instance. Give it a
         // moment so this loop reconnects to the next server, not the corpse.
         if (a.Sleep) a.Sleep(150);
+        // Heartbeat: the number grows only while this thread keeps looping, so
+        // two reads of work/loop.bin a few seconds apart answer "is the payload
+        // still alive" without a debugger and without a second injection.
+        loop_mark(a, ++g_loop_n);
     }
+}
+
+// One line of ground truth about the live mutex: the handle, the CreateMutex
+// error, and what a zero-timeout wait says. A wait of 0x102 (WAIT_TIMEOUT)
+// means some thread still owns it; 0x80 (WAIT_ABANDONED) means the owner died.
+// This file is not overwritten by the seek loop, so it survives a session end.
+inline void mutex_diag(Api& a, HANDLE h) {
+    char buf[96];
+    char* p = buf;
+    const char* pre = "h=";
+    while (*pre) *p++ = *pre++;
+    p = append_hex(p, reinterpret_cast<unsigned long long>(h));
+    const char* mid = " e=";
+    while (*mid) *p++ = *mid++;
+    DWORD e = a.GetLastError ? a.GetLastError() : 0;
+    if (e == 0) { *p++ = '0'; } else {
+        char tmp[8]; int n = 0;
+        while (e) { tmp[n++] = static_cast<char>('0' + (e % 10)); e /= 10; }
+        while (n) *p++ = tmp[--n];
+    }
+    // ReleaseMutex answers the only question that matters: did this thread
+    // actually take the mutex? 1 means the create-time owner flag worked and
+    // the host will read WAIT_TIMEOUT while this thread lives. 0 means the
+    // handle exists without ownership and the host is right to call it dead.
+    DWORD r = (h && a.ReleaseMutex) ? a.ReleaseMutex(h) : 0;
+    const char* rel = " r=";
+    while (*rel) *p++ = *rel++;
+    *p++ = static_cast<char>('0' + (r ? 1 : 0));
+    if (r && a.WaitForSingleObject) {
+        // Take it back: the handle is meant to stay owned for the life of the
+        // thread, the release was only a measurement.
+        a.WaitForSingleObject(h, 0);
+    }
+    const char* wt = " w=";
+    while (*wt) *p++ = *wt++;
+    DWORD w = 0;
+    if (h && a.WaitForSingleObject) w = a.WaitForSingleObject(h, 0);
+    if (w == 0) { *p++ = '0'; } else {
+        char tmp[8]; int n = 0;
+        while (w) { tmp[n++] = static_cast<char>('0' + (w % 10)); w /= 10; }
+        while (n) *p++ = tmp[--n];
+    }
+    *p++ = '\n';
+    HANDLE f = a.CreateFileA("D:\\zendo\\work\\mutex.bin", GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    a.WriteFile(f, buf, static_cast<DWORD>(p - buf), &wrote, nullptr);
+    a.CloseHandle(f);
+}
+
+// Same as STAGE_MARK but a different file, and it takes a number: proof that
+// the seek loop is still iterating after a session ended. The stage file is
+// overwritten by whatever runs last, so it cannot answer that question.
+inline void loop_mark(Api& a, unsigned int n) {
+    char buf[16];
+    char* p = buf;
+    unsigned int v = n;
+    char tmp[12]; int k = 0;
+    if (v == 0) tmp[k++] = '0';
+    while (v) { tmp[k++] = static_cast<char>('0' + (v % 10)); v /= 10; }
+    while (k) *p++ = tmp[--k];
+    *p++ = '\n';
+    HANDLE f = a.CreateFileA("D:\\zendo\\work\\loop.bin", GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    a.WriteFile(f, buf, static_cast<DWORD>(p - buf), &wrote, nullptr);
+    a.CloseHandle(f);
 }
 
 inline DWORD beacon() {
     g_veh_tid = __readgsqword(0x48);
+    // Claim the one-payload slot. Nothing else in the image created this
+    // mutex, which is why every run of the executor read "no session": the
+    // host was asking a question nobody had answered. The handle is never
+    // released on purpose - owning it for the life of the thread is what says
+    // "a payload is parked here". The kernel abandons it when this thread
+    // dies, so a dead payload reads as no session instead of blocking injects.
+    //
+    // resolve_api first: the table is zeroed until someone fills it, and a
+    // null import here is not a failed call, it is a jump to address zero in
+    // the middle of a borrowed game thread.
+    if (!api().CreateMutexA) resolve_api();
+    static HANDLE live = nullptr;
+    if (!live && api().CreateMutexA)
+        live = api().CreateMutexA(nullptr, TRUE, "zendo-live");
+    mutex_diag(api(), live);
 #if ZENDO_STAGE == 65
     return 111;
 #elif ZENDO_STAGE == 64

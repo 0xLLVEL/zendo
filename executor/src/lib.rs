@@ -118,10 +118,10 @@ put("hookmetamethod", function(obj, method, hook)
 end)
 
 put("hookfunction", function(old, new)
-    local oc, oe, oc_isC = call("zendo:fninfo", old)
-    local nc, ne, nc_isC = call("zendo:fninfo", new)
+    local oc, oe, oc_exec = call("zendo:probe", old)
+    local nc, ne, nc_exec = call("zendo:probe", new)
     if oc == nil or nc == nil then return nil, "not a function" end
-    if oc_isC ~= 1 or nc_isC ~= 1 then
+    if oc_exec ~= 1 or nc_exec ~= 1 then
         return nil, "luau closure has no entry point to swap"
     end
     if not oe or oe == 0 or not ne or ne == 0 then
@@ -136,6 +136,18 @@ put("hookfunction", function(old, new)
         done = true
         return call("zendo:fnset", old, oe) == 1
     end
+end)
+
+-- What a closure IS, decided by where its entry point lives rather than by a
+-- byte in the header. A C closure's entry is inside an executable image; a Luau
+-- closure has no callable entry at all, only a Proto at +0x18.
+put("iscclosure", function(f)
+    local _, _, exec = call("zendo:probe", f)
+    return exec == 1
+end)
+put("islclosure", function(f)
+    local _, _, exec = call("zendo:probe", f)
+    return exec == 0
 end)
 
 put("fireclickdetector", function(cd, dist)

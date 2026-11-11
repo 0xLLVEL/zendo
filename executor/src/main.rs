@@ -103,6 +103,41 @@ fn main() {
         println!("live={}", pipe::payload_live());
         return;
     }
+    // Ask a parked payload to unwind for good. Without this a payload thread
+    // stays inside the client between runs, and a process in that state cannot
+    // be terminated - the window goes away, the pid keeps answering.
+    if args.len() >= 2 && args[1] == "detach" {
+        let server = match pipe::Pipe::create(r"\\.\pipe\zendo-dev") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("pipe create failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        let pending = server.begin_accept();
+        let ms = std::env::var("ZENDO_ACCEPT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3000);
+        match pending.wait(ms) {
+            Ok(true) => {
+                if let Err(e) = server.write_all(b"x") {
+                    eprintln!("detach write failed: {e}");
+                    std::process::exit(1);
+                }
+                println!("detached");
+            }
+            Ok(false) => {
+                eprintln!("no payload parked");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("accept failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.len() < 3 {
         usage();
     }
@@ -149,10 +184,15 @@ fn main() {
     // instead of a second image.
     let pending = server.begin_accept();
     let mut hijack_child: Option<Child> = None;
-    // A live payload only lasts as long as its session: it restores the borrowed
-    // thread on 'q' rather than parking it. So this wait is about not racing a
-    // dying server, not about finding a reusable one.
-    let mut connected = match pending.wait(900) {
+    // An idle payload parks in its reconnect loop for twenty minutes, so a run
+    // that finds one should join it instead of mapping another image into the
+    // same client. The wait is only paid in full when there is no payload;
+    // ZENDO_ACCEPT_MS covers a slow client without rebuilding.
+    let accept_ms = std::env::var("ZENDO_ACCEPT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2000);
+    let mut connected = match pending.wait(accept_ms) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("accept failed: {e}");
