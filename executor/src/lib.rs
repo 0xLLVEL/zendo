@@ -65,8 +65,8 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 4 then
-local api = { version = 4, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 5 then
+local api = { version = 5, missing = {} }
 local function put(name, value)
     if rawget(__znd_env, name) == nil then __znd_env[name] = value end
 end
@@ -206,6 +206,22 @@ put("listfiles", function(path)
         out[#out + 1] = entry[1]
     end
     return out
+end)
+
+-- Instance helpers are plain Luau: the client already hands us real Instances
+-- through game:GetService, so none of this needs a new native door.
+put("gethui", function()
+    local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+    if ok then return cg end
+    return nil
+end)
+
+put("compareinstances", function(a, b)
+    return a == b
+end)
+
+put("cloneref", function(ref)
+    return ref
 end)
 
 -- Encoding runs in plain Luau, not in the client's memory. There is no string
