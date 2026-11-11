@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>zendo</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span class="dot" id="dot"></span>
+        <span class="name">zendo</span>
+        <span class="ver">4080</span>
+      </div>
+      <div class="client" id="client">looking for client…</div>
+      <button id="run" class="run">Run <kbd>ctrl</kbd><kbd>↵</kbd></button>
+    </header>
+
+    <main>
+      <section class="pane editor">
+        <div class="bar"><span>script.luau</span><span id="lines">0 lines</span></div>
+        <div class="wrap">
+          <div class="gutter" id="gutter"></div>
+          <textarea id="code" spellcheck="false" autocomplete="off" placeholder="print('scent at the door')"></textarea>
+        </div>
+      </section>
+
+      <section class="pane output">
+        <div class="bar"><span>output</span><span id="stage">idle</span></div>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <footer>
+      <span id="status">ready</span>
+      <span class="spacer"></span>
+      <span id="timing"></span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>

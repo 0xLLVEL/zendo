@@ -1,0 +1,18 @@
+[package]
+name = "zendo-exec"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zendo-exec"
+path = "src/main.rs"
+
+[lib]
+name = "zendo_core"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+codegen-units = 1
+strip = true
