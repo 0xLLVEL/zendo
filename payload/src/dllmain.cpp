@@ -2701,6 +2701,7 @@ static unsigned long long g_cap_closure = 0;
 static unsigned long long g_cap_f = 0;
 static HANDLE g_cap_pipe = INVALID_HANDLE_VALUE;
 static int g_cap_mode = 0;   // 0 = untouched, 1 = swap only, 2 = +read args, 3 = +pipe
+static int g_api_live = 0;   // the closure slot carries native_api for this session
 static unsigned int g_cap_calls = 0;
 
 inline void cap_put(const char* s, unsigned int n) {
@@ -2811,6 +2812,10 @@ inline void hit_mark() {
     a.WriteFile(f, b, n, &w, nullptr);
     a.CloseHandle(f);
 }
+
+// cap_print is defined further down; the dispatcher falls back into it for
+// anything that is not a zendo op so print capture survives the swap.
+inline int cap_print(void* L);
 
 // A C closure is the only way Lua can reach native code, and the target of
 // every call it makes is an indirect call - which is exactly what CFG checks.
@@ -3077,18 +3082,14 @@ inline unsigned long long load_stage(unsigned int need) {
     return stage;
 }
 
-// Prepends the 8-byte guard magic the loader wants in front of raw bytecode and
-// calls it. The loader pushes the resulting closure onto L's stack, so a caller
-// that returns 1 hands that closure straight to the script.
-inline int lua_load_bytes(unsigned long long l, const char* body, unsigned int blen) {
-    if (!body || !blen || blen > (1u << 20) - 8) return 0;
-    unsigned long long buf = load_stage(blen + 8);
-    if (!buf || !g_base) return 0;
+// Prepends the guard magic to whatever already sits at buf+8 and hands the blob
+// to LuaVMLoad. The loader pushes the resulting closure onto L's stack, so a
+// caller that returns 1 gives it straight to the script.
+inline int lua_load_stage(unsigned long long l, unsigned long long buf, unsigned int blen) {
+    if (!buf || !blen || !g_base) return 0;
     const unsigned long long magic = 0xE009325B4A107A52ull;
     char* p = reinterpret_cast<char*>(buf);
     for (int i = 0; i < 8; ++i) p[i] = static_cast<char>(magic >> (8 * i));
-    for (unsigned int i = 0; i < blen; ++i)
-        *reinterpret_cast<volatile char*>(p + 8 + i) = body[i];
     ChunkName src;
     src.data = p;
     src.pad = 0;
@@ -3100,8 +3101,17 @@ inline int lua_load_bytes(unsigned long long l, const char* body, unsigned int b
     return ret == 0 ? 1 : 0;
 }
 
-// Reads a compiled chunk from disk into the staging buffer and loads it. This is
-// how a script is handed over before the pipe carries the bytes itself.
+inline int lua_load_bytes(unsigned long long l, const char* body, unsigned int blen) {
+    if (!body || !blen || blen > (1u << 20) - 8) return 0;
+    unsigned long long buf = load_stage(blen + 8);
+    if (!buf) return 0;
+    char* p = reinterpret_cast<char*>(buf);
+    for (unsigned int i = 0; i < blen; ++i)
+        *reinterpret_cast<volatile char*>(p + 8 + i) = body[i];
+    return lua_load_stage(l, buf, blen);
+}
+
+// Reads a compiled chunk from disk into the staging buffer and loads it.
 inline int lua_load_file(unsigned long long l, const char* path) {
     HANDLE f = api().CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -3118,19 +3128,115 @@ inline int lua_load_file(unsigned long long l, const char* path) {
         return 0;
     }
     api().CloseHandle(f);
-    unsigned int size = got;
-    const unsigned long long magic = 0xE009325B4A107A52ull;
-    for (int i = 0; i < 8; ++i) p[i] = static_cast<char>(magic >> (8 * i));
-    ChunkName src;
-    src.data = p;
-    src.pad = 0;
-    src.size = size + 8;
-    src.cap = size + 8;
-    typedef int (*LoadFn)(void*, void*, const char*, int);
-    LoadFn load = reinterpret_cast<LoadFn>(g_base + 0x426A570);
-    if (!g_base) return 0;
-    int ret = load(reinterpret_cast<void*>(l), &src, "=zendo", 0);
-    return ret == 0 ? 1 : 0;
+    return lua_load_stage(l, buf, got);
+}
+
+// Reads one newline terminated field from the session pipe.
+inline unsigned int pipe_line(Api& a, HANDLE pipe, char* dst, unsigned int cap) {
+    unsigned int n = 0;
+    for (;;) {
+        char c = 0;
+        DWORD rd = 0;
+        if (!a.ReadFile(pipe, &c, 1, &rd, nullptr) || rd == 0) return 0;
+        if (c == '\n') break;
+        if (n + 1 < cap) dst[n++] = c;
+    }
+    dst[n] = 0;
+    return n;
+}
+
+inline unsigned int parse_dec(const char* s) {
+    unsigned int v = 0;
+    while (*s >= '0' && *s <= '9') v = v * 10 + static_cast<unsigned int>(*s++ - '0');
+    return v;
+}
+
+// Reply-path diagnostic: a failed loadstring has to say where it stopped.
+inline void ls_log(const char* tag, unsigned long long v) {
+    Api& a = api();
+    HANDLE f = a.CreateFileA("D:\\zendo\\work\\ls.bin", FILE_APPEND_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char b[96];
+    char* p = b;
+    while (*tag) *p++ = *tag++;
+    *p++ = ' ';
+    p = append_hex(p, v);
+    *p++ = '\n';
+    DWORD w = 0;
+    a.WriteFile(f, b, static_cast<DWORD>(p - b), &w, nullptr);
+    a.CloseHandle(f);
+}
+
+// Live loadstring. The client has no compiler, so the source goes out on the
+// session pipe exactly as Lua handed it over; the executor compiles and remaps
+// it offline and answers with the blob. The reply lands in the staging buffer
+// and LuaVMLoad turns it into the closure the script asked for.
+//
+// Wire, payload -> endpoint:  "C <len>\n" + source bytes
+//       endpoint -> payload:  "K <len>\n" + bytecode  |  "E <len>\n" + message
+inline int lua_compile_remote(unsigned long long l, const char* src, unsigned int slen) {
+    HANDLE pipe = g_cap_pipe;
+    Api& a = api();
+    if (pipe == INVALID_HANDLE_VALUE || !src || !slen || slen > 262144) return 0;
+    char head[24];
+    unsigned int n = 0;
+    head[n++] = 'C';
+    head[n++] = ' ';
+    char d[12];
+    unsigned int k = 0, v = slen;
+    do { d[k++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v);
+    while (k) head[n++] = d[--k];
+    head[n++] = '\n';
+    DWORD w = 0;
+    if (!a.WriteFile(pipe, head, n, &w, nullptr)) return 0;
+    if (!a.WriteFile(pipe, src, slen, &w, nullptr)) return 0;
+
+    char line[64];
+    if (!pipe_line(a, pipe, line, sizeof(line))) {
+        ls_log("no-reply", 0);
+        return 0;
+    }
+    unsigned int rlen = parse_dec(line + 2);
+    ls_log("line", static_cast<unsigned long long>(static_cast<unsigned char>(line[0])));
+    ls_log("rlen", rlen);
+    if (rlen > (1u << 20) - 8) rlen = 0;
+    if (line[0] == 'K' && rlen) {
+        unsigned long long buf = load_stage(rlen + 8);
+        if (!buf) return 0;
+        if (!read_all(a, pipe, reinterpret_cast<void*>(buf + 8), rlen)) {
+            ls_log("short-body", rlen);
+            return 0;
+        }
+        int r = lua_load_stage(l, buf, rlen);
+        ls_log("load", static_cast<unsigned long long>(r));
+        if (r == 0) {
+            HANDLE f = a.CreateFileA("D:\\zendo\\work\\ls_blob.bin", GENERIC_WRITE,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                DWORD w2 = 0;
+                a.WriteFile(f, reinterpret_cast<void*>(buf + 8), rlen, &w2, nullptr);
+                a.CloseHandle(f);
+            }
+        }
+        return r;
+    }
+    if (line[0] == 'E' && rlen) {
+        static char err[256];
+        unsigned int keep = rlen < sizeof(err) - 1 ? rlen : sizeof(err) - 1;
+        read_all(a, pipe, err, rlen);
+        err[keep] = 0;
+        char out[300];
+        const char* pre = "Ploadstring: ";
+        unsigned int q = 0;
+        while (*pre) out[q++] = *pre++;
+        for (unsigned int i = 0; i < keep && q < sizeof(out) - 2; ++i) out[q++] = err[i];
+        out[q++] = '\n';
+        a.WriteFile(pipe, out, q, &w, nullptr);
+    }
+    return 0;
 }
 
 inline int native_api(void* L) {
@@ -3200,6 +3306,18 @@ inline int native_api(void* L) {
             char* body = lua_arg_str(l, 1, &blen);
             int n = body ? lua_load_bytes(l, body, blen) : 0;
             api_step(n ? 'P' : 'E', 11);
+            return n;
+        }
+
+        // Live compile: source in, callable closure out. The executor answers on
+        // the same pipe it is already streaming this chunk over.
+        if (op_is(op, oplen, "zendo:loadstring")) {
+            api_step('S', 13);
+            unsigned int slen = 0;
+            char* src = lua_arg_str(l, 1, &slen);
+            int n = 0;
+            if (src && slen) n = lua_compile_remote(l, src, slen);
+            api_step(n ? 'P' : 'E', 13);
             return n;
         }
 
@@ -3412,6 +3530,7 @@ inline int native_api(void* L) {
         }
     }
 
+    if (g_cap_mode) return cap_print(L);
     if (g_cap_f) return reinterpret_cast<int (*)(void*)>(g_cap_f)(L);
     return 0;
 }
@@ -3446,9 +3565,36 @@ inline int native_loadbytecode(void* L) {
 }
 
 
+// cap_print is the closure body the client calls for print, so it is also the
+// one place every script call passes through. A `zendo:` first argument is
+// handed to the native dispatcher; everything else is captured and printed.
+inline int native_api(void* L);
+
 inline int cap_print(void* L) {
     stage_mark(api(), "H1");
     ++g_cap_calls;
+    // Every script call that reaches our page passes through here, so this is
+    // also where `zendo:op` is recognised: the first argument names the op,
+    // anything else is ordinary print traffic and falls through to capture.
+    {
+        unsigned long long b = 0, t = 0;
+        read_u64(reinterpret_cast<unsigned long long>(L) + 0x58, &b);
+        read_u64(reinterpret_cast<unsigned long long>(L) + 0x60, &t);
+        if (t > b) {
+            unsigned long long v = 0, w = 0;
+            if (read_u64(b, &v) && read_u64(b + 8, &w) &&
+                static_cast<unsigned int>((w >> 32) & 0xff) == 6 && v) {
+                unsigned int len = 0;
+                read_u32(v + 0x14, &len);
+                if (len >= 6 && readable(reinterpret_cast<const void*>(v + 0x18), 6)) {
+                    const char* s = reinterpret_cast<const char*>(v + 0x18);
+                    if (s[0] == 'z' && s[1] == 'e' && s[2] == 'n' && s[3] == 'd' &&
+                        s[4] == 'o' && s[5] == ':')
+                        return native_api(L);
+                }
+            }
+        }
+    }
     if (g_cap_mode >= 2) {
         unsigned long long base = 0, top = 0;
         read_u64(reinterpret_cast<unsigned long long>(L) + 0x58, &base);
@@ -3512,13 +3658,16 @@ inline int cfg_register(void* target) {
 }
 
 inline void cap_install() {
-    if (g_cap_mode >= 1 && g_cap_closure && g_cap_f) {
+    // A live dispatcher owns the closure slot for the whole session: swapping
+    // print in for the duration of every call would hide the native surface.
+    if (!g_api_live && g_cap_mode >= 1 && g_cap_closure && g_cap_f) {
         g_cfg_status = cfg_register(reinterpret_cast<void*>(&cap_print));
         wr64(g_cap_closure + 0x28, reinterpret_cast<unsigned long long>(&cap_print));
     }
 }
 
 inline void cap_restore() {
+    if (g_api_live) return;
     if (g_cap_closure && g_cap_f) wr64(g_cap_closure + 0x28, g_cap_f);
 }
 
@@ -3624,6 +3773,19 @@ inline int exec_raw(Api& a, HANDLE pipe, Out& o, unsigned long long L,
         o.hex(self ^ qw);
         o.nl();
         flush_out(a, pipe, o);
+    }
+
+    // Hand the native surface to the chunk as its single vararg. Same closure
+    // the session installed the dispatcher on, so `local z = ...` is all a
+    // script needs to reach it.
+    {
+        unsigned long long last = 0;
+        read_u64(L + 0x68, &last);
+        if (g_cap_closure && top0 + 32 <= last) {
+            wr64(top0 + 16, g_cap_closure);
+            wr64(top0 + 24, 0x8ull << 32);
+            wr64(L + 0x60, top0 + 32);
+        }
     }
 
     struct CallCtx {
@@ -7681,6 +7843,7 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     flush_out(a, pipe, o);
 
     caps_open(base, L, o, pipe, a, "REPL");
+    g_base = base;
     g_declared_size = 64;
     g_patch_proto = 1;
     g_veh_pipe = pipe;
@@ -7694,6 +7857,28 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     g_cap_pipe = pipe;
     exec_raw(a, pipe, o, L, base, kChunkCapi, kChunkCapiLen, "capi");
     flush_capture(a, o, L, base);
+    // The closure every script call travels through. Captured once; its C
+    // function pointer is what the dispatcher replaces.
+    if (!g_cap_closure)
+        exec_raw(a, pipe, o, L, base, kChunkKCaptureBody, kChunkKCaptureLen, "zcapture");
+
+    // Install the dispatcher for the session. The captured print closure keeps
+    // its identity; only its C function pointer is swapped, so an armed call
+    // target is all CFG needs. Capture stays on (mode 3): the dispatcher falls
+    // back into cap_print for anything that is not a zendo op.
+    if (g_cap_closure && g_cap_f) {
+        g_cap_mode = 3;
+        if (arm_cfg(a, o, reinterpret_cast<unsigned long long>(&native_api), "api cfg")) {
+            wr64(g_cap_closure + 0x28, reinterpret_cast<unsigned long long>(&native_api));
+            g_api_live = 1;
+            o.str("api live clo=");
+            o.hex(g_cap_closure);
+            o.nl();
+        } else {
+            o.str("api cfg failed, surface off\n");
+        }
+        flush_out(a, pipe, o);
+    }
 
     for (;;) {
         stage_mark(a, "RDY");
@@ -8849,6 +9034,13 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         exec_chunk(a, pipe, o, L, base, hit->body, hit->len, hit->name);
         g_sentinel = false;
     }
+
+    // Session over: the closure slot goes back to the game's own print, and the
+    // capture mode is retired with it.
+    if (g_api_live && g_cap_closure && g_cap_f)
+        wr64(g_cap_closure + 0x28, g_cap_f);
+    g_api_live = 0;
+    g_cap_mode = 0;
 
     g_declared_size = 0;
     g_patch_proto = 0;

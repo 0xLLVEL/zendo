@@ -87,6 +87,18 @@ pub fn build(src: &Path) -> Result<Vec<u8>, String> {
     Ok(out.blob)
 }
 
+/// Compile Luau source text with the same offline pipeline `build` uses. This is
+/// the other half of `zendo:loadstring`: the client has no compiler, so every
+/// live loadstring call lands here while the script is waiting for it.
+pub fn compile_str(src: &str) -> Result<Vec<u8>, String> {
+    let tmp = std::env::temp_dir().join(format!("zendo-ls-{}.luau", std::process::id()));
+    std::fs::write(&tmp, src).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let blob = compile(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let blob = blob?;
+    remap::remap(&blob).map(|o| o.blob).map_err(|e| format!("remap: {e}"))
+}
+
 /// Start the injector beside a pipe that is already being served. The payload
 /// hosts a long-lived REPL, so the injector must not wait for DllMain to end.
 pub fn spawn_inject(extra: &[&str]) -> Result<Child, String> {

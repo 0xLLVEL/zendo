@@ -191,6 +191,27 @@ impl Pending {
     }
 }
 
+/// Fill `dst` from bytes already buffered in `acc` first, then from the pipe.
+/// A request header and its body travel together, so a single read can pull
+/// part of the body into the line buffer before the header is parsed.
+fn take_bytes(pipe: &Pipe, acc: &mut Vec<u8>, dst: &mut [u8]) -> io::Result<()> {
+    let mut off = 0usize;
+    while off < dst.len() && !acc.is_empty() {
+        let n = (dst.len() - off).min(acc.len());
+        dst[off..off + n].copy_from_slice(&acc[..n]);
+        acc.drain(..n);
+        off += n;
+    }
+    while off < dst.len() {
+        let n = pipe.read(&mut dst[off..])?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short body"));
+        }
+        off += n;
+    }
+    Ok(())
+}
+
 /// Streams payload output into `sink` and answers RDY lines with `steps` in
 /// order, then `q` once the list is drained. Lines the payload marks with a
 /// leading `P` are script output and reach the sink with a `» ` prefix so the
@@ -211,6 +232,36 @@ pub fn drive(pipe: &Pipe, steps: &[Step], mut sink: impl Write) -> io::Result<()
         while let Some(pos) = acc.iter().position(|&c| c == b'\n') {
             let line: Vec<u8> = acc.drain(..=pos).collect();
             let body = &line[..line.len() - 1];
+            if body.starts_with(b"C ") {
+                // Live loadstring: the script is blocked inside the client
+                // waiting for these bytes, so compile now and answer on the
+                // same stream. Nothing else is pending; the next line is RDY.
+                let want: usize = std::str::from_utf8(&body[2..])
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut src = vec![0u8; want.min(262144)];
+                if want == 0 || want > 262144 {
+                    pipe.write_all(b"E 0\n")?;
+                } else {
+                    take_bytes(pipe, &mut acc, &mut src)?;
+                    match crate::compile_str(&String::from_utf8_lossy(&src)) {
+                        Ok(blob) => {
+                            eprintln!("[pipe] loadstring {} bytes -> {} bytes", want, blob.len());
+                            pipe.write_all(format!("K {}\n", blob.len()).as_bytes())?;
+                            pipe.write_all(&blob)?;
+                        }
+                        Err(e) => {
+                            eprintln!("[pipe] loadstring failed: {e}");
+                            let msg = e.into_bytes();
+                            pipe.write_all(format!("E {}\n", msg.len()).as_bytes())?;
+                            pipe.write_all(&msg)?;
+                        }
+                    }
+                }
+                sink.flush()?;
+                continue;
+            }
             if body == b"RDY" {
                 if idx < steps.len() {
                     match steps[idx] {
