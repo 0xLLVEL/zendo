@@ -2938,8 +2938,15 @@ inline void api_line(char tag, unsigned long long a, unsigned long long b,
     api().CloseHandle(f);
 }
 
+// Off by default. Every result push used to open, write and close a log file,
+// which turned a script that makes a few hundred native calls into a few
+// hundred file opens - measurable at exactly the moment a memory walk is being
+// bisected, and a variable nobody needs while the surface is stable.
+static int g_api_trace = 0;
+
 inline void api_stk(unsigned long long L, unsigned long long top, unsigned long long last,
                     unsigned long long citop, int pushed) {
+    if (!g_api_trace) return;
     unsigned long long base = 0;
     read_u64(L + 0x58, &base);
     api_line(static_cast<char>('0' + (pushed & 0xf)), L, top, citop, base);
@@ -3313,6 +3320,25 @@ inline int native_api(void* L) {
             int r = lua_ret_num(l, static_cast<double>(slen));
             api_step('E', 3);
             return r;
+        }
+
+        // Raw identity of any Lua value: the pointer inside the TValue and its
+        // type tag. Every introspection path starts here - a closure, a table
+        // and a userdata all answer with the address of the object the value
+        // points at, which is what the GC walk and the proto readers need. The
+        // pointer fits a double exactly below 2^48, so it round-trips through
+        // the Lua number without losing bits.
+        if (op_is(op, oplen, "zendo:ref")) {
+            api_step('S', 21);
+            LuaArg a{};
+            if (!lua_arg(l, 1, &a)) {
+                api_step('E', 21);
+                return 0;
+            }
+            int pushed = lua_ret_num(l, static_cast<double>(a.v));
+            pushed += lua_ret_num(l, static_cast<double>((a.w >> 32) & 0xff));
+            api_step('P', 21);
+            return pushed;
         }
 
         // Function identity for the Lua layer. A function TValue carries a
