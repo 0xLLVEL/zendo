@@ -65,8 +65,8 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 7 then
-local api = { version = 7, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 8 then
+local api = { version = 8, missing = {} }
 local function put(name, value)
     if rawget(__znd_env, name) == nil then __znd_env[name] = value end
 end
@@ -245,21 +245,79 @@ put("getinfo", function(f)
     }
 end)
 
+-- Upvalues. The count and the capture slots are measured fields, not guesses:
+-- a Luau closure answers how many it holds and each slot is one TValue, read
+-- through the same door `kget` uses. A capture by reference resolves to the
+-- cell the closure shares with the stack, so reading it sees live values.
+-- Reads go through a 48 byte buffer because the host only writes into long
+-- strings - a shorter buffer is interned and the copy is refused.
+local function __znd_mem(addr, n)
+    if type(read) ~= "function" or type(addr) ~= "number" or addr < 0x10000 then return nil end
+    local size = n or 48
+    if size < 48 then size = 48 end
+    local buf = string.rep("A", size)
+    if read(addr, buf) ~= size then return nil end
+    return buf
+end
+
+put("getupvalues", function(f)
+    local n = call("zendo:ucount", f)
+    if type(n) ~= "number" then return {} end
+    local out = {}
+    for i = 0, n - 1 do out[i + 1] = call("zendo:uget", f, i) end
+    return out
+end)
+
+put("getupvalue", function(f, i)
+    local idx = (tonumber(i) or 0) - 1
+    if idx < 0 then return nil end
+    local v = call("zendo:uget", f, idx)
+    -- Names are not in the chunk: the compiler runs with debug info off, so the
+    -- proto carries no upvalue name table to read. The index is what is real, so
+    -- the name slot carries it as a string rather than inventing a name.
+    return tostring(idx + 1), v
+end)
+
+put("setupvalue", function(f, i, v)
+    local idx = (tonumber(i) or 0) - 1
+    if idx < 0 then return nil end
+    if call("zendo:uset", f, idx, v) ~= 1 then return nil end
+    return f
+end)
+
 -- sUNC scores `debug.getconstants`; the native read behind `getconstants` is
 -- the same one. The debug table the client ships may be read-only, so a denied
 -- rawset falls back to a proxy that keeps every other debug field reachable.
+-- The upvalue trio rides the same path: it is the same measured read, exposed
+-- under the names sUNC asks for.
 local dbg = rawget(__znd_env, "debug")
-if type(dbg) == "table" and rawget(dbg, "getconstants") == nil then
+if type(dbg) == "table" then
     local gc = rawget(__znd_env, "getconstants")
     local one = function(f, i)
         local k = gc(f)
         return k[i]
     end
-    local ok = pcall(function() rawset(dbg, "getconstants", gc); rawset(dbg, "getconstant", one) end)
+    local guvs = rawget(__znd_env, "getupvalues")
+    local guv = rawget(__znd_env, "getupvalue")
+    local suv = rawget(__znd_env, "setupvalue")
+    local ok = pcall(function()
+        if rawget(dbg, "getconstants") == nil then
+            rawset(dbg, "getconstants", gc)
+            rawset(dbg, "getconstant", one)
+        end
+        if rawget(dbg, "getupvalues") == nil then rawset(dbg, "getupvalues", guvs) end
+        if rawget(dbg, "getupvalue") == nil then rawset(dbg, "getupvalue", guv) end
+        if rawget(dbg, "setupvalue") == nil then rawset(dbg, "setupvalue", suv) end
+    end)
     if not ok then
         local proxy = setmetatable({}, { __index = dbg })
-        proxy.getconstants = gc
-        proxy.getconstant = one
+        if rawget(dbg, "getconstants") == nil then
+            proxy.getconstants = gc
+            proxy.getconstant = one
+        end
+        if rawget(dbg, "getupvalues") == nil then proxy.getupvalues = guvs end
+        if rawget(dbg, "getupvalue") == nil then proxy.getupvalue = guv end
+        if rawget(dbg, "setupvalue") == nil then proxy.setupvalue = suv end
         rawset(__znd_env, "debug", proxy)
     end
 end

@@ -3456,6 +3456,112 @@ inline int native_api(void* L) {
             api_step('E', 28);
             return 1;
         }
+        // Upvalues. Measured on a live chunk, not taken from a layout doc: a
+        // Luau closure keeps the capture count in the low byte of the word at
+        // +0x4, and the captures themselves start at +0x20, one TValue each.
+        // A capture by value holds the value inline. A capture by reference
+        // holds an UpVal pointer in that TValue's value word under tag 0x10,
+        // and UpVal+0x8 is the cell shared with the stack. Both kinds showed up
+        // in the same chunk, so the tag is what decides which read applies.
+        // Tags are hex in every dump this was measured from: a REF slot prints
+        // "tt=10" and that is 16, not ten. Comparing against ten keeps tag 0x10
+        // flowing to the VM as a value, which the interpreter reads as a type
+        // it has no case for and dies on.
+        if (op_is(op, oplen, "zendo:ucount")) {
+            api_step('S', 30);
+            LuaArg a{};
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v) return 0;
+            unsigned int head = 0;
+            if (!read_u32(a.v + 4, &head)) return 0;
+            int r = lua_ret_num(l, static_cast<double>(head & 0xff));
+            api_step('P', 30);
+            return r;
+        }
+
+        if (op_is(op, oplen, "zendo:uget")) {
+            api_step('S', 29);
+            LuaArg a{};
+            double idxf = 0;
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v ||
+                !lua_arg_num(l, 2, &idxf) || idxf < 0 || idxf > 255)
+                return 0;
+            unsigned int head = 0;
+            if (!read_u32(a.v + 4, &head)) return 0;
+            unsigned int nup = head & 0xff;
+            unsigned int i = static_cast<unsigned int>(idxf);
+            if (i >= nup) return 0;
+            unsigned long long slot = a.v + 0x20 + 16ull * i;
+            unsigned long long v = 0, w = 0;
+            if (!read_u64(slot, &v) || !read_u64(slot + 8, &w)) return 0;
+            if (((w >> 32) & 0xff) == 0x10) {
+                unsigned long long cell = 0;
+                if (!v || !read_u64(v + 8, &cell) || !cell) return 0;
+                if (!read_u64(cell, &v) || !read_u64(cell + 8, &w)) return 0;
+            }
+
+            unsigned long long top = 0;
+            if (!read_u64(l + 0x60, &top) || !top) return 0;
+            unsigned long long last = 0, ci = 0, citop = 0;
+            read_u64(l + 0x68, &last);
+            if (read_u64(l + 0x70, &ci) && ci) read_u64(ci + 8, &citop);
+            unsigned long long limit = last;
+            if (citop && citop < limit) limit = citop;
+            if (limit && top + 16 > limit) return 0;
+            wr64(top, v);
+            wr64(top + 8, w);
+            wr64(l + 0x60, top + 16);
+            api_step('P', 29);
+            return 1;
+        }
+
+        // Writing an upvalue. Numbers, booleans and nil only: a collectable
+        // value stored into a GC object needs a write barrier, and the address
+        // of the barrier in this build has not been measured yet. Refusing the
+        // collectable tags is the difference between a patch and a crash.
+        if (op_is(op, oplen, "zendo:uset")) {
+            api_step('S', 31);
+            LuaArg a{};
+            LuaArg val{};
+            double idxf = 0;
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v ||
+                !lua_arg_num(l, 2, &idxf) || idxf < 0 || idxf > 255 ||
+                !lua_arg(l, 3, &val))
+                return 0;
+            unsigned int tt = static_cast<unsigned int>((val.w >> 32) & 0xff);
+            if (tt != 0 && tt != 1 && tt != 3) {
+                api_step('E', 31);
+                return lua_ret_num(l, 0.0);
+            }
+            unsigned int head = 0;
+            if (!read_u32(a.v + 4, &head)) return 0;
+            unsigned int nup = head & 0xff;
+            unsigned int i = static_cast<unsigned int>(idxf);
+            if (i >= nup) return 0;
+            unsigned long long slot = a.v + 0x20 + 16ull * i;
+            unsigned long long v = 0, w = 0;
+            if (!read_u64(slot, &v) || !read_u64(slot + 8, &w)) return 0;
+            unsigned long long dst = slot;
+            if (((w >> 32) & 0xff) == 0x10) {
+                if (!v || !read_u64(v + 8, &dst) || !dst) return 0;
+            }
+            // The cell is usually a stack slot or a live heap page, both already
+            // writable. api_write only asks the kernel for a protection change
+            // when the page really is read-only, and it sizes the range from the
+            // page the address sits in - a hardcoded two page span can walk off
+            // the end of the region and come back false on a healthy write.
+            char tv[16];
+            for (int k = 0; k < 8; ++k) {
+                tv[k] = static_cast<char>((val.v >> (8 * k)) & 0xff);
+                tv[8 + k] = static_cast<char>((val.w >> (8 * k)) & 0xff);
+            }
+            if (!api_write(dst, tv, 16)) {
+                api_step('E', 31);
+                return lua_ret_num(l, 0.0);
+            }
+            api_step('P', 31);
+            return lua_ret_num(l, 1.0);
+        }
+
         // the tag found at each pointer, so the constants array can be found by
         // looking for tag 6 at the address a word holds - not by assuming an
         // offset from a layout doc.
