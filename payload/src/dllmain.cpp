@@ -114,6 +114,9 @@ struct Mbi {
 
 struct Api {
     using CreateFileA_t = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+    using CreateMutexA_t = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, BOOL, LPCSTR);
+    using WaitForSingleObject_t = DWORD(WINAPI*)(HANDLE, DWORD);
+    using ReleaseMutex_t = BOOL(WINAPI*)(HANDLE);
     using WriteFile_t = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
     using ReadFile_t = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
     using CloseHandle_t = BOOL(WINAPI*)(HANDLE);
@@ -127,6 +130,9 @@ struct Api {
     using SetCfgTargets_t = BOOL(WINAPI*)(HANDLE, void*, SIZE_T, ULONG, void*);
 
     CreateFileA_t CreateFileA;
+    CreateMutexA_t CreateMutexA;
+    WaitForSingleObject_t WaitForSingleObject;
+    ReleaseMutex_t ReleaseMutex;
     WriteFile_t WriteFile;
     ReadFile_t ReadFile;
     CloseHandle_t CloseHandle;
@@ -151,6 +157,10 @@ inline DWORD resolve_api() {
     if (!k32.base) return 10;
     Api& a = api();
     a.CreateFileA = reinterpret_cast<Api::CreateFileA_t>(find_export(k32.base, fnv1a("CreateFileA")));
+    a.CreateMutexA = reinterpret_cast<Api::CreateMutexA_t>(find_export(k32.base, fnv1a("CreateMutexA")));
+    a.WaitForSingleObject =
+        reinterpret_cast<Api::WaitForSingleObject_t>(find_export(k32.base, fnv1a("WaitForSingleObject")));
+    a.ReleaseMutex = reinterpret_cast<Api::ReleaseMutex_t>(find_export(k32.base, fnv1a("ReleaseMutex")));
     a.WriteFile = reinterpret_cast<Api::WriteFile_t>(find_export(k32.base, fnv1a("WriteFile")));
     a.ReadFile = reinterpret_cast<Api::ReadFile_t>(find_export(k32.base, fnv1a("ReadFile")));
     a.CloseHandle = reinterpret_cast<Api::CloseHandle_t>(find_export(k32.base, fnv1a("CloseHandle")));
@@ -5879,7 +5889,10 @@ inline void caps_open(unsigned long long base, unsigned long long L, Out& o,
     unsigned long long slot = ctx_id ? ctx_id + 0x158 : 0;
     if (slot && readable(reinterpret_cast<const void*>(slot), 0x40)) {
         wr64(slot + 0x30, 0xFFFFFFFFFFFFFFFFull);
-        wr64(slot + 0x38, 0);
+        // Both words are capability-shaped. The second one was zeroed when only
+        // the synchronous path mattered; a deferred thread asks that slot first
+        // and reports "lacking capability Players", so widen it too.
+        wr64(slot + 0x38, 0xFFFFFFFFFFFFFFFFull);
     }
     unsigned long long E = 0;
     read_u64(L + 8, &E);
@@ -6754,39 +6767,10 @@ static const ReplEntry kReplTable[] = {
     {'5', "live1", kChunkL1Body, kChunkL1Len},
 };
 
-inline DWORD run_repl() {
-    DWORD st = resolve_api();
-    if (st) return 100 + st;
-    stage_mark(api(), "API");
-    Api& a = api();
-    HANDLE pipe = INVALID_HANDLE_VALUE;
-    for (int i = 0; i < 100; ++i) {
-        pipe = a.CreateFileA("\\\\.\\pipe\\zendo-dev", GENERIC_READ | GENERIC_WRITE,
-                             0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (pipe != INVALID_HANDLE_VALUE) break;
-        if (a.Sleep) a.Sleep(100);
-        else break;
-    }
-    if (pipe == INVALID_HANDLE_VALUE) return 2;
-    beacon(a, "PIPE");
+inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
+                           unsigned long long L) {
     static Out o;
     o.reset();
-    Module exe = find_module(fnv1a_w(L"RobloxPlayerBeta.exe"));
-    unsigned long long base = reinterpret_cast<unsigned long long>(exe.base);
-    unsigned long long fake = 0, dm = 0;
-    read_u64(base + k_fake_dm_static, &fake);
-    read_u64(fake + k_fake_dm_to_dm, &dm);
-    unsigned long long sc = find_service(base, base + k_script_context_vtable, dm);
-    unsigned long long L = sc ? decode_split(sc + k_slot_a) : 0;
-    if (!L) {
-        o.str("no state\nEND\n");
-        flush_out(a, pipe, o);
-        char ack[8];
-        DWORD rd = 0;
-        a.ReadFile(pipe, ack, sizeof(ack), &rd, nullptr);
-        a.CloseHandle(pipe);
-        return 111;
-    }
     o.str("ZEND1 repl L=");
     o.hex(L);
     o.nl();
@@ -6800,7 +6784,9 @@ inline DWORD run_repl() {
     g_veh_L = L;
 
     // Lua-side print capture. Every later chunk's `print` output lands in a
-    // buffer this same thread drains after the chunk returns.
+    // buffer this same thread drains after the chunk returns. Re-running the
+    // chunk on each session is safe: the wrapper is idempotent and the buffer
+    // starts empty.
     g_cap_pipe = pipe;
     exec_raw(a, pipe, o, L, base, kChunkCapi, kChunkCapiLen, "capi");
     flush_capture(a, o, L, base);
@@ -6926,11 +6912,87 @@ inline DWORD run_repl() {
     g_patch_proto = 0;
     o.str("END\n");
     flush_out(a, pipe, o);
-    char ack[16];
-    DWORD rd = 0;
-    a.ReadFile(pipe, ack, sizeof(ack), &rd, nullptr);
-    a.CloseHandle(pipe);
-    return 111;
+    return 0;
+}
+
+// One injection, many sessions. The payload keeps the borrowed thread open and
+// waits for the next pipe server instead of returning from DllMain, so the UI
+// can push another chunk without re-mapping the image. 90 s with no server at
+// all and the thread goes back to the stub, so a dead UI cannot leave a stray
+// image pinned in the client forever.
+inline DWORD run_repl() {
+    DWORD st = resolve_api();
+    if (st) {
+        stage_mark(api(), "EXIT-API");
+        return 100 + st;
+    }
+    Api& a = api();
+    stage_mark(a, "E1-API");
+    // No single-instance guard here. A mutex was tried twice and both versions
+    // hurt: the first rejected the second injection outright, the second parked
+    // the borrowed thread for seconds and the client dropped its websocket. The
+    // pipe session is the only authority on who is live, so nothing else talks.
+    stage_mark(a, "E2-OWN");
+
+    Module exe = find_module(fnv1a_w(L"RobloxPlayerBeta.exe"));
+    unsigned long long base = reinterpret_cast<unsigned long long>(exe.base);
+    unsigned long long fake = 0, dm = 0;
+    read_u64(base + k_fake_dm_static, &fake);
+    read_u64(fake + k_fake_dm_to_dm, &dm);
+    stage_mark(a, "E4-DM");
+    unsigned long long sc = find_service(base, base + k_script_context_vtable, dm);
+    unsigned long long L = sc ? decode_split(sc + k_slot_a) : 0;
+    if (!L) {
+        for (int i = 0; i < 100; ++i) {
+            HANDLE pipe = a.CreateFileA("\\\\.\\pipe\\zendo-dev",
+                                        GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                        OPEN_EXISTING, 0, nullptr);
+            if (pipe == INVALID_HANDLE_VALUE) {
+                if (a.Sleep) a.Sleep(100);
+                continue;
+            }
+            static Out o;
+            o.reset();
+            o.str("no state\nEND\n");
+            flush_out(a, pipe, o);
+            a.CloseHandle(pipe);
+            break;
+        }
+        stage_mark(a, "EXIT-NOSTATE");
+        return 111;
+    }
+
+    unsigned int idle = 0;
+    stage_mark(a, "SEEK");
+    for (;;) {
+        HANDLE pipe = a.CreateFileA("\\\\.\\pipe\\zendo-dev",
+                                    GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                    OPEN_EXISTING, 0, nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            if ((idle++ % 100) == 0) stage_mark(a, "SEEK");
+            if (idle > 20) {
+                // Leave DllMain: the stub restores the borrowed thread's
+                // original context, so nothing is left parked inside this
+                // client for a watchdog to find.
+                stage_mark(a, "EXIT-IDLE");
+                return 111;
+            }
+            if (!a.Sleep) {
+                stage_mark(a, "EXIT-NOSLEEP");
+                return 2;
+            }
+            a.Sleep(50);
+            continue;
+        }
+        idle = 0;
+        beacon(a, "PIPE");
+        serve_session(a, pipe, base, L);
+        g_cap_pipe = INVALID_HANDLE_VALUE;
+        a.CloseHandle(pipe);
+        // The server that just ended is still closing its instance. Give it a
+        // moment so this loop reconnects to the next server, not the corpse.
+        if (a.Sleep) a.Sleep(150);
+    }
 }
 
 inline DWORD beacon() {

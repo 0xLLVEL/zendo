@@ -19,6 +19,55 @@ fn inject() -> Result<Child, String> {
     spawn_inject(&["--hijack"])
 }
 
+/// The client already writes every `print` into its own Player log, and a chunk
+/// handed to the scheduler outlives our pipe. Tail that file for the session.
+fn player_log() -> Option<PathBuf> {
+    let dir = std::path::Path::new(&std::env::var_os("LOCALAPPDATA")?).join("Roblox").join("logs");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in std::fs::read_dir(dir).ok()? {
+        let Ok(e) = e else { continue };
+        let p = e.path();
+        let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
+        if !name.ends_with("_last.log") || name.contains("CrashHandler") {
+            continue;
+        }
+        let Ok(mt) = e.metadata().and_then(|m| m.modified()) else { continue };
+        if best.as_ref().map_or(true, |(t, _)| mt > *t) {
+            best = Some((mt, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn tail(path: &PathBuf, offset: u64, secs: u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut pos = offset;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let out = std::io::stdout();
+    while std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let Ok(mut f) = std::fs::File::open(path) else { continue };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len <= pos {
+            continue;
+        }
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(pos)).is_err() || (&mut f).take(len - pos).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        pos = len;
+        let mut w = out.lock();
+        for line in String::from_utf8_lossy(&buf).lines() {
+            if let Some((_, r)) = line.split_once("[FLog::CreatorOutput] ") {
+                let _ = writeln!(w, "» {r}");
+            } else if let Some((_, r)) = line.split_once("[FLog::CreatorWarning] Warning: ") {
+                let _ = writeln!(w, "» warn: {r}");
+            }
+        }
+        let _ = w.flush();
+    }
+}
+
 fn usage() -> ! {
     eprintln!("usage: zendo-exec <run|build|serve> <script.luau|blob.bin> [out.bin]");
     std::process::exit(2);
@@ -50,6 +99,10 @@ fn serve(src: &PathBuf) -> ! {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "probe" {
+        println!("live={}", pipe::payload_live());
+        return;
+    }
     if args.len() < 3 {
         usage();
     }
@@ -89,21 +142,45 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // A thread of our own dies at TLS init in this client, so borrow a parked
-    // thread instead. The failed attempt is not tried first any more: it left a
-    // second payload image behind and broke the borrow that followed.
-    eprintln!("[z] pipe up, hijacking");
-    let hijack_child = match zendo_core::spawn_inject_stream(&["--hijack"]) {
-        Ok(c) => c,
+    // Reuse a payload that is already listening; otherwise borrow a thread.
+    // A live mutex means the previous payload may still be in its one second
+    // tail, so wait briefly before deciding. When nothing answers we inject
+    // anyway: the payload-side mutex guard turns a duplicate into a no-op
+    // instead of a second image.
+    let pending = server.begin_accept();
+    let mut hijack_child: Option<Child> = None;
+    let mut connected = match pending.wait(600) {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("inject failed: {e}");
+            eprintln!("accept failed: {e}");
             std::process::exit(1);
         }
     };
-    eprintln!("[z] waiting for payload");
-    if let Err(e) = server.accept() {
-        eprintln!("accept failed: {e}");
-        std::process::exit(1);
+    if connected {
+        eprintln!("[z] live session, reusing");
+    } else {
+        // A held mutex only means the previous payload thread never let go of
+        // it after returning from DllMain. The pipe is the only session that
+        // matters: inject a fresh image and let this injection own the pipe.
+        eprintln!("[z] no session, injecting");
+        match zendo_core::spawn_inject_stream(&["--hijack"]) {
+            Ok(c) => hijack_child = Some(c),
+            Err(e) => {
+                eprintln!("inject failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        match pending.wait(30_000) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("[z] payload never connected");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("accept failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     eprintln!("[z] payload connected");
     let stdout = std::io::stdout();
@@ -123,18 +200,30 @@ fn main() {
             }
         }
     }
+    let log = player_log();
+    let log_pos = log.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0);
     let driven = pipe::drive(&server, &steps, stdout.lock());
-    // The payload waits for this ack before leaving DllMain. Without it the
-    // borrowed thread never returns and its context can never be restored.
-    let _ = server.write_all(b"ZEND1 ack\n");
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    match hijack_child.wait_with_output() {
-        Ok(out) => echo(&out),
-        Err(e) => eprintln!("injector wait failed: {e}"),
+    // The payload parks itself after `END` and waits for the next server, so
+    // there is no ack to send. Only a payload that finished the session (no
+    // live one was reused) leaves the injector to reap.
+    if let Some(child) = hijack_child {
+        match child.wait_with_output() {
+            Ok(out) => echo(&out),
+            Err(e) => eprintln!("injector wait failed: {e}"),
+        }
     }
     if let Err(e) = driven {
         eprintln!("pipe error: {e}");
         std::process::exit(1);
     }
     let _ = std::io::stdout().flush();
+    if let Some(p) = log {
+        let secs = std::env::var("ZENDO_TAIL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8);
+        if secs > 0 {
+            tail(&p, log_pos, secs);
+        }
+    }
 }

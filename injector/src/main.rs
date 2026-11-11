@@ -175,6 +175,36 @@ struct Pe {
     import_dir: (u32, u32),
 }
 
+/// True when `base` still holds a readable PE image with our header shape.
+/// The pid in the marker file can be recycled, so the check is structural:
+/// same entry RVA, same SizeOfImage, valid DOS and NT headers.
+fn image_at(proc: Handle, base: u64, entry: usize, size: usize) -> bool {
+    let mut hdr = [0u8; 0x200];
+    let mut got = 0usize;
+    let ok = unsafe {
+        ReadProcessMemory(proc, base as *const c_void, hdr.as_mut_ptr() as *mut c_void,
+                          hdr.len(), &mut got)
+    };
+    if ok == 0 || got < hdr.len() {
+        return false;
+    }
+    if &hdr[0..2] != b"MZ" {
+        return false;
+    }
+    let nt = u32::from_le_bytes(hdr[0x3C..0x40].try_into().unwrap()) as usize;
+    if nt + 0x60 > hdr.len() || &hdr[nt..nt + 4] != b"PE\0\0" {
+        return false;
+    }
+    let opt = nt + 0x18;
+    let magic = u16::from_le_bytes(hdr[opt..opt + 2].try_into().unwrap());
+    if magic != 0x20B {
+        return false;
+    }
+    let aep = u32::from_le_bytes(hdr[opt + 0x10..opt + 0x14].try_into().unwrap()) as usize;
+    let soi = u32::from_le_bytes(hdr[opt + 0x38..opt + 0x3C].try_into().unwrap()) as usize;
+    aep == entry && soi == size
+}
+
 fn read_pe(bytes: &[u8]) -> Result<Pe, String> {
     if bytes.len() < 0x40 || u16_at(bytes, 0) != 0x5A4D {
         return Err("not a PE (bad MZ)".into());
@@ -443,13 +473,38 @@ fn hijack_on(proc: Handle, tid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64
     let mut zero = [0u8; 16];
     unsafe { WriteProcessMemory(proc, flag_addr as *mut c_void, zero.as_ptr() as *const c_void, 16, &mut wrote); }
 
-    unsafe { SuspendThread(th); }
+    let prev = unsafe { SuspendThread(th) };
+    if prev == u32::MAX {
+        let e = std::io::Error::last_os_error();
+        unsafe { CloseHandle(th); }
+        return Attempt::Retry(format!("SuspendThread {tid}: {e}"));
+    }
+    // A thread someone else already holds suspended never reaches user mode,
+    // so the stub would never run and our resume would only decrement their
+    // count. Leave it alone and try another thread.
+    if prev > 0 {
+        unsafe { ResumeThread(th); CloseHandle(th); }
+        println!("  skipping thread {tid}: already suspended ({prev})");
+        return Attempt::Retry(format!("thread {tid} already suspended ({prev})"));
+    }
 
     let mut saved = ThreadContext([0u8; 0x4D0]);
     saved.0[0x30..0x34].copy_from_slice(&0x0010_000Bu32.to_le_bytes());
     if unsafe { GetThreadContext(th, saved.0.as_mut_ptr()) } == 0 {
         unsafe { ResumeThread(th); CloseHandle(th); }
         return Attempt::Retry("GetThreadContext failed".into());
+    }
+
+    // Park the untouched context where the stub can pick it up after DllMain
+    // returns; the stub reloads it with RtlRestoreContext.
+    let mut cw = 0usize;
+    let ok = unsafe {
+        WriteProcessMemory(proc, (stub_addr + 0x200) as *mut c_void,
+                           saved.0.as_ptr() as *const c_void, saved.0.len(), &mut cw)
+    };
+    if ok == 0 || cw != saved.0.len() {
+        unsafe { ResumeThread(th); CloseHandle(th); }
+        return Attempt::Retry("context stash failed".into());
     }
 
     let rip = u64::from_le_bytes(saved.0[0xF8..0x100].try_into().unwrap());
@@ -467,6 +522,21 @@ fn hijack_on(proc: Handle, tid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64
     }
     unsafe { ResumeThread(th); }
 
+    // Prove whether the patched thread ever reached user mode at all. A thread
+    // still sitting at our stub was never scheduled; one that is gone was killed
+    // the moment it touched the stub page.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut after = ThreadContext([0u8; 0x4D0]);
+    after.0[0x30..0x34].copy_from_slice(&0x0010_000Bu32.to_le_bytes());
+    if unsafe { GetThreadContext(th, after.0.as_mut_ptr()) } == 0 {
+        println!("    thread {tid} gone after patch: {}", std::io::Error::last_os_error());
+    } else {
+        let rip2 = u64::from_le_bytes(after.0[0xF8..0x100].try_into().unwrap());
+        match module_offset(proc, rip2) {
+            Some((name, off)) => println!("    thread {tid} now at {name}{off:+#x}"),
+            None => println!("    thread {tid} now at {rip2:#x}"),
+        }
+    }
     let mut got = 0usize;
     let mut state = 0u64;
     let mut ret = 0u64;
@@ -486,9 +556,25 @@ fn hijack_on(proc: Handle, tid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64
         }
     }
     // A thread Hyperion has parked under its own suspension never runs the
-    // stub at all. Leave it alone and find another one.
+    // stub at all. The RIP is still patched, so put the saved context back
+    // before moving on: otherwise the thread runs the stub whenever it is
+    // finally resumed and a second DllMain appears minutes later.
     if state == 0 {
+        let s = unsafe { SuspendThread(th) };
+        let rc = unsafe { SetThreadContext(th, saved.0.as_ptr()) };
+        // Never leave a thread we suspended: an unreleased suspend is a frozen
+        // client, and the context we could not write is already parked at
+        // stub+0x200 for the next attempt.
+        if s != u32::MAX {
+            unsafe { ResumeThread(th); }
+        }
         unsafe { CloseHandle(th); }
+        if rc == 0 {
+            return Attempt::Retry(format!(
+                "restore {tid} failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
         return Attempt::Retry("stub never started".into());
     }
     // DllMain is long-lived (REPL). Do not restore: the stub already overwrote
@@ -566,6 +652,46 @@ fn main() {
         }
     };
 
+    // ZENDO_THREADS=1 dumps every thread with the module it is parked in and
+    // marks the ones the hijack picker would accept. Read-only, changes nothing.
+    if std::env::var_os("ZENDO_THREADS").is_some() {
+        let proc = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, target_pid) };
+        if proc.is_null() {
+            eprintln!("OpenProcess failed: {}", std::io::Error::last_os_error());
+            exit(5);
+        }
+        let cands = pick_threads(target_pid);
+        println!("candidates: {:?}", cands);
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            let mut te: ThreadEntry32 = std::mem::zeroed();
+            te.dw_size = std::mem::size_of::<ThreadEntry32>() as u32;
+            let mut ok = Thread32First(snap, &mut te);
+            while ok != 0 {
+                if te.th32_owner_process_id == target_pid {
+                    let th = OpenThread(THREAD_ALL_ACCESS, 0, te.th32_thread_id);
+                    if !th.is_null() {
+                        let mut ctx = ThreadContext([0u8; 0x4D0]);
+                        ctx.0[0x30..0x34].copy_from_slice(&0x0010_000Bu32.to_le_bytes());
+                        if GetThreadContext(th, ctx.0.as_mut_ptr()) != 0 {
+                            let rip = u64::from_le_bytes(ctx.0[0xF8..0x100].try_into().unwrap());
+                            let mark = if cands.contains(&te.th32_thread_id) { "*" } else { " " };
+                            match module_offset(proc, rip) {
+                                Some((n, o)) => println!("{mark} tid {:>6} {n}{o:+#x}", te.th32_thread_id),
+                                None => println!("{mark} tid {:>6} {rip:#x}", te.th32_thread_id),
+                            }
+                        }
+                        CloseHandle(th);
+                    }
+                }
+                ok = Thread32Next(snap, &mut te);
+            }
+            CloseHandle(snap);
+        }
+        unsafe { CloseHandle(proc); }
+        return;
+    }
+
     let bytes = match fs::read(&dll_path) {
         Ok(b) => b,
         Err(e) => { eprintln!("read {dll_path}: {e}"); exit(3); }
@@ -583,8 +709,8 @@ fn main() {
         exit(5);
     }
 
-    let remote = unsafe { VirtualAllocEx(proc, ptr::null_mut(), pe.size_of_image, MEM_COMMIT_RESERVE, PAGE_READWRITE) };
     if probe {
+        let remote = unsafe { VirtualAllocEx(proc, ptr::null_mut(), pe.size_of_image, MEM_COMMIT_RESERVE, PAGE_READWRITE) };
         let h = unsafe { LoadLibraryA(c"kernel32.dll".as_ptr() as *const i8) };
         let sleep = unsafe { GetProcAddress(h, c"Sleep".as_ptr() as *const i8) };
         let mut ptid = 0u32;
@@ -602,37 +728,85 @@ fn main() {
         unsafe { CloseHandle(t); CloseHandle(proc); }
         return;
     }
-    if remote.is_null() {
-        eprintln!("VirtualAllocEx failed: {}", std::io::Error::last_os_error());
-        exit(6);
-    }
-    let remote_base = remote as u64;
-    println!("  remote image at {remote_base:#x}");
 
-    let delta = remote_base.wrapping_sub(pe.image_base) as i64;
-    println!("  reloc dir {:#x}+{:#x}  import dir {:#x}+{:#x}",
-             pe.reloc_dir.0, pe.reloc_dir.1, pe.import_dir.0, pe.import_dir.1);
-    apply_relocations(&mut pe, delta);
-    match resolve_imports(&mut pe) {
-        Ok(n) => println!("  resolved {n} imports"),
-        Err(e) => { eprintln!("imports: {e}"); exit(7); }
-    }
-
-    let mut written = 0usize;
-    let ok = unsafe {
-        WriteProcessMemory(proc, remote, pe.image.as_ptr() as *const c_void, pe.image.len(), &mut written)
-    };
-    if ok == 0 || written != pe.image.len() {
-        eprintln!("WriteProcessMemory {written}/{} err {}", pe.image.len(), std::io::Error::last_os_error());
-        exit(8);
-    }
-    println!("  wrote {written:#x} bytes");
-
-    for (va, size, prot) in section_protections(&bytes) {
-        let mut old = 0u32;
-        unsafe {
-            VirtualProtectEx(proc, remote.add(va), size, prot, &mut old);
+    // Reuse the image this injector already mapped into this process. The
+    // borrowed thread is disposable (the client kills it within seconds), but
+    // the mapped image is not: re-entering it keeps one payload copy per
+    // process instead of one per script.
+    let marker = std::env::temp_dir().join("zendo-image.txt");
+    // A rebuilt payload must never be re-entered: the old image is still there
+    // but holds the previous code. Size + mtime of the DLL is the stamp.
+    let (dll_len, dll_time) = std::fs::metadata(&dll_path)
+        .ok()
+        .and_then(|m| {
+            let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            Some((m.len(), t))
+        })
+        .unwrap_or((0, 0));
+    // Re-entry into a previously mapped image is not viable: the second
+    // DllMain either hangs before its first mark or the patched thread dies on
+    // the stub page. A fresh map per injection is the only route that has ever
+    // produced a full MARK run on an already-injected client. Opt back in with
+    // ZENDO_REUSE=1 only for experiments.
+    let allow_reuse = std::env::var("ZENDO_REUSE").map(|v| v == "1").unwrap_or(false);
+    let mut remote_base = 0u64;
+    let mut reused = false;
+    if allow_reuse {
+        if let Ok(s) = std::fs::read_to_string(&marker) {
+        let f: Vec<&str> = s.split_whitespace().collect();
+        let same = f.len() == 4
+            && f[0].parse::<u32>().ok() == Some(target_pid)
+            && f[2].parse::<u64>().ok() == Some(dll_len)
+            && f[3].parse::<u64>().ok() == Some(dll_time);
+        let base = f.get(1).and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+        if same {
+            if let Some(b) = base {
+                if image_at(proc, b, pe.entry, pe.size_of_image) {
+                    remote_base = b;
+                    reused = true;
+                }
+            }
         }
+        }
+    }
+
+    if reused {
+        println!("  reusing image at {remote_base:#x}");
+    } else {
+        let remote = unsafe { VirtualAllocEx(proc, ptr::null_mut(), pe.size_of_image, MEM_COMMIT_RESERVE, PAGE_READWRITE) };
+        if remote.is_null() {
+            eprintln!("VirtualAllocEx failed: {}", std::io::Error::last_os_error());
+            exit(6);
+        }
+        remote_base = remote as u64;
+        println!("  remote image at {remote_base:#x}");
+
+        let delta = remote_base.wrapping_sub(pe.image_base) as i64;
+        println!("  reloc dir {:#x}+{:#x}  import dir {:#x}+{:#x}",
+                 pe.reloc_dir.0, pe.reloc_dir.1, pe.import_dir.0, pe.import_dir.1);
+        apply_relocations(&mut pe, delta);
+        match resolve_imports(&mut pe) {
+            Ok(n) => println!("  resolved {n} imports"),
+            Err(e) => { eprintln!("imports: {e}"); exit(7); }
+        }
+
+        let mut written = 0usize;
+        let ok = unsafe {
+            WriteProcessMemory(proc, remote, pe.image.as_ptr() as *const c_void, pe.image.len(), &mut written)
+        };
+        if ok == 0 || written != pe.image.len() {
+            eprintln!("WriteProcessMemory {written}/{} err {}", pe.image.len(), std::io::Error::last_os_error());
+            exit(8);
+        }
+        println!("  wrote {written:#x} bytes");
+
+        for (va, size, prot) in section_protections(&bytes) {
+            let mut old = 0u32;
+            unsafe {
+                VirtualProtectEx(proc, remote.add(va), size, prot, &mut old);
+            }
+        }
+        let _ = std::fs::write(&marker, format!("{target_pid} {remote_base:#x} {dll_len} {dll_time}\n"));
     }
 
     // CreateRemoteThread starts with rcx = parameter and rdx = 0, so calling the
@@ -647,6 +821,14 @@ fn main() {
     };
     if exit_fn.is_null() {
         eprintln!("RtlExitUserThread not found");
+        exit(9);
+    }
+    let restore_fn = unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr() as *const i8);
+        GetProcAddress(ntdll, c"RtlRestoreContext".as_ptr() as *const i8)
+    };
+    if restore_fn.is_null() {
+        eprintln!("RtlRestoreContext not found");
         exit(9);
     }
     let sleep_fn = unsafe {
@@ -702,24 +884,16 @@ fn main() {
         s.extend_from_slice(&[0x48, 0xB8]);
         s.extend_from_slice(&(remote_base + pe.entry as u64).to_le_bytes());
         s.extend_from_slice(&[0xFF, 0xD0]);
-        s.extend_from_slice(&[0x48, 0xBA]);
-        s.extend_from_slice(&flag_addr.to_le_bytes());
-        s.extend_from_slice(&[0x48, 0x89, 0x42, 0x08]);
-        s.extend_from_slice(&[0x48, 0xC7, 0x02, 0x01, 0x00, 0x00, 0x00]);
-        // mov rsi, Sleep; mov rdi, RtlExitUserThread; mov r12d, 100
-        s.extend_from_slice(&[0x48, 0xBE]);
-        s.extend_from_slice(&(sleep_fn as u64).to_le_bytes());
-        s.extend_from_slice(&[0x48, 0xBF]);
-        s.extend_from_slice(&(exit_fn as u64).to_le_bytes());
-        s.extend_from_slice(&[0x41, 0xBC, 0x64, 0x00, 0x00, 0x00]);
-        // wait: mov ecx,50; call rsi; dec r12d; jnz wait
-        s.extend_from_slice(&[0xB9, 0x32, 0x00, 0x00, 0x00]);
-        s.extend_from_slice(&[0xFF, 0xD6]);
-        s.extend_from_slice(&[0x41, 0xFF, 0xCC]);
-        s.extend_from_slice(&[0x75, 0xF4]);
-        s.extend_from_slice(&[0x31, 0xC9]);
-        s.extend_from_slice(&[0xFF, 0xD7]);
-        s.extend_from_slice(&[0xCC]);
+        // DllMain returned: put the thread back exactly where it was. The
+        // saved CONTEXT is written at stub+0x200 for every attempt, and
+        // RtlRestoreContext reloads it wholesale, so the borrowed thread
+        // resumes its wait instead of staying pinned in our image.
+        s.extend_from_slice(&[0x48, 0xB9]);
+        s.extend_from_slice(&(stub_addr + 0x200).to_le_bytes());
+        s.extend_from_slice(&[0x31, 0xD2]);
+        s.extend_from_slice(&[0x48, 0xB8]);
+        s.extend_from_slice(&(restore_fn as u64).to_le_bytes());
+        s.extend_from_slice(&[0xFF, 0xD0, 0xCC]);
         match hijack(proc, target_pid, stub_addr, &s, flag_addr, main_thread) {
             Ok(Attempt::Finished(code)) => println!("  hijack completed, DllMain returned {code}"),
             Ok(Attempt::Running) => println!("  hijack running (DllMain long-lived)"),
@@ -740,7 +914,6 @@ fn main() {
     if thread.is_null() {
         eprintln!("CreateRemoteThread failed: {}", std::io::Error::last_os_error());
         unsafe {
-            VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
             VirtualFreeEx(proc, stub_mem, 0, MEM_RELEASE);
         }
         exit(9);

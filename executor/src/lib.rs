@@ -51,10 +51,30 @@ pub fn compile(src: &Path) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
+/// A chunk executed straight from the borrowed thread cannot yield: the C frame
+/// it would resume into belongs to a thread the game has already taken back.
+/// Hand the work to the scheduler and let our frame unwind, so `task.wait` and
+/// `task.spawn` run on the client's own thread where yielding is legal.
+fn wrap(src: &str) -> String {
+    format!(
+        "task.defer(function()\n\
+         local __znd_ok, __znd_err = pcall(function()\n\
+         {src}\n\
+         end)\n\
+         if not __znd_ok then warn(tostring(__znd_err)) end\n\
+         end)\n"
+    )
+}
+
 /// Compile a Luau source file and remap its opcodes to the client's runtime
 /// numbering. The result is the exact blob the payload's `L` command expects.
 pub fn build(src: &Path) -> Result<Vec<u8>, String> {
-    let blob = compile(src)?;
+    let text = std::fs::read_to_string(src).map_err(|e| format!("read {}: {e}", src.display()))?;
+    let tmp = std::env::temp_dir().join(format!("zendo-chunk-{}.luau", std::process::id()));
+    std::fs::write(&tmp, wrap(&text)).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let blob = compile(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let blob = blob?;
     let out = remap::remap(&blob).map_err(|e| format!("remap: {e}"))?;
     Ok(out.blob)
 }

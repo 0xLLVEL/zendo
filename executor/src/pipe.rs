@@ -6,6 +6,8 @@
 
 use std::ffi::c_void;
 use std::io::{self, Write};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 pub type Handle = *mut c_void;
 
@@ -22,6 +24,38 @@ extern "system" {
     fn DisconnectNamedPipe(h: Handle) -> i32;
     fn CloseHandle(h: Handle) -> i32;
     fn GetLastError() -> u32;
+    fn OpenMutexA(access: u32, inherit: i32, name: *const i8) -> Handle;
+    fn WaitForSingleObject(h: Handle, ms: u32) -> u32;
+    fn ReleaseMutex(h: Handle) -> i32;
+}
+
+/// True while a payload thread is parked in the client **and owns** the
+/// `zendo-live` mutex. Ownership is the part that matters: the payload thread
+/// takes the mutex and never releases it, so the kernel marks it abandoned as
+/// soon as that thread dies even though a stale handle keeps the object alive.
+/// A dead payload therefore reads as no session instead of blocking every
+/// later inject forever.
+pub fn payload_live() -> bool {
+    let name = b"zendo-live\0";
+    // SYNCHRONIZE | MUTEX_MODIFY_STATE: enough to wait on it and take it.
+    let h = unsafe { OpenMutexA(0x0010_0001, 0, name.as_ptr() as *const i8) };
+    if h.is_null() {
+        return false;
+    }
+    let r = unsafe { WaitForSingleObject(h, 0) };
+    eprintln!("[probe] wait=0x{r:x}");
+    if r == 0x102 {
+        // Still owned by a running thread.
+        unsafe { CloseHandle(h) };
+        return true;
+    }
+    // Free or abandoned: nobody is serving. Hand ownership back so the next
+    // payload starts clean.
+    unsafe {
+        ReleaseMutex(h);
+        CloseHandle(h);
+    }
+    false
 }
 
 const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
@@ -63,6 +97,30 @@ impl Pipe {
             }
         }
         Ok(())
+    }
+
+    /// Start waiting for a client without blocking the caller. The wait runs on
+    /// a helper thread so the UI can decide whether a session is already alive
+    /// (a payload parked in its reconnect loop) before spending an injection.
+    pub fn begin_accept(&self) -> Pending {
+        let h = self.h as usize;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let handle = h as Handle;
+            let ok = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+            let res = if ok != 0 {
+                Ok(())
+            } else {
+                let e = unsafe { GetLastError() };
+                if e == ERROR_PIPE_CONNECTED {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(e as i32))
+                }
+            };
+            let _ = tx.send(res);
+        });
+        Pending { rx }
     }
 
     pub fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
@@ -107,6 +165,27 @@ impl Drop for Pipe {
 pub enum Step<'a> {
     Cmd(u8),
     Chunk(&'a [u8]),
+}
+
+/// A connection attempt started by `Pipe::begin_accept`.
+pub struct Pending {
+    rx: mpsc::Receiver<io::Result<()>>,
+}
+
+impl Pending {
+    /// Wait up to `ms` for the client to connect. `false` means nobody did yet;
+    /// the accept thread stays parked and a later `wait` picks up the same
+    /// connection, so the caller can inject and then keep waiting on it.
+    pub fn wait(&self, ms: u64) -> io::Result<bool> {
+        match self.rx.recv_timeout(Duration::from_millis(ms)) {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(e)) => Err(e),
+            Err(RecvTimeoutError::Timeout) => Ok(false),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(io::Error::new(io::ErrorKind::Other, "accept thread gone"))
+            }
+        }
+    }
 }
 
 /// Streams payload output into `sink` and answers RDY lines with `steps` in

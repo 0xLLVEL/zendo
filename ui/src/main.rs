@@ -95,6 +95,59 @@ fn temp_script(source: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Newest Player log and its length. CrashHandler logs are excluded: they never
+/// carry script output and are usually the newest file in the directory.
+fn player_log() -> Option<(PathBuf, u64)> {
+    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Roblox").join("logs");
+    let mut best: Option<(std::time::SystemTime, PathBuf, u64)> = None;
+    for entry in std::fs::read_dir(&dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.contains("_Player_") || name.contains("CrashHandler") || !name.ends_with(".log") {
+            continue;
+        }
+        let meta = entry.metadata().ok()?;
+        let mtime = meta.modified().ok()?;
+        let len = meta.len();
+        if best.as_ref().map(|(t, _, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, entry.path(), len));
+        }
+    }
+    let (_, path, len) = best?;
+    Some((path, len))
+}
+
+/// Script output as the client recorded it: `print` lands in CreatorOutput and
+/// `warn` in CreatorWarning. Everything else in the log is engine noise.
+fn tail(snap: Option<(PathBuf, u64)>) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some((path, mut off)) = snap else { return String::new() };
+    let Ok(mut f) = std::fs::File::open(&path) else { return String::new() };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len < off {
+        off = 0;
+    }
+    if f.seek(SeekFrom::Start(off)).is_err() {
+        return String::new();
+    }
+    let mut buf = String::new();
+    if f.read_to_string(&mut buf).is_err() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for line in buf.lines() {
+        if let Some(i) = line.find("[FLog::CreatorOutput] ") {
+            out.push_str(&line[i + 22..]);
+            out.push('\n');
+        } else if let Some(i) = line.find("[FLog::CreatorWarning] Warning: ") {
+            out.push_str("warn: ");
+            out.push_str(&line[i + 31..]);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn steps_of<'a>(spec: &str, chunk: &'a [u8]) -> Result<Vec<pipe::Step<'a>>, String> {
     let mut v: Vec<pipe::Step> = Vec::new();
     let spec = if spec.trim().is_empty() { "chunk" } else { spec };
@@ -120,30 +173,63 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     // This client kills new threads at TLS init, so the borrow path is the one
     // that actually works. Go straight to it: the thread path costs a 10 s
     // timeout on every run and never succeeds.
-    let _ = app.emit("zendo://stage", "injecting");
-    let injector = zendo_core::spawn_inject(&["--hijack"])?;
-
-    server.accept().map_err(|e| format!("accept: {e}"))?;
+    // Reuse the payload parked in the client if it is waiting for a server;
+    // only borrow a thread when no session is live. A live payload that is
+    // mid-reconnect is waited for, never duplicated.
+    let pending = server.begin_accept();
+    let mut injector: Option<std::process::Child> = None;
+    // Snapshot the client's own Player log before injecting. A deferred chunk
+    // outlives this pipe session, so print/warn never reach us as bytes; the
+    // only lasting record is the log line the client writes itself.
+    let log_start = player_log();
+    let mut connected = pending.wait(600).map_err(|e| format!("accept: {e}"))?;
+    if !connected {
+        let _ = app.emit("zendo://stage", "injecting");
+        match zendo_core::spawn_inject(&["--hijack"]) {
+            Ok(c) => injector = Some(c),
+            Err(e) => return Err(e),
+        }
+        match pending.wait(30_000) {
+            Ok(true) => {}
+            Ok(false) => return Err("payload never connected".into()),
+            Err(e) => return Err(format!("accept: {e}")),
+        }
+    }
     let _ = app.emit("zendo://stage", "payload attached");
 
     let buf = Arc::new(Mutex::new(Vec::new()));
     let steps = steps_of(&spec, &chunk)?;
     let tap = Tap { app: app.clone(), buf: buf.clone() };
     let driven = pipe::drive(&server, &steps, tap);
-    // The payload waits for this ack before leaving DllMain. Without it the
-    // borrowed thread never returns and its context is never restored.
-    let _ = server.write_all(b"ZEND1 ack\n");
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    let inj = injector.wait_with_output().map_err(|e| format!("injector: {e}"))?;
-    if !inj.status.success() {
-        return Err(format!(
-            "injector exited with {}\n{}{}",
-            inj.status,
-            String::from_utf8_lossy(&inj.stdout),
-            String::from_utf8_lossy(&inj.stderr)
-        ));
+    // The payload parks after `END` and waits for the next server, so there is
+    // no ack. The injector is only reaped when this run borrowed a thread.
+    if let Some(inj) = injector {
+        let inj = inj.wait_with_output().map_err(|e| format!("injector: {e}"))?;
+        if !inj.status.success() {
+            return Err(format!(
+                "injector exited with {}\n{}{}",
+                inj.status,
+                String::from_utf8_lossy(&inj.stdout),
+                String::from_utf8_lossy(&inj.stderr)
+            ));
+        }
     }
     driven.map_err(|e| format!("pipe: {e}"))?;
+
+    // The chunk is deferred: the pipe session ends before Lua runs. Give the
+    // client a moment to log the script's own print/warn lines, then relay them.
+    let mut logged = String::new();
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        logged = tail(log_start.clone());
+        if !logged.is_empty() {
+            break;
+        }
+    }
+    if !logged.is_empty() {
+        let _ = app.emit("zendo://out", logged.clone());
+        buf.lock().unwrap().extend_from_slice(logged.as_bytes());
+    }
 
     let output = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
     Ok(RunOut { output, ms: t0.elapsed().as_millis(), chunk: chunk.len(), path: path.display().to_string() })
