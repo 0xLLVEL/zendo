@@ -1053,6 +1053,7 @@ inline DWORD run_chunk() {
 #include "../chunks/c32.inc"
 #include "../chunks/c33.inc"
 #include "../chunks/c34.inc"
+#include "../chunks/gbind.inc"
 #include "../chunks/c35.inc"
 #include "../chunks/c36.inc"
 #include "../chunks/c37.inc"
@@ -3631,6 +3632,21 @@ inline int native_api(void* L) {
             }
             api_step(pushed ? 'P' : 'E', 17);
             return pushed;
+        }
+
+        // End of a deferred script. The wrapper signals this after its pcall
+        // returns, which is the only moment the executor can tell a scheduler
+        // thread is done using the pipe. Writing END does not end the session
+        // by itself: the host answers with 'q', and the read loop breaks there.
+        if (op_is(op, oplen, "zendo:done")) {
+            api_step('S', 18);
+            HANDLE pipe = g_cap_pipe;
+            if (pipe != INVALID_HANDLE_VALUE) {
+                DWORD w = 0;
+                api().WriteFile(pipe, "END\n", 4, &w, nullptr);
+            }
+            api_step('P', 18);
+            return 0;
         }
     }
 
@@ -7983,6 +7999,13 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         }
         flush_out(a, pipe, o);
     }
+
+    // Global bindings. Runs while the dispatcher already owns the closure, so
+    // the setup chunk can hand plain Luau scripts the same door under their own
+    // names: `loadstring(src)`, `read`, `write`, `dm`, `base`, `svc`, `svcs`.
+    // The chunk gets the closure as its vararg, exactly like a pipe chunk.
+    if (g_api_live)
+        exec_raw(a, pipe, o, L, base, kZGlobalBody, kZGlobalLen, "gbind");
 
     for (;;) {
         stage_mark(a, "RDY");

@@ -225,7 +225,8 @@ fn main() {
     }
     let log = player_log();
     let log_pos = log.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0);
-    let driven = pipe::drive(&server, &steps, stdout.lock());
+    let driven = pipe::drive_wait(&server, &steps, stdout.lock(),
+                                  std::env::var_os("ZENDO_RAW").is_none());
     // The payload parks itself after `END` and waits for the next server, so
     // there is no ack to send. Only a payload that finished the session (no
     // live one was reused) leaves the injector to reap.

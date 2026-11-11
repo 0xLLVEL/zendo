@@ -165,16 +165,11 @@ fn steps_of<'a>(spec: &str, chunk: &'a [u8]) -> Result<Vec<pipe::Step<'a>>, Stri
 fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, String> {
     let t0 = Instant::now();
     let path = temp_script(&source)?;
-    // A script that talks to the native surface has to run synchronously on the
-    // borrowed thread: `zendo:loadstring` blocks inside the client until the
-    // executor answers on the session pipe, and the deferred wrapper would move
-    // the body onto a scheduler thread that outlives the pipe. Everything else
-    // keeps the wrapper, so yielding stays legal for ordinary scripts.
-    let chunk = if source.contains("zendo:") {
-        zendo_core::compile_str(&source)?
-    } else {
-        build(&path)?
-    };
+    // Raw on purpose: a plain script that calls loadstring must run while the
+    // session pipe is still open, and the deferred wrapper moves it off the
+    // borrowed thread. No z: the payload installs the same surface as globals
+    // (loadstring, read, write, dm, base, svc, svcs).
+    let chunk = zendo_core::compile_str(&source)?;
 
     let server =
         pipe::Pipe::create(r"\\.\pipe\zendo-dev").map_err(|e| format!("pipe: {e}"))?;
@@ -209,7 +204,7 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     let buf = Arc::new(Mutex::new(Vec::new()));
     let steps = steps_of(&spec, &chunk)?;
     let tap = Tap { app: app.clone(), buf: buf.clone() };
-    let driven = pipe::drive(&server, &steps, tap);
+    let driven = pipe::drive_wait(&server, &steps, tap, true);
     // The payload restores the borrowed thread once the pipe closes, so there is
     // no ack to wait for. The injector is only reaped when this run borrowed one.
     if let Some(inj) = injector {

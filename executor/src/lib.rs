@@ -56,12 +56,18 @@ pub fn compile(src: &Path) -> Result<Vec<u8>, String> {
 /// Hand the work to the scheduler and let our frame unwind, so `task.wait` and
 /// `task.spawn` run on the client's own thread where yielding is legal.
 fn wrap(src: &str) -> String {
+    // The vararg is the native door the payload binds into every chunk it
+    // loads. A wrapped script is deferred, so it runs after exec returns and
+    // may still need the session pipe (loadstring, dynamic loading). Signalling
+    // done is what tells the host the scheduler thread finished with it.
     format!(
-        "task.defer(function()\n\
+        "local __znd = ...\n\
+         task.defer(function()\n\
          local __znd_ok, __znd_err = pcall(function()\n\
          {src}\n\
          end)\n\
          if not __znd_ok then warn(tostring(__znd_err)) end\n\
+         if __znd then pcall(__znd, \"zendo:done\") end\n\
          end)\n"
     )
 }
@@ -103,8 +109,15 @@ pub fn compile_str(src: &str) -> Result<Vec<u8>, String> {
 /// hosts a long-lived REPL, so the injector must not wait for DllMain to end.
 pub fn spawn_inject(extra: &[&str]) -> Result<Child, String> {
     let mut cmd = Command::new(injector());
-    cmd.args(["--name", "RobloxPlayerBeta.exe", "--dll"])
-        .arg(payload_dll())
+    match std::env::var("ZENDO_PID") {
+        Ok(pid) if !pid.trim().is_empty() => {
+            cmd.arg(pid.trim()).arg("--dll");
+        }
+        _ => {
+            cmd.args(["--name", "RobloxPlayerBeta.exe", "--dll"]);
+        }
+    }
+    cmd.arg(payload_dll())
         .args(extra);
     quiet(&mut cmd)
         .spawn()
@@ -115,8 +128,15 @@ pub fn spawn_inject(extra: &[&str]) -> Result<Child, String> {
 /// never wait behind a pipe that may never connect.
 pub fn spawn_inject_stream(extra: &[&str]) -> Result<Child, String> {
     let mut cmd = Command::new(injector());
-    cmd.args(["--name", "RobloxPlayerBeta.exe", "--dll"])
-        .arg(payload_dll())
+    match std::env::var("ZENDO_PID") {
+        Ok(pid) if !pid.trim().is_empty() => {
+            cmd.arg(pid.trim()).arg("--dll");
+        }
+        _ => {
+            cmd.args(["--name", "RobloxPlayerBeta.exe", "--dll"]);
+        }
+    }
+    cmd.arg(payload_dll())
         .args(extra);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::inherit())

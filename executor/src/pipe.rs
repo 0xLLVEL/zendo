@@ -17,6 +17,8 @@ extern "system" {
                         max_instances: u32, out_buf: u32, in_buf: u32,
                         timeout: u32, sec: *mut c_void) -> Handle;
     fn ConnectNamedPipe(h: Handle, overlapped: *mut c_void) -> i32;
+    fn PeekNamedPipe(h: Handle, buf: *mut c_void, len: u32, read: *mut u32,
+                     avail: *mut u32, left: *mut u32) -> i32;
     fn ReadFile(h: Handle, buf: *mut c_void, len: u32, read: *mut u32,
                 overlapped: *mut c_void) -> i32;
     fn WriteFile(h: Handle, buf: *const c_void, len: u32, written: *mut u32,
@@ -139,6 +141,21 @@ impl Pipe {
         Ok(())
     }
 
+    /// Bytes already buffered on the pipe. Polling this instead of blocking in
+    /// ReadFile is what lets the driver give up on a script that never signals
+    /// done without writing a stray byte into a reply the payload is waiting for.
+    pub fn available(&self) -> io::Result<u32> {
+        let mut avail: u32 = 0;
+        let ok = unsafe {
+            PeekNamedPipe(self.h, std::ptr::null_mut(), 0, std::ptr::null_mut(),
+                          &mut avail, std::ptr::null_mut())
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(avail)
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut got: u32 = 0;
         let ok = unsafe {
@@ -217,12 +234,49 @@ fn take_bytes(pipe: &Pipe, acc: &mut Vec<u8>, dst: &mut [u8]) -> io::Result<()> 
 /// leading `P` are script output and reach the sink with a `» ` prefix so the
 /// UI can tell them apart from protocol chatter.
 pub fn drive(pipe: &Pipe, steps: &[Step], mut sink: impl Write) -> io::Result<()> {
+    drive_wait(pipe, steps, &mut sink, false)
+}
+
+/// `wait_done` keeps the session open after the last step until the payload
+/// signals END. A wrapped chunk runs on a scheduler thread and only touches the
+/// pipe later; closing it early is what made `loadstring` return nil. A raw
+/// chunk runs inside the step itself, so there is nothing left to wait for.
+pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
+                  wait_done: bool) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     let mut acc = Vec::new();
     let mut idx = 0usize;
     let mut sent_quit = false;
     let mut seen_end = false;
+    let mut idle = Duration::ZERO;
+    // How long the host stays quiet waiting for the script's done signal. A
+    // deferred body can sit in the scheduler for seconds before it runs, so a
+    // short window is what kills the session mid-script.
+    let wait_limit = std::env::var("ZENDO_DONE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60));
     loop {
+        // Poll: a blocking read hands the timeout decision to the client, and
+        // any byte written to break the wait would land inside a reply the
+        // payload is still assembling (a loadstring header, for example).
+        let avail = match pipe.available() {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if avail == 0 {
+            if wait_done && !sent_quit && idx >= steps.len() && idle >= wait_limit {
+                eprintln!("[pipe] no done signal, closing");
+                pipe.write_all(b"q")?;
+                sent_quit = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            idle += Duration::from_millis(20);
+            continue;
+        }
+        idle = Duration::ZERO;
         let n = match pipe.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
@@ -284,12 +338,22 @@ pub fn drive(pipe: &Pipe, steps: &[Step], mut sink: impl Write) -> io::Result<()
                     }
                     idx += 1;
                 } else if !sent_quit {
-                    eprintln!("[pipe] sending quit");
-                    pipe.write_all(b"q")?;
-                    sent_quit = true;
+                    if wait_done && !seen_end {
+                        // The script is still running on a scheduler thread and
+                        // may call loadstring any moment. Stay silent.
+                    } else {
+                        eprintln!("[pipe] sending quit");
+                        pipe.write_all(b"q")?;
+                        sent_quit = true;
+                    }
                 }
             } else if body == b"END" {
                 seen_end = true;
+                if wait_done && !sent_quit {
+                    eprintln!("[pipe] script done, closing");
+                    pipe.write_all(b"q")?;
+                    sent_quit = true;
+                }
             } else if body.first() == Some(&b'P') {
                 sink.write_all("\u{bb} ".as_bytes())?;
                 sink.write_all(&body[1..])?;
