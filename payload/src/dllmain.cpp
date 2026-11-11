@@ -163,6 +163,8 @@ struct Api {
     using AddVeh_t = void*(WINAPI*)(ULONG, void*);
     using RtlAddTable_t = unsigned char(WINAPI*)(void*, unsigned long, unsigned long long);
     using SetCfgTargets_t = BOOL(WINAPI*)(HANDLE, void*, SIZE_T, ULONG, void*);
+    using VirtualAlloc_t = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);
+    using VirtualFree_t = BOOL(WINAPI*)(void*, SIZE_T, DWORD);
 
     CreateFileA_t CreateFileA;
     CreateMutexA_t CreateMutexA;
@@ -179,6 +181,8 @@ struct Api {
     AddVeh_t AddVectoredExceptionHandler;
     RtlAddTable_t RtlAddFunctionTable;
     SetCfgTargets_t SetProcessValidCallTargets;
+    VirtualAlloc_t VirtualAlloc;
+    VirtualFree_t VirtualFree;
     using SetMitigation_t = BOOL(WINAPI*)(int, void*, SIZE_T);
     SetMitigation_t SetProcessMitigationPolicy;
 };
@@ -205,6 +209,8 @@ inline DWORD resolve_api() {
     a.GetLastError = reinterpret_cast<Api::GetLastError_t>(find_export(k32.base, fnv1a("GetLastError")));
     a.VirtualQuery = reinterpret_cast<Api::VirtualQuery_t>(find_export(k32.base, fnv1a("VirtualQuery")));
     a.VirtualProtect = reinterpret_cast<Api::VirtualProtect_t>(find_export(k32.base, fnv1a("VirtualProtect")));
+    a.VirtualAlloc = reinterpret_cast<Api::VirtualAlloc_t>(find_export(k32.base, fnv1a("VirtualAlloc")));
+    a.VirtualFree = reinterpret_cast<Api::VirtualFree_t>(find_export(k32.base, fnv1a("VirtualFree")));
     a.FlushInstructionCache =
         reinterpret_cast<Api::FlushICache_t>(find_export(k32.base, fnv1a("FlushInstructionCache")));
     a.AddVectoredExceptionHandler =
@@ -7350,6 +7356,292 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             }
             o.nl();
             flush_out(a, pipe, o);
+            stage_mark(a, "DONE");
+            continue;
+        }
+        if (cmd[0] == 'T') {
+            // The dispatcher at RobloxPlayerBeta.dll+0x4c9360 is stock CFG and
+            // reads one bit out of a bitmap that measures PAGE_READWRITE in
+            // this process. Dynamic code is blocked (1655) and private pages
+            // cannot be opted in, so setting that bit by hand is the remaining
+            // route: byte = addr >> 15, bit = (addr >> 12) & 7, exactly the
+            // way the dispatcher reads it. Then the same native test as 'k'.
+            Module dll = find_module(fnv1a_w(L"RobloxPlayerBeta.dll"));
+            unsigned long long target =
+                reinterpret_cast<unsigned long long>(&native_loadstring);
+            o.str("guard T target=");
+            o.hex(target);
+            o.nl();
+            flush_out(a, pipe, o);
+            if (!dll.base) {
+                o.str("guard T no dll\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            unsigned long long db = reinterpret_cast<unsigned long long>(dll.base);
+            unsigned long long bitmap = 0;
+            read_u64(db + 0x4c9376ull + 0x9f9622ull, &bitmap);
+            unsigned long long slotp = bitmap + (target >> 15);
+            unsigned int bit = static_cast<unsigned int>((target >> 12) & 7);
+            o.str("guard T bitmap=");
+            o.hex(bitmap);
+            o.str(" slot=");
+            o.hex(slotp);
+            o.str(" bit=");
+            o.dec(bit);
+            o.nl();
+            flush_out(a, pipe, o);
+            Mbi mbi{};
+            if (!bitmap ||
+                !a.VirtualQuery(reinterpret_cast<const void*>(slotp), &mbi, sizeof(mbi))) {
+                o.str("guard T unreadable\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            unsigned char b0 = 0;
+            if (mbi.State == MEM_COMMIT && (mbi.Protect & 0xff) == PAGE_READWRITE) {
+                b0 = *reinterpret_cast<unsigned char*>(slotp);
+            }
+            o.str("guard T prot=");
+            o.hex(mbi.Protect);
+            o.str(" state=");
+            o.hex(mbi.State);
+            o.str(" region=");
+            o.hex(mbi.RegionSize);
+            o.str(" before=");
+            o.hex(b0);
+            o.nl();
+            flush_out(a, pipe, o);
+            if (mbi.State != MEM_COMMIT || (mbi.Protect & 0xff) != PAGE_READWRITE) {
+                // The map is a 4 GB reservation covering the whole user space;
+                // pages only exist where loaded images put targets. Indexing one
+                // that was never committed is what killed the client here: the
+                // dereference itself faults, before a single bit is set.
+                o.str("guard T page not live, use U\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            *reinterpret_cast<volatile unsigned char*>(slotp) =
+                static_cast<unsigned char>(b0 | (1u << bit));
+            o.str("guard T after=");
+            o.hex(*reinterpret_cast<unsigned char*>(slotp));
+            o.nl();
+            flush_out(a, pipe, o);
+            stage_mark(a, "GUARD");
+            cmd[0] = 'k';
+        }
+        if (cmd[0] == 'U') {
+            // Same bit as T, but the page is brought in first. The map is one
+            // big MEM_RESERVE, so committing our own index is a normal data
+            // commit: no execute rights, nothing for the dynamic-code policy to
+            // object to. Then the bit, then the native test.
+            Module dll = find_module(fnv1a_w(L"RobloxPlayerBeta.dll"));
+            unsigned long long target =
+                reinterpret_cast<unsigned long long>(&native_loadstring);
+            unsigned long long db = dll.base ? reinterpret_cast<unsigned long long>(dll.base) : 0;
+            unsigned long long bitmap = 0;
+            if (db) read_u64(db + 0x4c9376ull + 0x9f9622ull, &bitmap);
+            unsigned long long slotp = bitmap + (target >> 15);
+            unsigned long long page = slotp & ~0xfffull;
+            unsigned int bit = static_cast<unsigned int>((target >> 12) & 7);
+            o.str("guard U target=");
+            o.hex(target);
+            o.str(" map=");
+            o.hex(bitmap);
+            o.str(" byte=");
+            o.hex(slotp);
+            o.str(" page=");
+            o.hex(page);
+            o.str(" bit=");
+            o.dec(bit);
+            o.nl();
+            flush_out(a, pipe, o);
+            if (!bitmap) {
+                o.str("guard U no map\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            Mbi before_q{};
+            a.VirtualQuery(reinterpret_cast<const void*>(page), &before_q, sizeof(before_q));
+            o.str("guard U q_state=");
+            o.hex(before_q.State);
+            o.str(" q_prot=");
+            o.hex(before_q.Protect);
+            o.str(" q_type=");
+            o.hex(before_q.Type);
+            o.nl();
+            if (before_q.State != MEM_COMMIT) {
+                void* got = a.VirtualAlloc ? a.VirtualAlloc(reinterpret_cast<void*>(page), 0x1000,
+                                                            MEM_COMMIT, PAGE_READWRITE)
+                                           : nullptr;
+                o.str("guard U commit=");
+                o.hex(reinterpret_cast<unsigned long long>(got));
+                o.str(" err=");
+                o.dec(got ? 0u : static_cast<unsigned int>(a.GetLastError()));
+                o.nl();
+            }
+            flush_out(a, pipe, o);
+            Mbi q{};
+            if (!a.VirtualQuery(reinterpret_cast<const void*>(page), &q, sizeof(q)) ||
+                q.State != MEM_COMMIT || (q.Protect & 0xff) != PAGE_READWRITE) {
+                o.str("guard U page still dead state=");
+                o.hex(q.State);
+                o.str(" prot=");
+                o.hex(q.Protect);
+                o.nl();
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            unsigned char b0 = *reinterpret_cast<unsigned char*>(slotp);
+            *reinterpret_cast<volatile unsigned char*>(slotp) =
+                static_cast<unsigned char>(b0 | (1u << bit));
+            o.str("guard U bit ");
+            o.hex(b0);
+            o.str(" -> ");
+            o.hex(*reinterpret_cast<unsigned char*>(slotp));
+            o.nl();
+            flush_out(a, pipe, o);
+            stage_mark(a, "GUARD");
+            cmd[0] = 'k';
+        }
+        if (cmd[0] == 'S') {
+            // The dispatcher at RobloxPlayerBeta.dll+0x4c9360 is stock CFG:
+            // `mov r11,[rip+0x9f9622]` loads the bitmap base, then one byte is
+            // tested. So the question is not "which stub" but "can a bit be
+            // set". Report what the allocator and the bitmap actually allow.
+            if (!a.VirtualAlloc) {
+                o.str("guard S no alloc\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            void* rx = a.VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                                      PAGE_EXECUTE_READWRITE);
+            o.str("guard S rwx=");
+            o.hex(reinterpret_cast<unsigned long long>(rx));
+            o.str(" err=");
+            o.dec(rx ? 0u : static_cast<unsigned int>(a.GetLastError()));
+            o.nl();
+            flush_out(a, pipe, o);
+            void* rw = a.VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            o.str("guard S rw=");
+            o.hex(reinterpret_cast<unsigned long long>(rw));
+            o.str(" err=");
+            o.dec(rw ? 0u : static_cast<unsigned int>(a.GetLastError()));
+            o.nl();
+            if (rw) {
+                DWORD oldp = 0;
+                BOOL pr = a.VirtualProtect(rw, 0x1000, PAGE_EXECUTE_READ, &oldp);
+                o.str("guard S rw->rx rc=");
+                o.dec(pr ? 1u : 0u);
+                o.str(" err=");
+                o.dec(static_cast<unsigned int>(a.GetLastError()));
+                o.nl();
+            }
+            flush_out(a, pipe, o);
+
+            Module dll = find_module(fnv1a_w(L"RobloxPlayerBeta.dll"));
+            o.str("guard S dll=");
+            o.hex(reinterpret_cast<unsigned long long>(dll.base));
+            o.nl();
+            if (dll.base) {
+                unsigned long long db = reinterpret_cast<unsigned long long>(dll.base);
+                unsigned long long global = db + 0x4c9376ull + 0x9f9622ull;
+                unsigned long long bitmap = 0;
+                read_u64(global, &bitmap);
+                o.str("guard S bitmap_global=");
+                o.hex(global);
+                o.str(" bitmap=");
+                o.hex(bitmap);
+                o.nl();
+                flush_out(a, pipe, o);
+                if (bitmap) {
+                    Mbi mbi{};
+                    if (a.VirtualQuery(reinterpret_cast<const void*>(bitmap), &mbi, sizeof(mbi))) {
+                        o.str("guard S bitmap_prot=");
+                        o.hex(mbi.Protect);
+                        o.str(" type=");
+                        o.hex(mbi.Type);
+                        o.str(" state=");
+                        o.hex(mbi.State);
+                        o.nl();
+                        flush_out(a, pipe, o);
+                        unsigned long long probe = reinterpret_cast<unsigned long long>(&cap_print);
+                        unsigned long long idx = (probe >> 15) & 0x1ffffull;
+                        o.str("guard S idx=");
+                        o.hex(idx);
+                        o.str(" byte=");
+                        o.hex(*reinterpret_cast<unsigned char*>(bitmap + idx));
+                        o.nl();
+                    }
+                }
+            }
+            if (rx) a.VirtualFree(rx, 0, 0x8000);
+            if (rw) a.VirtualFree(rw, 0, 0x8000);
+            flush_out(a, pipe, o);
+            stage_mark(a, "DONE");
+            continue;
+        }
+        if (cmd[0] == 'R') {
+            // Private pages are not valid CFG call targets, which is what the
+            // earlier registration ran into (87). PAGE_TARGETS_INVALID says so
+            // at allocation time, and offsets can then be opted in. Nothing
+            // here touches a client page: the page is ours, the stub is
+            // `mov eax,42; ret`, and the proof call is direct.
+            if (!a.VirtualAlloc || !a.SetProcessValidCallTargets) {
+                o.str("guard R api missing\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            const DWORD kTargetsInvalid = 0x40000000;
+            void* page = a.VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                                        PAGE_EXECUTE_READWRITE | kTargetsInvalid);
+            o.str("guard R page=");
+            o.hex(reinterpret_cast<unsigned long long>(page));
+            o.str(" alloc_err=");
+            o.dec(page ? 0u : static_cast<unsigned int>(a.GetLastError()));
+            o.nl();
+            flush_out(a, pipe, o);
+            if (!page) {
+                stage_mark(a, "DONE");
+                continue;
+            }
+            unsigned char* pc = static_cast<unsigned char*>(page);
+            pc[0] = 0xb8;  // mov eax, 42
+            pc[1] = 0x2a;
+            pc[2] = 0;
+            pc[3] = 0;
+            pc[4] = 0;
+            pc[5] = 0xc3;  // ret
+            static CfgCallTargetInfo rinfo[1];
+            rinfo[0].Offset = 0;
+            rinfo[0].Flags = 1;
+            HANDLE self = reinterpret_cast<HANDLE>(static_cast<long long>(-1));
+            BOOL rc = a.SetProcessValidCallTargets(self, page, 0x1000, 1, rinfo);
+            o.str("guard R register rc=");
+            o.dec(rc ? 1u : 0u);
+            o.str(" err=");
+            o.dec(static_cast<unsigned int>(a.GetLastError()));
+            o.nl();
+            int v = reinterpret_cast<int (*)()>(page)();
+            o.str("guard R stub_direct=");
+            o.dec(static_cast<unsigned int>(v));
+            o.nl();
+            flush_out(a, pipe, o);
+            HANDLE f = a.CreateFileA("D:\\zendo\\work\\trust_page.bin", GENERIC_WRITE,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                DWORD w = 0;
+                a.WriteFile(f, &page, 8, &w, nullptr);
+                a.CloseHandle(f);
+            }
             stage_mark(a, "DONE");
             continue;
         }
