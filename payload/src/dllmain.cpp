@@ -3055,6 +3055,84 @@ inline void api_strinfo(unsigned long long tstr, unsigned int len) {
 // read/write take a Lua string as the buffer. Writing into a long string
 // (length > 40) is safe: Luau only interns short strings, so no hash table is
 // touched. The chunk test uses 64-byte buffers for that reason.
+// --- loadstring -------------------------------------------------------------
+// The client ships without a Luau compiler, so source cannot be compiled in
+// process. What it can do is load bytecode, and that is all loadstring really
+// needs: the executor compiles offline, the bytes travel, the VM turns them into
+// a callable closure. This is the door those bytes come through.
+
+// Staging area for the magic prefix plus the caller's bytecode. One page block,
+// allocated once per payload instance, never freed: the loader keeps pointers
+// into the proto it builds and the process dies with us anyway.
+inline unsigned long long load_stage(unsigned int need) {
+    static unsigned long long stage = 0;
+    if (!stage) {
+        void* p = api().VirtualAlloc ? api().VirtualAlloc(nullptr, 1u << 20,
+                                                          MEM_COMMIT | MEM_RESERVE,
+                                                          PAGE_READWRITE)
+                                     : nullptr;
+        if (p) stage = reinterpret_cast<unsigned long long>(p);
+    }
+    if (!stage || need > (1u << 20)) return 0;
+    return stage;
+}
+
+// Prepends the 8-byte guard magic the loader wants in front of raw bytecode and
+// calls it. The loader pushes the resulting closure onto L's stack, so a caller
+// that returns 1 hands that closure straight to the script.
+inline int lua_load_bytes(unsigned long long l, const char* body, unsigned int blen) {
+    if (!body || !blen || blen > (1u << 20) - 8) return 0;
+    unsigned long long buf = load_stage(blen + 8);
+    if (!buf || !g_base) return 0;
+    const unsigned long long magic = 0xE009325B4A107A52ull;
+    char* p = reinterpret_cast<char*>(buf);
+    for (int i = 0; i < 8; ++i) p[i] = static_cast<char>(magic >> (8 * i));
+    for (unsigned int i = 0; i < blen; ++i)
+        *reinterpret_cast<volatile char*>(p + 8 + i) = body[i];
+    ChunkName src;
+    src.data = p;
+    src.pad = 0;
+    src.size = blen + 8;
+    src.cap = blen + 8;
+    typedef int (*LoadFn)(void*, void*, const char*, int);
+    LoadFn load = reinterpret_cast<LoadFn>(g_base + 0x426A570);
+    int ret = load(reinterpret_cast<void*>(l), &src, "=zendo", 0);
+    return ret == 0 ? 1 : 0;
+}
+
+// Reads a compiled chunk from disk into the staging buffer and loads it. This is
+// how a script is handed over before the pipe carries the bytes itself.
+inline int lua_load_file(unsigned long long l, const char* path) {
+    HANDLE f = api().CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    unsigned long long buf = load_stage((1u << 20));
+    if (!buf) {
+        api().CloseHandle(f);
+        return 0;
+    }
+    DWORD got = 0;
+    char* p = reinterpret_cast<char*>(buf);
+    if (!api().ReadFile(f, p + 8, (1u << 20) - 8, &got, nullptr) || !got) {
+        api().CloseHandle(f);
+        return 0;
+    }
+    api().CloseHandle(f);
+    unsigned int size = got;
+    const unsigned long long magic = 0xE009325B4A107A52ull;
+    for (int i = 0; i < 8; ++i) p[i] = static_cast<char>(magic >> (8 * i));
+    ChunkName src;
+    src.data = p;
+    src.pad = 0;
+    src.size = size + 8;
+    src.cap = size + 8;
+    typedef int (*LoadFn)(void*, void*, const char*, int);
+    LoadFn load = reinterpret_cast<LoadFn>(g_base + 0x426A570);
+    if (!g_base) return 0;
+    int ret = load(reinterpret_cast<void*>(l), &src, "=zendo", 0);
+    return ret == 0 ? 1 : 0;
+}
+
 inline int native_api(void* L) {
     unsigned long long l = reinterpret_cast<unsigned long long>(L);
     // A dedicated page, not a static in the image: the write op changes page
@@ -3112,6 +3190,33 @@ inline int native_api(void* L) {
             int r = lua_ret_num(l, static_cast<double>(slen));
             api_step('E', 3);
             return r;
+        }
+
+        // loadstring: the loader pushes the closure, so returning 1 hands it
+        // back to the script as the result of the call.
+        if (op_is(op, oplen, "zendo:load")) {
+            api_step('S', 11);
+            unsigned int blen = 0;
+            char* body = lua_arg_str(l, 1, &blen);
+            int n = body ? lua_load_bytes(l, body, blen) : 0;
+            api_step(n ? 'P' : 'E', 11);
+            return n;
+        }
+
+        if (op_is(op, oplen, "zendo:loadf")) {
+            api_step('S', 12);
+            unsigned int plen = 0;
+            char* path = lua_arg_str(l, 1, &plen);
+            int n = 0;
+            if (path && plen && plen < 240) {
+                char tmp[256];
+                for (unsigned int i = 0; i < plen; ++i)
+                    *reinterpret_cast<volatile char*>(tmp + i) = path[i];
+                tmp[plen] = 0;
+                n = lua_load_file(l, tmp);
+            }
+            api_step(n ? 'P' : 'E', 12);
+            return n;
         }
 
         // Chunk-side reporting. The script hands the values it wants recorded to
