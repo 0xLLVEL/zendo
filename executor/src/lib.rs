@@ -65,8 +65,8 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 10 then
-local api = { version = 10, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 11 then
+local api = { version = 11, missing = {} }
 local function put(name, value)
     if rawget(__znd_env, name) == nil then __znd_env[name] = value end
 end
@@ -204,6 +204,59 @@ put("getthreadidentity", function()
     local n = call("zendo:ident")
     if type(n) ~= "number" then return 0 end
     return n
+end)
+
+-- HTTP is a host job. WinHTTP lives in the executor, not in the client; the
+-- payload forwards the request and can only receive numbers, so the host writes
+-- the response body and header block into the sandbox and this reads them back
+-- with the file door. Field names are the sUNC ones.
+local req_seq = 0
+put("request", function(t)
+    if type(t) ~= "table" or type(t.Url) ~= "string" then return nil end
+    local hdrs = {}
+    if type(t.Headers) == "table" then
+        for k, v in pairs(t.Headers) do
+            if type(k) == "string" and (type(v) == "string" or type(v) == "number") then
+                hdrs[#hdrs + 1] = k .. ": " .. tostring(v) .. "\r\n"
+            end
+        end
+    end
+    if type(t.Cookies) == "table" then
+        local parts = {}
+        for k, v in pairs(t.Cookies) do
+            if type(k) == "string" then parts[#parts + 1] = k .. "=" .. tostring(v) end
+        end
+        if #parts > 0 then
+            hdrs[#hdrs + 1] = "Cookie: " .. table.concat(parts, "; ") .. "\r\n"
+        end
+    end
+    req_seq = req_seq + 1
+    local tag = tostring(req_seq) .. "_" .. tostring(math.floor(os.clock() * 1000))
+    local body_path = "http/" .. tag .. ".body"
+    local hdr_path = "http/" .. tag .. ".hdr"
+    local status, ok = call("zendo:req", t.Url, tostring(t.Method or "GET"),
+        table.concat(hdrs), tostring(t.Body or ""), body_path, hdr_path)
+    if type(status) ~= "number" or status == 0 then return nil end
+    local raw_h = call("zendo:file", hdr_path)
+    local raw_b = call("zendo:file", body_path)
+    call("zendo:del", body_path)
+    call("zendo:del", hdr_path)
+    local headers, message = {}, ""
+    if type(raw_h) == "string" then
+        for line in string.gmatch(raw_h, "[^\r\n]+") do
+            local k, v = string.match(line, "^([^:]+):%s*(.*)$")
+            if k then headers[k] = v end
+        end
+        message = string.match(raw_h, "^HTTP/[%d%.]+%s+%d+%s*(.*)") or ""
+    end
+    return {
+        Success = ok == 1,
+        StatusCode = status,
+        StatusMessage = message,
+        Headers = headers,
+        Body = (type(raw_b) == "string" and raw_b or ""),
+        Url = t.Url,
+    }
 end)
 
 put("isfile", function(path)

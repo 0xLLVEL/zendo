@@ -60,6 +60,194 @@ pub fn payload_live() -> bool {
     false
 }
 
+#[link(name = "winhttp")]
+extern "system" {
+    fn WinHttpOpen(agent: *const u16, access: u32, proxy: *const u16,
+                   bypass: *const u16, flags: u32) -> *mut c_void;
+    fn WinHttpConnect(session: *mut c_void, host: *const u16, port: u16,
+                      reserved: u32) -> *mut c_void;
+    fn WinHttpOpenRequest(connect: *mut c_void, verb: *const u16, path: *const u16,
+                          version: *const u16, referrer: *const u16,
+                          accept: *const u16, flags: u32) -> *mut c_void;
+    fn WinHttpSendRequest(req: *mut c_void, headers: *const u16, headers_len: u32,
+                          body: *const c_void, body_len: u32, total_len: u32,
+                          context: usize) -> i32;
+    fn WinHttpReceiveResponse(req: *mut c_void, reserved: *mut c_void) -> i32;
+    fn WinHttpQueryHeaders(req: *mut c_void, info: u32, name: *const u16,
+                           buf: *mut c_void, len: *mut u32, index: *mut u32) -> i32;
+    fn WinHttpReadData(req: *mut c_void, buf: *mut c_void, len: u32,
+                       read: *mut u32) -> i32;
+    fn WinHttpQueryDataAvailable(req: *mut c_void, avail: *mut u32) -> i32;
+    fn WinHttpSetTimeouts(session: *mut c_void, resolve: i32, connect: i32,
+                          send: i32, receive: i32) -> i32;
+    fn WinHttpSetOption(h: *mut c_void, option: u32, buf: *mut c_void, len: u32) -> i32;
+    fn WinHttpCloseHandle(h: *mut c_void) -> i32;
+}
+
+const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
+const WINHTTP_QUERY_STATUS_TEXT: u32 = 20;
+const WINHTTP_QUERY_RAW_HEADERS_CRLF: u32 = 22;
+const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+
+pub struct HttpResponse {
+    pub status: u32,
+    pub reason: String,
+    pub headers: String,
+    pub body: Vec<u8>,
+}
+
+/// `http[s]://host[:port]/path?query` -> (secure, host, port, path).
+fn split_url(url: &str) -> Option<(bool, String, u16, String)> {
+    let (secure, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return None;
+    };
+    let (authority, path) = match rest.find(['/', '?']) {
+        Some(i) if rest[i..].starts_with('/') => (&rest[..i], rest[i..].to_string()),
+        Some(i) => (&rest[..i], format!("/{}", &rest[i..])),
+        None => (rest, "/".to_string()),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !h.ends_with(']') => (
+            h.to_string(),
+            p.parse::<u16>().ok()?,
+        ),
+        _ => (authority.to_string(), if secure { 443 } else { 80 }),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((secure, host, port, path))
+}
+
+fn query_text(req: *mut c_void, info: u32) -> Option<String> {
+    let mut len = 0u32;
+    unsafe {
+        WinHttpQueryHeaders(req, info, std::ptr::null(), std::ptr::null_mut(),
+                            &mut len, std::ptr::null_mut());
+    }
+    if len == 0 {
+        return Some(String::new());
+    }
+    let mut buf = vec![0u16; (len as usize / 2) + 2];
+    let ok = unsafe {
+        WinHttpQueryHeaders(req, info, std::ptr::null(), buf.as_mut_ptr() as *mut c_void,
+                            &mut len, std::ptr::null_mut())
+    };
+    if ok == 0 {
+        return None;
+    }
+    let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..nul]))
+}
+
+/// One HTTP round trip through WinHTTP. WinHTTP owns TLS, proxy discovery and
+/// redirects, so nothing here has to know about certificates or chunked
+/// encoding. Errors are strings because they end up in the log, not in Lua.
+pub fn http_perform(url: &str, method: &str, headers: &str, body: &[u8]) -> Result<HttpResponse, String> {
+    let (secure, host, port, path) = split_url(url).ok_or_else(|| format!("bad url: {url}"))?;
+    let agent = wide("zendo/1.0");
+    unsafe {
+        let session = WinHttpOpen(agent.as_ptr(), 0, std::ptr::null(), std::ptr::null(), 0);
+        if session.is_null() {
+            return Err("WinHttpOpen".into());
+        }
+        // A script that hangs must not hang the whole session: every phase gets
+        // a ceiling, and the pipe is synchronous while a request is in flight.
+        WinHttpSetTimeouts(session, 10_000, 10_000, 30_000, 30_000);
+        let hostw = wide(&host);
+        let conn = WinHttpConnect(session, hostw.as_ptr(), port, 0);
+        if conn.is_null() {
+            WinHttpCloseHandle(session);
+            return Err(format!("WinHttpConnect {host}:{port}"));
+        }
+        let verb_src = if method.is_empty() { "GET" } else { method };
+        let verb = wide(verb_src);
+        let pathw = wide(&path);
+        let flags = if secure { WINHTTP_FLAG_SECURE } else { 0 };
+        let req = WinHttpOpenRequest(conn, verb.as_ptr(), pathw.as_ptr(),
+                                     std::ptr::null(), std::ptr::null(),
+                                     std::ptr::null(), flags);
+        if req.is_null() {
+            WinHttpCloseHandle(conn);
+            WinHttpCloseHandle(session);
+            return Err("WinHttpOpenRequest".into());
+        }
+        let hdrw: Vec<u16> = headers.encode_utf16().chain(std::iter::once(0)).collect();
+        // gzip | deflate: WinHTTP adds Accept-Encoding itself and hands back
+        // decoded bytes. A script that sets its own Accept-Encoding still gets
+        // what it asked for; the option only removes the manual inflate step.
+        let decomp: u32 = 3;
+        WinHttpSetOption(req, 118, &decomp as *const u32 as *mut c_void, 4);
+        let (hp, hl) = if headers.is_empty() {
+            (std::ptr::null(), 0u32)
+        } else {
+            (hdrw.as_ptr(), u32::MAX)
+        };
+        let (bp, bl) = if body.is_empty() {
+            (std::ptr::null(), 0u32)
+        } else {
+            (body.as_ptr() as *const c_void, body.len() as u32)
+        };
+        let sent = WinHttpSendRequest(req, hp, hl, bp, bl, bl, 0);
+        if sent == 0 {
+            let e = std::io::Error::last_os_error();
+            WinHttpCloseHandle(req);
+            WinHttpCloseHandle(conn);
+            WinHttpCloseHandle(session);
+            return Err(format!("send: {e}"));
+        }
+        if WinHttpReceiveResponse(req, std::ptr::null_mut()) == 0 {
+            let e = std::io::Error::last_os_error();
+            WinHttpCloseHandle(req);
+            WinHttpCloseHandle(conn);
+            WinHttpCloseHandle(session);
+            return Err(format!("receive: {e}"));
+        }
+        let mut status = 0u32;
+        let mut slen = 4u32;
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            std::ptr::null(), &mut status as *mut u32 as *mut c_void,
+                            &mut slen, std::ptr::null_mut());
+        let reason = query_text(req, WINHTTP_QUERY_STATUS_TEXT).unwrap_or_default();
+        let raw_headers = query_text(req, WINHTTP_QUERY_RAW_HEADERS_CRLF).unwrap_or_default();
+        let mut data: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; 1 << 16];
+        // Query first, then read the advertised count. A bare ReadData can
+        // return zero bytes while the body is still arriving (http/2 and
+        // chunked responses both do this), which is how an example.com page
+        // came back as a 200 with an empty body.
+        loop {
+            let mut avail = 0u32;
+            if WinHttpQueryDataAvailable(req, &mut avail) == 0 || avail == 0 {
+                break;
+            }
+            let want = (avail as usize).min(chunk.len());
+            let mut got = 0u32;
+            let ok = WinHttpReadData(req, chunk.as_mut_ptr() as *mut c_void,
+                                     want as u32, &mut got);
+            if ok == 0 || got == 0 {
+                break;
+            }
+            data.extend_from_slice(&chunk[..got as usize]);
+            if data.len() > (8 << 20) {
+                break;
+            }
+        }
+        WinHttpCloseHandle(req);
+        WinHttpCloseHandle(conn);
+        WinHttpCloseHandle(session);
+        Ok(HttpResponse { status, reason, headers: raw_headers, body: data })
+    }
+}
+
 const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 const PIPE_ACCESS_DUPLEX: u32 = 0x3;
 const PIPE_TYPE_BYTE: u32 = 0x0;
@@ -438,6 +626,67 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                     } else {
                         pipe.write_all(format!("A {}\n", ok).as_bytes())?;
                     }
+                }
+                sink.flush()?;
+                continue;
+            }
+            if body.first() == Some(&b'Q') {
+                // HTTP request forwarded from the payload. The socket lives
+                // here, not in the client: WinHTTP handles TLS, proxies and
+                // redirects. The response body and header block are written to
+                // two sandbox files, and the script reads them back with
+                // readfile - the payload cannot build a Luau string.
+                const CAPS: [usize; 6] = [8192, 16, 65536, 8 << 20, 512, 512];
+                let fields: Vec<usize> = body[1..]
+                    .split(|&c| c == b' ')
+                    .filter(|f| !f.is_empty())
+                    .filter_map(|f| std::str::from_utf8(f).ok()?.trim().parse().ok())
+                    .collect();
+                if fields.len() != 6 || fields.iter().zip(CAPS).any(|(n, cap)| *n > cap) {
+                    pipe.write_all(b"R 0 0\n")?;
+                } else {
+                    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(6);
+                    for n in &fields {
+                        let mut v = vec![0u8; *n];
+                        take_bytes(pipe, &mut acc, &mut v)?;
+                        parts.push(v);
+                    }
+                    let url = String::from_utf8_lossy(&parts[0]).to_string();
+                    let method = String::from_utf8_lossy(&parts[1]).to_string();
+                    let headers = String::from_utf8_lossy(&parts[2]).to_string();
+                    let body_path = String::from_utf8_lossy(&parts[4]).to_string();
+                    let hdr_path = String::from_utf8_lossy(&parts[5]).to_string();
+                    let mut ok = 0u8;
+                    let mut status = 0u32;
+                    match http_perform(&url, &method, &headers, &parts[3]) {
+                        Ok(resp) => {
+                            status = resp.status;
+                            let write_into = |raw: &str, bytes: &[u8]| -> bool {
+                                match fs_path(raw.as_bytes()) {
+                                    Some(p) => {
+                                        if let Some(parent) = p.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        std::fs::write(&p, bytes).is_ok()
+                                    }
+                                    None => false,
+                                }
+                            };
+                            let mut text = resp.headers.clone();
+                            if !text.ends_with("\r\n") {
+                                text.push_str("\r\n");
+                            }
+                            let body_ok = write_into(&body_path, &resp.body);
+                            let hdr_ok = write_into(&hdr_path, text.as_bytes());
+                            if body_ok && hdr_ok {
+                                ok = 1;
+                            }
+                            eprintln!("[pipe] http {} {} -> {} ({} bytes)",
+                                      method, url, resp.status, resp.body.len());
+                        }
+                        Err(e) => eprintln!("[pipe] http failed: {e}"),
+                    }
+                    pipe.write_all(format!("R {} {}\n", status, ok).as_bytes())?;
                 }
                 sink.flush()?;
                 continue;

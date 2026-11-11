@@ -295,15 +295,24 @@ Payload → host:
 | `P <text>` | script output; the host prints it with a `»` prefix |
 | `END` | the deferred chunk finished |
 | `C <len>` + source | the script called `loadstring`; compile now and answer on the same stream |
+| `Q <6 lens>` + six strings | HTTP request forwarded to the host (url, method, headers, body, body path, header path) |
 | `A <0|1>` | filesystem result |
 | `F/G/S/L/T/M/D ...` | filesystem request: read, write, is-file, list, is-folder, mkdir, delete |
 
 `loadstring` is answered with `K <len>` + bytecode (or `E <len>` + message). The
 filesystem requests are answered with a *chunk* that returns the bytes as a
 literal, because the payload cannot construct a Luau string on its own — the VM
-turns the literal into a real string on the other side.
+turns the literal into a real string on the other side. That chunk carries the
+same spoofed 64-byte declared size as the injection chunk; without it the loader's
+`size - 8 >= 0x118` gate rejects every reply of 288 bytes or more.
 
-The outer host dispatcher must accept every request letter (`F G S L T M D`).
+HTTP is a host job. `Q` forwards six strings, WinHTTP performs the round trip, and
+the host writes the response body and raw header block into two sandbox files. The
+payload answers `R <status> <ok>`; the Lua `request` helper reads both files back
+through the file door and builds the sUNC table. No socket is opened inside the
+client, and TLS, proxies and redirects are WinHTTP's problem.
+
+The outer host dispatcher must accept every request letter (`F G S L T M D Q`).
 Dropping one silently deadlocks the script waiting for an answer.
 
 ### 7. The Lua API layer
@@ -594,11 +603,12 @@ one client, one injection per run, client alive at the end:
 | 34 | `loadstring` | `loadstring("return 3+4")()` → `7` |
 | 35 | `getthreadidentity` | `8` |
 | 36 | `compareinstances` | `true, false, true` |
+| 37 | `request` | HTTPS 200 body 577 B, gzip 84 B, redirect, 404 |
 
-**36 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
+**37 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
 layout measurements behind items 30–36 live in `docs/re.md`.
 
-### Remaining 43, grouped by blocker
+### Remaining 42, grouped by blocker
 
 | Blocker | Names |
 |---|---|
@@ -607,7 +617,7 @@ layout measurements behind items 30–36 live in `docs/re.md`.
 | Closure allocation | `newcclosure`, `clonefunction`, `restorefunction`, `isexecutorclosure`, `getfunctionhash` |
 | Proto children / frame walking | `debug.getprotos`, `debug.getproto`, `debug.getstack`, `debug.setstack` |
 | Drawing API (not implemented at all) | `cleardrawcache`, `isrenderobj`, `getrenderproperty`, `setrenderproperty` |
-| Host-side work | `request` (WinHTTP in the payload), `getcustomasset` |
+| Host-side work | `getcustomasset` |
 | Needs a capability mask, not just a byte | `setthreadidentity` |
 | Namecall state | `getnamecallmethod` |
 

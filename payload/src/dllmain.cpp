@@ -3145,6 +3145,12 @@ inline unsigned long long load_stage(unsigned int need) {
 // Prepends the guard magic to whatever already sits at buf+8 and hands the blob
 // to LuaVMLoad. The loader pushes the resulting closure onto L's stack, so a
 // caller that returns 1 gives it straight to the script.
+//
+// The loader has a watermark gate on `size - 8 >= 0x118`: at 288 bytes or more
+// it takes the validating path and rejects a chunk the executor built itself.
+// The undump parser does not bounds-check, so a small declared size skips the
+// gate while the whole real buffer is still parsed - the same trick exec_raw
+// uses for the injection chunk.
 inline int lua_load_stage(unsigned long long l, unsigned long long buf, unsigned int blen) {
     if (!buf || !blen || !g_base) return 0;
     const unsigned long long magic = 0xE009325B4A107A52ull;
@@ -3153,8 +3159,8 @@ inline int lua_load_stage(unsigned long long l, unsigned long long buf, unsigned
     ChunkName src;
     src.data = p;
     src.pad = 0;
-    src.size = blen + 8;
-    src.cap = blen + 8;
+    src.size = (8ull + blen >= 0x120ull) ? 64ull : (8ull + blen);
+    src.cap = 8ull + blen;
     typedef int (*LoadFn)(void*, void*, const char*, int);
     LoadFn load = reinterpret_cast<LoadFn>(g_base + 0x426A570);
     int ret = load(reinterpret_cast<void*>(l), &src, "=zendo", 0);
@@ -3301,6 +3307,7 @@ inline int lua_compile_remote(unsigned long long l, const char* src, unsigned in
 
 // Defined after exec_raw, next to the call machinery it borrows.
 int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen);
+int zendo_http_op(unsigned long long l);
 
 inline int native_api(void* L) {
     unsigned long long l = reinterpret_cast<unsigned long long>(L);
@@ -3409,6 +3416,16 @@ inline int native_api(void* L) {
             api_step('S', 25);
             int r = zendo_file_op(l, op, oplen);
             api_step('E', 25);
+            return r;
+        }
+
+        // HTTP is a host job. The payload cannot build a Luau string, so it
+        // only forwards the request and receives two file paths the script can
+        // read back; no socket is opened inside the client.
+        if (op_is(op, oplen, "zendo:req")) {
+            api_step('S', 34);
+            int r = zendo_http_op(l);
+            api_step('E', 34);
             return r;
         }
 
@@ -4634,6 +4651,59 @@ int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen) {
     unsigned long long got = (t2 - base_top) / 16;
     if (got > 4) got = 4;
     return static_cast<int>(got);
+}
+
+// Six strings in, one frame out: url, method, header block, body, body path,
+// header path. The host does the round trip and writes both files, so the only
+// thing that crosses back into Lua is a status code and an ok flag. Two numbers
+// are pushed in that order; anything else is the host saying it did not try.
+int zendo_http_op(unsigned long long l) {
+    HANDLE pipe = g_cap_pipe;
+    Api& a = api();
+    if (pipe == INVALID_HANDLE_VALUE || !g_base) return 0;
+
+    struct Part { char* p; unsigned int n; };
+    Part parts[6];
+    const unsigned int caps[6] = {8192u, 16u, 65536u, 8u << 20, 512u, 512u};
+    for (int i = 0; i < 6; ++i) {
+        unsigned int n = 0;
+        char* p = lua_arg_str(l, i + 1, &n);
+        if (!p || n > caps[i]) return 0;
+        parts[i].p = p;
+        parts[i].n = n;
+    }
+    if (!parts[0].n || !parts[4].n || !parts[5].n) return 0;
+
+    char head[128];
+    unsigned int hn = 0, q = 0;
+    char digits[12];
+    head[hn++] = 'Q';
+    for (int i = 0; i < 6; ++i) {
+        head[hn++] = ' ';
+        unsigned int v = parts[i].n;
+        q = 0;
+        do { digits[q++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v);
+        while (q) head[hn++] = digits[--q];
+    }
+    head[hn++] = '\n';
+
+    DWORD w = 0;
+    if (!a.WriteFile(pipe, head, hn, &w, nullptr)) return 0;
+    for (int i = 0; i < 6; ++i) {
+        if (parts[i].n && !a.WriteFile(pipe, parts[i].p, parts[i].n, &w, nullptr)) return 0;
+    }
+
+    char line[64];
+    if (!pipe_line(a, pipe, line, sizeof(line))) return 0;
+    if (line[0] != 'R') return 0;
+    const char* s = line + 2;
+    unsigned long long status = 0;
+    while (*s >= '0' && *s <= '9') { status = status * 10 + static_cast<unsigned>(*s - '0'); ++s; }
+    while (*s == ' ') ++s;
+    const unsigned int ok = (*s == '1') ? 1u : 0u;
+    int r = lua_ret_num(l, static_cast<double>(status));
+    r += lua_ret_num(l, static_cast<double>(ok));
+    return r;
 }
 
 // Runs the flush chunk with the report pipe muted: the payload's chatter would
