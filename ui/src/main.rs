@@ -169,7 +169,7 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     // session pipe is still open, and the deferred wrapper moves it off the
     // borrowed thread. No z: the payload installs the same surface as globals
     // (loadstring, read, write, dm, base, svc, svcs).
-    let chunk = zendo_core::compile_str(&source)?;
+    let chunk = zendo_core::compile_script(&source)?;
 
     let server =
         pipe::Pipe::create(r"\\.\pipe\zendo-dev").map_err(|e| format!("pipe: {e}"))?;

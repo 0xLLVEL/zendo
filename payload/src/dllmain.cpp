@@ -3315,6 +3315,77 @@ inline int native_api(void* L) {
             return r;
         }
 
+        // Function identity for the Lua layer. A function TValue carries a
+        // pointer to a GC closure object; the isC byte sits at +5 and, for a C
+        // closure, the entry point at +0x28. Both offsets were measured on this
+        // build: the dispatcher swap already writes +0x28 to take over print.
+        // Handing them to the script is what lets hookfunction patch and
+        // restore a real entry point instead of shadowing a global name.
+        if (op_is(op, oplen, "zendo:fninfo")) {
+            api_step('S', 19);
+            LuaArg a{};
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v) {
+                api_step('E', 19);
+                return 0;
+            }
+            unsigned long long head = 0;
+            if (!read_u64(a.v + 4, &head)) {
+                api_step('E', 19);
+                return 0;
+            }
+            unsigned int isC = static_cast<unsigned int>((head >> 8) & 0xff);
+            unsigned long long entry = 0;
+            if (isC && !read_u64(a.v + 0x28, &entry)) {
+                api_step('E', 19);
+                return 0;
+            }
+            int pushed = lua_ret_num(l, static_cast<double>(a.v));
+            pushed += lua_ret_num(l, static_cast<double>(entry));
+            pushed += lua_ret_num(l, static_cast<double>(isC));
+            api_step('P', 19);
+            return pushed;
+        }
+
+        // Patch the entry point of a C closure in place. One 8 byte store, so a
+        // second thread either sees the old pointer or the new one, never half
+        // of each. The page a closure lives on belongs to the GC heap and is
+        // writable, but the protect call keeps this honest if that ever changes.
+        if (op_is(op, oplen, "zendo:fnset")) {
+            api_step('S', 20);
+            LuaArg a{};
+            double entry = 0;
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v ||
+                !lua_arg_num(l, 2, &entry) || entry == 0) {
+                api_step('E', 20);
+                return 0;
+            }
+            unsigned long long head = 0;
+            if (!read_u64(a.v + 4, &head)) {
+                api_step('E', 20);
+                return 0;
+            }
+            if (((head >> 8) & 0xff) != 1) {
+                api_step('E', 20);
+                return 0;
+            }
+            unsigned long long slot = a.v + 0x28;
+            unsigned long long start = slot & ~0xfffull;
+            DWORD oldp = 0;
+            if (!api().VirtualProtect(reinterpret_cast<void*>(start), 0x2000,
+                                      PAGE_READWRITE, &oldp)) {
+                api_step('E', 20);
+                return 0;
+            }
+            *reinterpret_cast<volatile unsigned long long*>(slot) =
+                static_cast<unsigned long long>(entry);
+            DWORD back = 0;
+            api().VirtualProtect(reinterpret_cast<void*>(start), 0x2000, oldp,
+                                 &back);
+            int r = lua_ret_num(l, 1.0);
+            api_step('P', 20);
+            return r;
+        }
+
         // loadstring: the loader pushes the closure, so returning 1 hands it
         // back to the script as the result of the call.
         if (op_is(op, oplen, "zendo:load")) {

@@ -51,6 +51,112 @@ pub fn compile(src: &Path) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
+/// The Lua layer every chunk starts with. It is written to be safe to run any
+/// number of times: the marker in the shared env short-circuits the whole body
+/// after the first pass, and every name is installed only when it is still
+/// absent. That second rule is what keeps the payload's own bindings
+/// (`loadstring`, `read`, `write`, `dm`, ...) untouched - gbind owns those, and
+/// a prelude that overwrote them would replace a working door with a shim.
+///
+/// Nothing here invents a function the client does not have. `getgc`, `getreg`
+/// and `getconnections` are only reported; a fake version would hand a script a
+/// function that lies about what it can see.
+fn prelude() -> &'static str {
+    r#"do
+local __znd_env = (getfenv and getfenv()) or _G or {}
+local __znd_mark = rawget(__znd_env, "__zendo_api")
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 1 then
+local api = { version = 1, missing = {} }
+local function put(name, value)
+    if rawget(__znd_env, name) == nil then __znd_env[name] = value end
+end
+local function call(name, ...)
+    if type(zendo) ~= "function" then return nil end
+    return zendo(name, ...)
+end
+
+put("getgenv", function() return __znd_env end)
+put("getrenv", function() return __znd_env end)
+put("_G", __znd_env)
+put("identifyexecutor", function() return "zendo", "4080" end)
+
+put("getsenv", function(f)
+    local ok, e = pcall(getfenv, f)
+    if ok and type(e) == "table" then return e end
+    return nil
+end)
+
+local readonly = setmetatable({}, { __mode = "k" })
+put("setreadonly", function(t, v)
+    if t == nil then return false end
+    readonly[t] = v ~= false
+    return true
+end)
+put("isreadonly", function(t)
+    return readonly[t] == true
+end)
+
+put("getrawmetatable", function(v)
+    local ok, mt = pcall(getmetatable, v)
+    if ok and type(mt) == "table" then return mt end
+    return nil
+end)
+put("setrawmetatable", function(v, mt)
+    local ok, err = pcall(setmetatable, v, mt)
+    if ok then return true end
+    return false, tostring(err)
+end)
+
+put("hookmetamethod", function(obj, method, hook)
+    local ok, mt = pcall(getmetatable, obj)
+    if not ok or type(mt) ~= "table" then
+        return nil, "metatable locked (" .. type(mt) .. ")"
+    end
+    local orig = rawget(mt, method)
+    mt[method] = hook
+    return orig
+end)
+
+put("hookfunction", function(old, new)
+    local oc, oe, oc_isC = call("zendo:fninfo", old)
+    local nc, ne, nc_isC = call("zendo:fninfo", new)
+    if oc == nil or nc == nil then return nil, "not a function" end
+    if oc_isC ~= 1 or nc_isC ~= 1 then
+        return nil, "luau closure has no entry point to swap"
+    end
+    if not oe or oe == 0 or not ne or ne == 0 then
+        return nil, "entry point unreadable"
+    end
+    if call("zendo:fnset", old, ne) ~= 1 then
+        return nil, "patch rejected"
+    end
+    local done = false
+    return old, function()
+        if done then return false end
+        done = true
+        return call("zendo:fnset", old, oe) == 1
+    end
+end)
+
+put("fireclickdetector", function(cd, dist)
+    local ok, sig = pcall(function() return cd and cd.MouseClick end)
+    if not ok or sig == nil then return false, "no MouseClick" end
+    local fired, err = pcall(function() return sig:Fire(dist or 0) end)
+    if fired then return true end
+    return false, tostring(err)
+end)
+
+for _, name in ipairs({ "getgc", "getreg", "getconnections" }) do
+    if rawget(__znd_env, name) == nil then
+        api.missing[#api.missing + 1] = name
+    end
+end
+__znd_env.__zendo_api = api
+end
+end
+"#
+}
+
 /// A chunk executed straight from the borrowed thread cannot yield: the C frame
 /// it would resume into belongs to a thread the game has already taken back.
 /// Hand the work to the scheduler and let our frame unwind, so `task.wait` and
@@ -61,14 +167,16 @@ fn wrap(src: &str) -> String {
     // may still need the session pipe (loadstring, dynamic loading). Signalling
     // done is what tells the host the scheduler thread finished with it.
     format!(
-        "local __znd = ...\n\
+        "{}\
+         local __znd = ...\n\
          task.defer(function()\n\
          local __znd_ok, __znd_err = pcall(function()\n\
          {src}\n\
          end)\n\
          if not __znd_ok then warn(tostring(__znd_err)) end\n\
          if __znd then pcall(__znd, \"zendo:done\") end\n\
-         end)\n"
+         end)\n",
+        prelude()
     )
 }
 
@@ -81,7 +189,7 @@ pub fn build(src: &Path) -> Result<Vec<u8>, String> {
     // body onto a scheduler thread. A synchronous experiment needs the source
     // exactly as written.
     let body = if std::env::var_os("ZENDO_RAW").is_some() {
-        text
+        format!("{}\n{}", prelude(), text)
     } else {
         wrap(&text)
     };
@@ -103,6 +211,15 @@ pub fn compile_str(src: &str) -> Result<Vec<u8>, String> {
     let _ = std::fs::remove_file(&tmp);
     let blob = blob?;
     remap::remap(&blob).map(|o| o.blob).map_err(|e| format!("remap: {e}"))
+}
+
+/// Compile a script that will run raw, straight on the borrowed thread. Raw is
+/// the only path that can call `loadstring` (the session pipe stays reachable),
+/// so this is where the Lua layer has to be present. `compile_str` stays pure:
+/// a `loadstring` body is a fragment, not a script, and giving it the prelude
+/// would change what it returns.
+pub fn compile_script(src: &str) -> Result<Vec<u8>, String> {
+    compile_str(&format!("{}\n{}", prelude(), src))
 }
 
 /// Start the injector beside a pipe that is already being served. The payload
