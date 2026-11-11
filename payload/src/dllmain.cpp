@@ -6946,7 +6946,15 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         // scheduler never gets back, and two of those stop the game's loop: the
         // window still paints the last frame but stops answering input.
         if (cmd[0] == 'q') break;
-        if (cmd[0] == 'L') {
+        if (cmd[0] == 'L' || cmd[0] == 'i') {
+            unsigned int want_id = 7;
+            if (cmd[0] == 'i') {
+                char idb[1];
+                DWORD idr = 0;
+                if (!a.ReadFile(pipe, idb, 1, &idr, nullptr) || idr == 0) continue;
+                want_id = static_cast<unsigned char>(idb[0]);
+                if (want_id > 15 && want_id != 0xFF) want_id = 7;
+            }
             unsigned int blen = 0;
             if (!read_all(a, pipe, &blen, 4) || blen == 0 || blen > 262144) {
                 o.str("dyn bad len\n");
@@ -6964,8 +6972,58 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             o.dec(blen);
             o.nl();
             flush_out(a, pipe, o);
+            // Identity swap for the synchronous test path: run this chunk on the
+            // borrowed thread as identity 7 and put the old value back before
+            // returning, so a failed experiment cannot leave a game thread
+            // carrying an identity the scheduler did not give it.
+            unsigned long long E2 = 0, oldid = 0;
+            bool swapped = false;
+            if (cmd[0] == 'i') {
+                read_u64(L + 8, &E2);
+                if (E2 && read_u64(E2 + 0x70, &oldid)) {
+                    swapped = true;
+                    o.str("ident was=");
+                    o.dec(static_cast<unsigned int>(oldid));
+                    o.nl();
+                    flush_out(a, pipe, o);
+                }
+            }
+            if (swapped && want_id == 0xFF) {
+                // One session, every identity: the loadstring refusal changes
+                // wording with identity, so the whole table is worth having.
+                for (unsigned int id = 0; id <= 9; ++id) {
+                    wr64(E2 + 0x70, id);
+                    unsigned long long rb = 0;
+                    read_u64(E2 + 0x70, &rb);
+                    o.str("sweep id=");
+                    o.dec(id);
+                    o.str(" readback=");
+                    o.dec(static_cast<unsigned int>(rb));
+                    o.nl();
+                    flush_out(a, pipe, o);
+                    exec_raw(a, pipe, o, L, base, lbuf, blen, "sweep");
+                    flush_capture(a, o, L, base);
+                }
+                wr64(E2 + 0x70, oldid);
+                o.str("ident restored=");
+                o.dec(static_cast<unsigned int>(oldid));
+                o.nl();
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            if (swapped) {
+                wr64(E2 + 0x70, want_id);
+            }
             stage_mark(a, "EXEC");
-            exec_raw(a, pipe, o, L, base, lbuf, blen, "raw dyn");
+            exec_raw(a, pipe, o, L, base, lbuf, blen, cmd[0] == 'i' ? "ident" : "raw dyn");
+            if (swapped) {
+                wr64(E2 + 0x70, oldid);
+                o.str("ident restored=");
+                o.dec(static_cast<unsigned int>(oldid));
+                o.nl();
+                flush_out(a, pipe, o);
+            }
             flush_capture(a, o, L, base);
             stage_mark(a, "DONE");
             continue;

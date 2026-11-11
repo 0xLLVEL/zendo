@@ -197,6 +197,13 @@ fn main() {
             match tok.trim() {
                 "c" | "C" => steps.push(pipe::Step::Cmd(b'C')),
                 "chunk" | "L" => steps.push(pipe::Step::Chunk(&chunk)),
+                "ident" => {
+                    let id: u8 = std::env::var("ZENDO_IDENT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(7);
+                    steps.push(pipe::Step::Ident(&chunk, id));
+                }
                 "none" | "" => {}
                 t if t.len() == 1 => steps.push(pipe::Step::Cmd(t.as_bytes()[0])),
                 other => eprintln!("unknown step {other}"),

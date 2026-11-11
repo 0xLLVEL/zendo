@@ -71,7 +71,15 @@ fn wrap(src: &str) -> String {
 pub fn build(src: &Path) -> Result<Vec<u8>, String> {
     let text = std::fs::read_to_string(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     let tmp = std::env::temp_dir().join(format!("zendo-chunk-{}.luau", std::process::id()));
-    std::fs::write(&tmp, wrap(&text)).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    // The deferred wrapper is what makes yielding legal, but it also moves the
+    // body onto a scheduler thread. A synchronous experiment needs the source
+    // exactly as written.
+    let body = if std::env::var_os("ZENDO_RAW").is_some() {
+        text
+    } else {
+        wrap(&text)
+    };
+    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     let blob = compile(&tmp);
     let _ = std::fs::remove_file(&tmp);
     let blob = blob?;

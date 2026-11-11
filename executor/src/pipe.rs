@@ -165,6 +165,9 @@ impl Drop for Pipe {
 pub enum Step<'a> {
     Cmd(u8),
     Chunk(&'a [u8]),
+    /// Same blob as `Chunk`, sent as `i`: the payload runs it synchronously on
+    /// the borrowed thread with the given identity, then restores the old one.
+    Ident(&'a [u8], u8),
 }
 
 /// A connection attempt started by `Pipe::begin_accept`.
@@ -219,6 +222,12 @@ pub fn drive(pipe: &Pipe, steps: &[Step], mut sink: impl Write) -> io::Result<()
                             eprintln!("[pipe] sending chunk {} bytes", chunk.len());
                             pipe.write_all(b"L")?;
                             pipe.write_all(&(chunk.len() as u32).to_le_bytes())?;
+                            pipe.write_all(chunk)?;
+                        }
+                        Step::Ident(chunk, id) => {
+                            eprintln!("[pipe] sending ident chunk {} bytes id {}", chunk.len(), id);
+                            pipe.write_all(b"i")?;
+                            pipe.write_all(&[id])?;                            pipe.write_all(&(chunk.len() as u32).to_le_bytes())?;
                             pipe.write_all(chunk)?;
                         }
                     }
