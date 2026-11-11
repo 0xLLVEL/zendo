@@ -76,6 +76,41 @@ inline Module find_module(DWORD name_hash) {
     return {nullptr, 0};
 }
 
+inline LdrEntry* find_module_entry(DWORD name_hash) {
+    auto* peb = reinterpret_cast<Peb*>(__readgsqword(0x60));
+    auto* head = &peb->Ldr->InLoadOrderModuleList;
+    for (auto* it = head->Flink; it != head; it = it->Flink) {
+        auto* entry = CONTAINING_RECORD(it, LdrEntry, InLoadOrderLinks);
+        if (!entry->BaseDllName.Buffer || !entry->DllBase) continue;
+        if (fnv1a_w(entry->BaseDllName.Buffer) == name_hash) return entry;
+    }
+    return nullptr;
+}
+
+// Every address this payload uses is pinned to one client build. On any other
+// build the writes land in unrelated code and the client dies with no
+// explanation, so the first thing the payload does is prove it is in the build
+// it was made for. The build id lives in the module path
+// (...\Versions\version-<hash>\RobloxPlayerBeta.dll), which needs no PE parsing
+// and no imports.
+static const wchar_t k_build_tag[] = L"version-f0ea5da9412f4e35";
+
+inline bool wide_contains(const UString& s, const wchar_t* needle) {
+    if (!s.Buffer || s.Length < 2) return false;
+    unsigned int n = s.Length / sizeof(wchar_t);
+    unsigned int m = 0;
+    while (needle[m]) ++m;
+    if (m > n) return false;
+    for (unsigned int i = 0; i + m <= n; ++i) {
+        unsigned int j = 0;
+        while (j < m && s.Buffer[i + j] == needle[j]) ++j;
+        if (j == m) return true;
+    }
+    return false;
+}
+
+inline bool readable(const void* p, SIZE_T len);
+
 inline void* find_export(void* module_base, DWORD name_hash) {
     auto* base = static_cast<unsigned char*>(module_base);
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
@@ -287,6 +322,45 @@ inline bool readable(const void* p, SIZE_T len) {
     unsigned long long begin = reinterpret_cast<unsigned long long>(mbi.BaseAddress);
     unsigned long long at = reinterpret_cast<unsigned long long>(p);
     return at + len <= begin + mbi.RegionSize;
+}
+
+// The six pinned entry points are only useful if they still resolve to code
+// inside the image. A drift that moves a function elsewhere is caught here
+// instead of at the first call. A byte read is not the test: the protector
+// leaves code pages PAGE_NOACCESS until they are executed, so reading the
+// instruction from another thread fails on a perfectly healthy client.
+// Committed memory inside the image is what can be proven without running it.
+static int g_off_fail = -1;
+
+inline bool committed_at(unsigned long long addr, unsigned long long len) {
+    Mbi mbi;
+    if (!api().VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)))
+        return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & PAGE_GUARD) return false;
+    unsigned long long begin = reinterpret_cast<unsigned long long>(mbi.BaseAddress);
+    return addr + len <= begin + mbi.RegionSize;
+}
+
+inline bool offsets_ok(unsigned long long base, const Module& m) {
+    const unsigned long long sites[] = {
+        0x426A570,  // lua_vm_load
+        0x26361C0,  // luaD_call
+        0x26360B0,  // luaD_rawrunprotected
+        0x2632230,  // CallContext::run
+        0x2637250,  // luaD_seterrorobj
+        0x2631F40,  // lua_pcallyieldable
+        0x8D87878,  // capability default mask
+    };
+    for (int i = 0; i < 7; ++i) {
+        unsigned long long addr = base + sites[i];
+        bool inside = addr >= base && addr + 0x100 <= base + m.size;
+        if (!inside || !committed_at(addr, 0x100)) {
+            g_off_fail = i;
+            return false;
+        }
+    }
+    return true;
 }
 
 inline bool read_u64(unsigned long long addr, unsigned long long* out) {
@@ -6968,6 +7042,23 @@ inline DWORD run_repl() {
 
     Module exe = find_module(fnv1a_w(L"RobloxPlayerBeta.exe"));
     unsigned long long base = reinterpret_cast<unsigned long long>(exe.base);
+    // Every offset below is a number from one specific client build. On any
+    // other build those writes land in unrelated code and the client dies with
+    // no explanation, so prove the build before touching anything. The build id
+    // is the directory name the loader already recorded, which costs no PE
+    // parsing and no imports.
+    LdrEntry* exe_entry = find_module_entry(fnv1a_w(L"RobloxPlayerBeta.exe"));
+    if (!exe_entry || !wide_contains(exe_entry->FullDllName, k_build_tag)) {
+        stage_mark(a, "EARGS-BUILD");
+        return 120;
+    }
+    if (!offsets_ok(base, exe)) {
+        char tb[12] = {'E', 'A', 'R', 'G', 'S', '-', 'O', 'F', 'F', '0', 0, 0};
+        tb[9] = static_cast<char>('0' + g_off_fail);
+        stage_mark(a, tb);
+        return 121;
+    }
+    stage_mark(a, "E3-GATE");
     unsigned long long fake = 0, dm = 0;
     read_u64(base + k_fake_dm_static, &fake);
     read_u64(fake + k_fake_dm_to_dm, &dm);
