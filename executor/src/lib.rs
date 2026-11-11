@@ -65,8 +65,8 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 1 then
-local api = { version = 1, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 2 then
+local api = { version = 2, missing = {} }
 local function put(name, value)
     if rawget(__znd_env, name) == nil then __znd_env[name] = value end
 end
@@ -150,8 +150,135 @@ put("islclosure", function(f)
     return exec == 0
 end)
 
-put("fireclickdetector", function(cd, dist)
-    local ok, sig = pcall(function() return cd and cd.MouseClick end)
+-- Encoding runs in plain Luau, not in the client's memory. There is no string
+-- constructor reachable from the payload yet, so a native base64 would have
+-- nothing to hand back; a Lua implementation returns real strings today and
+-- costs nothing a script can measure.
+local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local b64map = {}
+for i = 1, #b64chars do b64map[string.byte(b64chars, i)] = i - 1 end
+
+put("base64encode", function(data)
+    data = tostring(data or "")
+    local out = {}
+    local n = #data
+    local i = 1
+    while i <= n do
+        local a = string.byte(data, i) or 0
+        local b = string.byte(data, i + 1)
+        local c = string.byte(data, i + 2)
+        local v = a * 65536 + (b or 0) * 256 + (c or 0)
+        local c1 = math.floor(v / 262144) % 64
+        local c2 = math.floor(v / 4096) % 64
+        local c3 = math.floor(v / 64) % 64
+        local c4 = v % 64
+        out[#out + 1] = string.sub(b64chars, c1 + 1, c1 + 1)
+        out[#out + 1] = string.sub(b64chars, c2 + 1, c2 + 1)
+        out[#out + 1] = b and string.sub(b64chars, c3 + 1, c3 + 1) or "="
+        out[#out + 1] = c and string.sub(b64chars, c4 + 1, c4 + 1) or "="
+        i += 3
+    end
+    return table.concat(out)
+end)
+
+put("base64decode", function(data)
+    data = tostring(data or ""):gsub("[^%w%+/=]", "")
+    local out = {}
+    local n = #data
+    local i = 1
+    while i <= n do
+        local v = 0
+        local pad = 0
+        for k = 0, 3 do
+            local ch = string.byte(data, i + k)
+            if ch == nil or ch == 61 then
+                pad += 1
+                v *= 64
+            else
+                local d = b64map[ch]
+                if d == nil then pad += 1; v *= 64 else v = v * 64 + d end
+            end
+        end
+        out[#out + 1] = string.char(math.floor(v / 65536) % 256)
+        if pad < 2 then out[#out + 1] = string.char(math.floor(v / 256) % 256) end
+        if pad < 1 then out[#out + 1] = string.char(v % 256) end
+        i += 4
+    end
+    return table.concat(out)
+end)
+
+-- LZ4 block format. The compressor emits literal-only sequences, which is a
+-- valid block - a decompressor reads it without knowing it never matched -
+-- and the decompressor handles the full token grammar so a block produced by
+-- any real LZ4 lands back as the original bytes.
+put("lz4compress", function(data)
+    data = tostring(data or "")
+    local out = {}
+    local n = #data
+    local i = 1
+    while i <= n do
+        local len = math.min(65535, n - i + 1)
+        local token = len >= 15 and 240 or len * 16
+        out[#out + 1] = string.char(token)
+        if len >= 15 then
+            local rest = len - 15
+            while rest >= 255 do out[#out + 1] = string.char(255); rest -= 255 end
+            out[#out + 1] = string.char(rest)
+        end
+        out[#out + 1] = string.sub(data, i, i + len - 1)
+        i += len
+    end
+    return table.concat(out)
+end)
+
+put("lz4decompress", function(data)
+    data = tostring(data or "")
+    local out = {}
+    local n = #data
+    local i = 1
+    while i <= n do
+        local token = string.byte(data, i)
+        i += 1
+        local lit = math.floor(token / 16)
+        if lit == 15 then
+            while true do
+                local b = string.byte(data, i)
+                if b == nil then return table.concat(out) end
+                i += 1
+                lit += b
+                if b ~= 255 then break end
+            end
+        end
+        if lit > 0 then
+            out[#out + 1] = string.sub(data, i, i + lit - 1)
+            i += lit
+        end
+        if i > n then break end
+        local lo = string.byte(data, i) or 0
+        local hi = string.byte(data, i + 1) or 0
+        i += 2
+        local buf = table.concat(out)
+        local offset = lo + hi * 256
+        if offset == 0 or offset > #buf then break end
+        local mlen = (token % 16) + 4
+        if token % 16 == 15 then
+            while true do
+                local b = string.byte(data, i)
+                if b == nil then return table.concat(out) end
+                i += 1
+                mlen += b
+                if b ~= 255 then break end
+            end
+        end
+        local start = #buf - offset + 1
+        local piece = string.sub(buf, start, start + mlen - 1)
+        while #piece < mlen do piece ..= piece end
+        out[#out + 1] = string.sub(piece, 1, mlen)
+    end
+    return table.concat(out)
+end)
+
+put("fireclickdetector", function(cd, dist)    local ok, sig = pcall(function() return cd and cd.MouseClick end)
     if not ok or sig == nil then return false, "no MouseClick" end
     local fired, err = pcall(function() return sig:Fire(dist or 0) end)
     if fired then return true end
