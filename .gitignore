@@ -3,3 +3,10 @@ build/
 gen/
 *.log
 *.err
+
+PLAN.md
+docs/
+work/
+tests/
+tools/
+resource/

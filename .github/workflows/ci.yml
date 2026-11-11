@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            executor
+            injector
+            ui
+
+      - name: executor
+        run: cargo build --release --manifest-path executor/Cargo.toml
+
+      - name: injector
+        run: cargo build --release --manifest-path injector/Cargo.toml
+
+      - name: ui
+        run: cargo build --release --manifest-path ui/Cargo.toml
