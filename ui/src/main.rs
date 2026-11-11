@@ -173,16 +173,16 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     // This client kills new threads at TLS init, so the borrow path is the one
     // that actually works. Go straight to it: the thread path costs a 10 s
     // timeout on every run and never succeeds.
-    // Reuse the payload parked in the client if it is waiting for a server;
-    // only borrow a thread when no session is live. A live payload that is
-    // mid-reconnect is waited for, never duplicated.
+    // A payload only lives for one session: it restores the borrowed thread when
+    // the pipe closes, so the 900 ms window is there to avoid racing a dying
+    // server, not to find a reusable one.
     let pending = server.begin_accept();
     let mut injector: Option<std::process::Child> = None;
     // Snapshot the client's own Player log before injecting. A deferred chunk
     // outlives this pipe session, so print/warn never reach us as bytes; the
     // only lasting record is the log line the client writes itself.
     let log_start = player_log();
-    let mut connected = pending.wait(600).map_err(|e| format!("accept: {e}"))?;
+    let mut connected = pending.wait(900).map_err(|e| format!("accept: {e}"))?;
     if !connected {
         let _ = app.emit("zendo://stage", "injecting");
         match zendo_core::spawn_inject(&["--hijack"]) {
@@ -201,8 +201,8 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     let steps = steps_of(&spec, &chunk)?;
     let tap = Tap { app: app.clone(), buf: buf.clone() };
     let driven = pipe::drive(&server, &steps, tap);
-    // The payload parks after `END` and waits for the next server, so there is
-    // no ack. The injector is only reaped when this run borrowed a thread.
+    // The payload restores the borrowed thread once the pipe closes, so there is
+    // no ack to wait for. The injector is only reaped when this run borrowed one.
     if let Some(inj) = injector {
         let inj = inj.wait_with_output().map_err(|e| format!("injector: {e}"))?;
         if !inj.status.success() {
