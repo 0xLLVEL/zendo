@@ -65,8 +65,8 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 8 then
-local api = { version = 8, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 10 then
+local api = { version = 10, missing = {} }
 local function put(name, value)
     if rawget(__znd_env, name) == nil then __znd_env[name] = value end
 end
@@ -174,6 +174,36 @@ put("appendfile", function(path, data)
     local old = call("zendo:file", path)
     local body = (type(old) == "string" and old or "") .. tostring(data or "")
     return call("zendo:filew", path, body) == 1
+end)
+
+-- Both of these are the file door plus the client's own compiler: the payload
+-- has no compiler and no string constructor, so the source comes back as a real
+-- string and loadstring turns it into a real closure. Nothing is emulated.
+put("loadfile", function(path)
+    if type(path) ~= "string" then return nil, "bad path" end
+    local src = call("zendo:file", path)
+    if type(src) ~= "string" then return nil, "no such file" end
+    local fn, err = loadstring(src)
+    if not fn then return nil, tostring(err) end
+    return fn
+end)
+
+put("dofile", function(path)
+    if type(path) ~= "string" then return nil, "bad path" end
+    local src = call("zendo:file", path)
+    if type(src) ~= "string" then return nil, "no such file" end
+    local fn, err = loadstring(src)
+    if not fn then return nil, tostring(err) end
+    return fn()
+end)
+
+-- The identity is a field of the caller's state, written by the session gate.
+-- Reading it costs one native call; writing it would also have to raise the
+-- capability mask, so this side stays read-only.
+put("getthreadidentity", function()
+    local n = call("zendo:ident")
+    if type(n) ~= "number" then return 0 end
+    return n
 end)
 
 put("isfile", function(path)
@@ -285,6 +315,22 @@ put("setupvalue", function(f, i, v)
     return f
 end)
 
+-- Constants are a TValue array on the proto, so the same write that moves an
+-- upvalue moves a constant. Numbers and booleans land; a string is refused by
+-- the payload until a write barrier address is measured.
+put("setconstant", function(f, i, v)
+    local idx = (tonumber(i) or 0) - 1
+    if idx < 0 then return false end
+    return call("zendo:kset", f, idx, v) == 1
+end)
+
+-- cloneref hands back the same reference, so identity is the comparison the
+-- client itself would make. No allocation, no proxy table.
+put("compareinstances", function(a, b)
+    if a == nil or b == nil then return false end
+    return a == b
+end)
+
 -- sUNC scores `debug.getconstants`; the native read behind `getconstants` is
 -- the same one. The debug table the client ships may be read-only, so a denied
 -- rawset falls back to a proxy that keeps every other debug field reachable.
@@ -300,6 +346,7 @@ if type(dbg) == "table" then
     local guvs = rawget(__znd_env, "getupvalues")
     local guv = rawget(__znd_env, "getupvalue")
     local suv = rawget(__znd_env, "setupvalue")
+    local sk = rawget(__znd_env, "setconstant")
     local ok = pcall(function()
         if rawget(dbg, "getconstants") == nil then
             rawset(dbg, "getconstants", gc)
@@ -308,6 +355,7 @@ if type(dbg) == "table" then
         if rawget(dbg, "getupvalues") == nil then rawset(dbg, "getupvalues", guvs) end
         if rawget(dbg, "getupvalue") == nil then rawset(dbg, "getupvalue", guv) end
         if rawget(dbg, "setupvalue") == nil then rawset(dbg, "setupvalue", suv) end
+        if rawget(dbg, "setconstant") == nil then rawset(dbg, "setconstant", sk) end
     end)
     if not ok then
         local proxy = setmetatable({}, { __index = dbg })
@@ -318,6 +366,7 @@ if type(dbg) == "table" then
         if rawget(dbg, "getupvalues") == nil then proxy.getupvalues = guvs end
         if rawget(dbg, "getupvalue") == nil then proxy.getupvalue = guv end
         if rawget(dbg, "setupvalue") == nil then proxy.setupvalue = suv end
+        if rawget(dbg, "setconstant") == nil then proxy.setconstant = sk end
         rawset(__znd_env, "debug", proxy)
     end
 end

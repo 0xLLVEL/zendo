@@ -3369,6 +3369,20 @@ inline int native_api(void* L) {
             return lua_ret_num(l, ident >= 8.0 ? 2.0 : 0.0);
         }
 
+        // The identity the caller's state carries, straight off the extras block.
+        // The session gate writes 8 there; the game's own callbacks carry their
+        // own level. Reading it is the honest half of getthreadidentity - the
+        // write side would also have to raise the capability mask, and a false
+        // identity with no capabilities is worse than none.
+        if (op_is(op, oplen, "zendo:ident")) {
+            api_step('S', 32);
+            unsigned long long ex = 0, ident = 0;
+            if (read_u64(l + 8, &ex) && ex) read_u64(ex + 0x70, &ident);
+            int r = lua_ret_num(l, static_cast<double>(ident));
+            api_step('P', 32);
+            return r;
+        }
+
         // Same op the other way round: the chunk announces the state it runs on.
         if (op_is(op, oplen, "zendo:mark")) {
             api_step('S', 24);
@@ -3456,6 +3470,45 @@ inline int native_api(void* L) {
             api_step('E', 28);
             return 1;
         }
+        // The write half of kget: a constant is a TValue in the proto's k array,
+        // so a number, boolean or nil can be stored with the same shape the
+        // reader already understands. Strings stay refused for the same reason
+        // setupvalue refuses them - a collectable needs a write barrier whose
+        // address has not been measured in this build.
+        if (op_is(op, oplen, "zendo:kset")) {
+            api_step('S', 33);
+            LuaArg a{};
+            LuaArg val{};
+            double idxf = 0;
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v ||
+                !lua_arg_num(l, 2, &idxf) || idxf < 0 || idxf > 4096 ||
+                !lua_arg(l, 3, &val))
+                return 0;
+            unsigned int tt = static_cast<unsigned int>((val.w >> 32) & 0xff);
+            if (tt != 0 && tt != 1 && tt != 3) {
+                api_step('E', 33);
+                return lua_ret_num(l, 0.0);
+            }
+            unsigned long long proto = 0, k = 0;
+            if (!read_u64(a.v + 0x18, &proto) || !proto) return 0;
+            if (!read_u64(proto + 0x60, &k) || !k) return 0;
+            unsigned int sizek = 0;
+            read_u32(proto + 0xac, &sizek);
+            unsigned int i = static_cast<unsigned int>(idxf);
+            if (i >= sizek) return 0;
+            char tv[16];
+            for (int q = 0; q < 8; ++q) {
+                tv[q] = static_cast<char>((val.v >> (8 * q)) & 0xff);
+                tv[8 + q] = static_cast<char>((val.w >> (8 * q)) & 0xff);
+            }
+            if (!api_write(k + 16ull * i, tv, 16)) {
+                api_step('E', 33);
+                return lua_ret_num(l, 0.0);
+            }
+            api_step('P', 33);
+            return lua_ret_num(l, 1.0);
+        }
+
         // Upvalues. Measured on a live chunk, not taken from a layout doc: a
         // Luau closure keeps the capture count in the low byte of the word at
         // +0x4, and the captures themselves start at +0x20, one TValue each.
