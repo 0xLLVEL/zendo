@@ -1,4 +1,4 @@
-﻿// Zendo payload â€” M1 beacon.
+// Zendo payload — M1 beacon.
 // No CRT, no imports beyond what we resolve from the PEB at runtime.
 // Build: payload/build.bat (cl, /NODEFAULTLIB, /ENTRY:DllMain)
 
@@ -2402,7 +2402,7 @@ inline int exec_protected(Api& a, HANDLE pipe, Out& o, unsigned long long L,
     flush_out(a, pipe, o);
 
     // `return pcall` lands here: the result slot holds the builtin closure, so
-    // its c.f is luaB_pcally inside the client image — the entry point for
+    // its c.f is luaB_pcally inside the client image � the entry point for
     // locating lua_pcallyieldable and luaD_pcall without guessing.
     if (body == kChunkC40Body && n >= 2) {
         unsigned long long fnv = 0, cname = 0, cont = 0, cf = 0, hdr = 0;
@@ -2510,7 +2510,7 @@ static const unsigned char kChunkPrint[] = {
 };
 static const unsigned int kChunkPrintLen = sizeof(kChunkPrint);
 
-// print("probe", 1, true, nil, 2.5) — used by the capture probes below.
+// print("probe", 1, true, nil, 2.5) � used by the capture probes below.
 static const unsigned char kChunkProbe[] = {
     0x0e, 0x03, 0x02, 0x05, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x05, 0x70, 0x72,
     0x6f, 0x62, 0x65, 0x00, 0x01, 0x4d, 0x06, 0x00, 0x00, 0x01, 0x0a, 0x00,
@@ -2791,7 +2791,7 @@ inline void cap_restore() {
 static bool g_flush_next = false;
 
 // The `P` protocol: one line per captured print, written straight to the dev
-// pipe. The UI turns each into a `» ` line.
+// pipe. The UI turns each into a `� ` line.
 inline void emit_capture(unsigned long long slot) {
     unsigned long long v = 0, w = 0;
     if (!read_u64(slot, &v) || !read_u64(slot + 8, &w)) return;
@@ -7216,7 +7216,275 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             stage_mark(a, "DONE");
             continue;
         }
+        if (cmd[0] == 'y') {
+            // The CFG dispatch stub is named in the PE load config, not in the
+            // import table. GuardCFDispatchFunctionPointer (+0x78) is exactly
+            // the address every instrumented indirect call routes through, so
+            // one qword replaces the whole image scan. Report only - patching
+            // waits for a second look at the prologue.
+            unsigned int lfanew = 0;
+            // The client's own PE directories are stripped by the protector, so
+            // read the load config from a system module instead: every guarded
+            // module in this process points at the same ntdll stub.
+            Module sys = find_module(fnv1a_w(L"kernel32.dll"));
+            unsigned long long pb0 = reinterpret_cast<unsigned long long>(sys.base);
+            if (!pb0 || !read_u32(pb0 + 0x3C, &lfanew)) { stage_mark(a, "DONE"); continue; }
+            unsigned long long opt = pb0 + lfanew + 0x18;
+            unsigned long long ddir = opt + 0x70 + 10 * 8;
+            unsigned int lc_rva = 0, lc_size = 0;
+            read_u32(ddir, &lc_rva);
+            read_u32(ddir + 4, &lc_size);
+            o.str("lc rva=");
+            o.hex(lc_rva);
+            o.str(" size=");
+            o.hex(lc_size);
+            o.nl();
+            flush_out(a, pipe, o);
+            if (!lc_rva) { stage_mark(a, "DONE"); continue; }
+            unsigned long long lc = pb0 + lc_rva;
+            unsigned long long chk = 0, disp = 0;
+            read_u64(lc + 0x70, &chk);
+            read_u64(lc + 0x78, &disp);
+            o.str("cf check=");
+            o.hex(chk);
+            o.str(" dispatch=");
+            o.hex(disp);
+            o.nl();
+            unsigned char pb[16] = {0};
+            bool jmpr = false;
+            if (disp) {
+                for (int k = 0; k < 16; ++k) pb[k] = *reinterpret_cast<unsigned char*>(disp + k);
+                for (int k = 0; k + 1 < 16; ++k)
+                    if (pb[k] == 0xff && pb[k + 1] == 0xe0) jmpr = true;
+            }
+            o.str("dispatch prologue=");
+            for (int k = 0; k < 16; ++k) { o.hex(pb[k]); o.str(" "); }
+            o.str(jmpr ? "has_jmp_rax" : "no_jmp_rax");
+            o.nl();
+            flush_out(a, pipe, o);
+            stage_mark(a, "DONE");
+            continue;
+        }
+        if (cmd[0] == 'Q') {
+            // Read-only follow-up to M. M proved the client's dispatch slot is
+            // not writable (VirtualProtect err 5) and that its value points
+            // somewhere that is not our image. Name that module before deciding
+            // anything else: a protector stub and a CFG dispatcher need
+            // different answers, and guessing between them killed the client
+            // once already.
+            auto mod_of = [](unsigned long long addr, char* out, unsigned int cap) {
+                out[0] = 0;
+                auto* peb = reinterpret_cast<Peb*>(__readgsqword(0x60));
+                auto* head = &peb->Ldr->InLoadOrderModuleList;
+                for (auto* it = head->Flink; it != head; it = it->Flink) {
+                    auto* e = CONTAINING_RECORD(it, LdrEntry, InLoadOrderLinks);
+                    unsigned long long b = reinterpret_cast<unsigned long long>(e->DllBase);
+                    if (!b || addr < b || addr >= b + e->SizeOfImage) continue;
+                    unsigned int n = e->BaseDllName.Length / sizeof(wchar_t);
+                    if (n >= cap) n = cap - 1;
+                    for (unsigned int i = 0; i < n; ++i) {
+                        wchar_t c = e->BaseDllName.Buffer[i];
+                        out[i] = (c >= 32 && c < 127) ? static_cast<char>(c) : '?';
+                    }
+                    out[n] = 0;
+                    return b;
+                }
+                return 0ull;
+            };
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+                o.str("guard Q bad image\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            auto& lc = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+            unsigned int lsz = 0, flags = 0;
+            unsigned long long slot_c = 0, slot_d = 0, val_c = 0, val_d = 0;
+            if (lc.VirtualAddress) {
+                read_u32(base + lc.VirtualAddress, &lsz);
+                if (lsz > lc.Size) lsz = lc.Size;
+                if (lsz >= 0x80) {
+                    read_u64(base + lc.VirtualAddress + 0x70, &slot_c);
+                    read_u64(base + lc.VirtualAddress + 0x78, &slot_d);
+                }
+                if (lsz >= 0x94) read_u32(base + lc.VirtualAddress + 0x90, &flags);
+            }
+            if (slot_c) read_u64(slot_c, &val_c);
+            if (slot_d) read_u64(slot_d, &val_d);
+            char name[64];
+            o.str("guard Q client=");
+            o.hex(base);
+            o.str(" lc_rva=");
+            o.hex(lc.VirtualAddress);
+            o.str(" lc_size=");
+            o.dec(lsz);
+            o.str(" dir_size=");
+            o.hex(lc.Size);
+            o.str(" flags=");
+            o.hex(flags);
+            o.nl();
+            const unsigned long long addrs[4] = {slot_c, val_c, slot_d, val_d};
+            const char* tags[4] = {"slot_c", "val_c ", "slot_d", "val_d "};
+            for (int i = 0; i < 4; ++i) {
+                if (!addrs[i]) continue;
+                unsigned long long mb = mod_of(addrs[i], name, sizeof(name));
+                o.str("guard Q ");
+                o.str(tags[i]);
+                o.str("=");
+                o.hex(addrs[i]);
+                o.str(" mod=");
+                o.str(name);
+                o.str("+");
+                o.hex(mb ? addrs[i] - mb : 0);
+                o.nl();
+            }
+            o.str("guard Q val_d_head=");
+            for (int k = 0; k < 16; ++k) {
+                unsigned char b = 0;
+                if (readable(reinterpret_cast<const void*>(val_d + k), 1))
+                    b = *reinterpret_cast<unsigned char*>(val_d + k);
+                o.hex(b);
+                o.ch(' ');
+            }
+            o.nl();
+            flush_out(a, pipe, o);
+            stage_mark(a, "DONE");
+            continue;
+        }
+        if (cmd[0] == 'M') {
+            // Run 2 without the walk that killed the client at stage 'x'. The
+            // client image names its own dispatch slot in the load config:
+            // offset 0x78 is GuardCFDispatchFunctionPointer, the address of
+            // that image's __guard_dispatch_icall_fptr. Read it, report what
+            // it holds, then point it at ntdll's own `jmp rax` stub. One 8-byte
+            // write to a data page: no scan, no code patch, no icache flush.
+            // If the slot already holds that stub, nothing is written and the
+            // native test runs as-is - which answers the question either way.
+            Module ntdll = find_module(fnv1a_w(L"ntdll.dll"));
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+            if (!ntdll.base || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+                o.str("guard M bad image\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            auto& lc = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+            unsigned long long nb = reinterpret_cast<unsigned long long>(ntdll.base);
+            auto* ndos = reinterpret_cast<IMAGE_DOS_HEADER*>(ntdll.base);
+            auto* nnt = reinterpret_cast<IMAGE_NT_HEADERS*>(nb + ndos->e_lfanew);
+            auto& nlc = nnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+
+            unsigned long long slot = 0, nslot = 0, nop = 0;
+            if (lc.VirtualAddress && lc.Size >= 0x80)
+                read_u64(base + lc.VirtualAddress + 0x78, &slot);
+            if (nlc.VirtualAddress && nlc.Size >= 0x80) {
+                read_u64(nb + nlc.VirtualAddress + 0x78, &nslot);
+                read_u64(nslot, &nop);
+            }
+            unsigned char nop0 = 0, nop1 = 0;
+            if (nop && readable(reinterpret_cast<const void*>(nop), 2)) {
+                nop0 = *reinterpret_cast<unsigned char*>(nop);
+                nop1 = *reinterpret_cast<unsigned char*>(nop + 1);
+            }
+            o.str("guard M client=");
+            o.hex(base);
+            o.str(" ldcfg=");
+            o.hex(lc.VirtualAddress);
+            o.str(" slot=");
+            o.hex(slot);
+            o.str(" ntdll_slot=");
+            o.hex(nslot);
+            o.str(" stub=");
+            o.hex(nop);
+            o.str(" stub_ok=");
+            o.dec((nop0 == 0xff && nop1 == 0xe0) ? 1 : 0);
+            o.nl();
+            flush_out(a, pipe, o);
+            if (!slot) {
+                o.str("guard M no slot\n");
+                flush_out(a, pipe, o);
+                stage_mark(a, "DONE");
+                continue;
+            }
+            unsigned long long held = 0;
+            read_u64(slot, &held);
+            o.str("guard M held=");
+            o.hex(held);
+            o.str(" rva=");
+            o.hex(held >= nb ? held - nb : 0);
+            o.str(" head=");
+            for (int k = 0; k < 16; ++k) {
+                unsigned char b = 0;
+                if (readable(reinterpret_cast<const void*>(held + k), 1))
+                    b = *reinterpret_cast<unsigned char*>(held + k);
+                o.hex(b);
+                o.ch(' ');
+            }
+            o.nl();
+            flush_out(a, pipe, o);
+
+            if (nop0 == 0xff && nop1 == 0xe0 && held != nop) {
+                DWORD oldp = 0;
+                if (!a.VirtualProtect(reinterpret_cast<void*>(slot), 8, PAGE_READWRITE, &oldp)) {
+                    o.str("guard M protect failed=");
+                    o.dec(static_cast<unsigned int>(a.GetLastError()));
+                    o.nl();
+                    flush_out(a, pipe, o);
+                    stage_mark(a, "DONE");
+                    continue;
+                }
+                wr64(slot, nop);
+                DWORD tmp = 0;
+                a.VirtualProtect(reinterpret_cast<void*>(slot), 8, oldp, &tmp);
+                unsigned long long back = 0;
+                read_u64(slot, &back);
+                o.str("guard M slot->stub readback=");
+                o.hex(back);
+                o.nl();
+                flush_out(a, pipe, o);
+            } else if (held == nop) {
+                o.str("guard M slot already stub\n");
+                flush_out(a, pipe, o);
+            } else {
+                // No nop stub in ntdll's own slot: patch the dispatcher body
+                // instead. The target arrives in rax (proven by the entry's
+                // `mov r10, rax`), so `48 ff e0` is a complete replacement.
+                DWORD oldp = 0;
+                if (!a.VirtualProtect(reinterpret_cast<void*>(held), 0x10,
+                                      PAGE_EXECUTE_READWRITE, &oldp)) {
+                    o.str("guard M code protect failed=");
+                    o.dec(static_cast<unsigned int>(a.GetLastError()));
+                    o.nl();
+                    flush_out(a, pipe, o);
+                    stage_mark(a, "DONE");
+                    continue;
+                }
+                *reinterpret_cast<unsigned char*>(held) = 0x48;
+                *reinterpret_cast<unsigned char*>(held + 1) = 0xff;
+                *reinterpret_cast<unsigned char*>(held + 2) = 0xe0;
+                if (a.FlushInstructionCache)
+                    a.FlushInstructionCache(INVALID_HANDLE_VALUE,
+                                            reinterpret_cast<void*>(held), 3);
+                DWORD tmp = 0;
+                a.VirtualProtect(reinterpret_cast<void*>(held), 0x10, oldp, &tmp);
+                o.str("guard M dispatcher patched\n");
+                flush_out(a, pipe, o);
+            }
+            stage_mark(a, "GUARD");
+            cmd[0] = 'k';
+        }
         if (cmd[0] == 'x') {
+            // Disabled after the client died mid-walk. The load config names
+            // the same target without touching 16 MB of protected pages.
+            o.str("guard x disabled, use M\n");
+            flush_out(a, pipe, o);
+            stage_mark(a, "DONE");
+            continue;
+        }
+        if (cmd[0] == 'X') {
             // CFG has no bitmap entry for MEM_PRIVATE pages, and the policy
             // cannot be relaxed at runtime (err 5). The check itself lives in
             // ntdll's dispatch stub: every instrumented indirect call is a
