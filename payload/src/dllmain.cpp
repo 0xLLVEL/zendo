@@ -2693,12 +2693,20 @@ inline void cap_value(char* d, unsigned int& n, unsigned long long slot) {
 }
 
 static unsigned long long g_base = 0;
+// 0: run the load. 1: prove entry only - the guard question and the load
+// question are different questions, and they cost a client relaunch each.
+static int g_native_mode = 0;
 
 // A C closure is the only way Lua can reach native code, and the target of
 // every call it makes is an indirect call - which is exactly what CFG checks.
 // The bytes come from the client's own luau_load, so the address is inside the
 // image and no guard bitmap of ours is involved.
 inline int native_loadstring(void* L) {
+    stage_mark(api(), "ENTER");
+    if (g_native_mode) {
+        stage_mark(api(), "ENTER-ONLY");
+        return 1;
+    }
     unsigned long long l = reinterpret_cast<unsigned long long>(L);
     unsigned long long base = 0;
     read_u64(l + 0x58, &base);
@@ -7359,6 +7367,17 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             stage_mark(a, "DONE");
             continue;
         }
+        if (cmd[0] == 'v' || cmd[0] == 'u') {
+            // Same bitmap write as U, different native body. 'v' returns the
+            // moment it is entered, so a crash on 'v' can only mean the call
+            // never arrived. 'u' runs the real load. One build, both answers.
+            g_native_mode = (cmd[0] == 'v') ? 1 : 0;
+            o.str("guard mode=");
+            o.dec(static_cast<unsigned int>(g_native_mode));
+            o.nl();
+            flush_out(a, pipe, o);
+            cmd[0] = 'U';
+        }
         if (cmd[0] == 'T') {
             // The dispatcher at RobloxPlayerBeta.dll+0x4c9360 is stock CFG and
             // reads one bit out of a bitmap that measures PAGE_READWRITE in
@@ -7922,8 +7941,39 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             o.hex(g_cap_closure);
             o.str(" f=");
             o.hex(old_f);
+            o.str(" mode=");
+            o.dec(static_cast<unsigned int>(g_native_mode));
             o.nl();
             flush_out(a, pipe, o);
+            {
+                // Read the guard bit right now, not at the time it was set: if
+                // the protector resets the map between the write and the call,
+                // this is where it shows.
+                Module dll = find_module(fnv1a_w(L"RobloxPlayerBeta.dll"));
+                unsigned long long tgt =
+                    reinterpret_cast<unsigned long long>(&native_loadstring);
+                unsigned long long bitmap = 0;
+                if (dll.base) {
+                    unsigned long long db = reinterpret_cast<unsigned long long>(dll.base);
+                    read_u64(db + 0x4c9376ull + 0x9f9622ull, &bitmap);
+                }
+                if (bitmap) {
+                    unsigned long long bp = bitmap + (tgt >> 15);
+                    Mbi q{};
+                    a.VirtualQuery(reinterpret_cast<const void*>(bp), &q, sizeof(q));
+                    unsigned char cur = 0;
+                    if (q.State == MEM_COMMIT && (q.Protect & 0xff) == PAGE_READWRITE)
+                        cur = *reinterpret_cast<unsigned char*>(bp);
+                    o.str("native guard bit=");
+                    o.hex(cur);
+                    o.str(" want=");
+                    o.hex(1u << static_cast<unsigned int>((tgt >> 12) & 7));
+                    o.str(" page_state=");
+                    o.hex(q.State);
+                    o.nl();
+                    flush_out(a, pipe, o);
+                }
+            }
             stage_mark(a, "NATIVE");
             exec_raw(a, pipe, o, L, base, kChunkKNativeBody, kChunkKNativeLen, "knative");
             wr64(g_cap_closure + 0x28, old_f);
