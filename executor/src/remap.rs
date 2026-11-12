@@ -1,6 +1,8 @@
 //! Rewrites compiler stock opcodes to the client's file opcodes.
 //!
-//!     file = FILE_TO_RUNTIME[CLASS_TO_RUNTIME[stock]]
+//! ```text
+//! file = FILE_TO_RUNTIME[CLASS_TO_RUNTIME[stock]]
+//! ```
 //!
 //! Both tables come from the decrypted image (see tables.rs). Only the low
 //! byte of each instruction's first word changes; AUX words are untouched.

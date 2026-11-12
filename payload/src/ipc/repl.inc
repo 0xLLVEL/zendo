@@ -75,6 +75,13 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     // writer beside the client's own scheduler, and that race is what killed
     // the client seconds after a session ended with its body never running.
 
+    // A deferred body finishes on the client's scheduler, so the host has to
+    // wait on the client's own log for the completion line. Three seconds of
+    // silence was not enough: the payload broke out of the session (and closed
+    // the pipe) while the host was still waiting for that line, and the host's
+    // closing `q` then failed with ERROR_NO_DATA. Thirty seconds matches the
+    // host's own patience for a deferred run.
+    bool deferred = false;
     for (;;) {
         stage_mark(a, "RDY");
         o.str("RDY\n");
@@ -87,7 +94,8 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         // image, and two payloads end up in one client.
         if (a.PeekNamedPipe && a.Sleep) {
             bool ready = false;
-            for (int spin = 0; spin < 60; ++spin) {
+            const int spins = deferred ? 600 : 60;
+            for (int spin = 0; spin < spins; ++spin) {
                 DWORD avail = 0;
                 if (!a.PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) {
                     trace_tag(a, "peek-gone");
@@ -106,6 +114,7 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             break;
         }
         cmd[1] = 0;
+        if (cmd[0] == 'd') deferred = true;
         trace_tag(a, cmd);
         stage_mark(a, cmd);
         // Detach: leave the client with no payload thread parked inside it.

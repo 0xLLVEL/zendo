@@ -451,12 +451,19 @@ fn take_bytes(pipe: &Pipe, acc: &mut Vec<u8>, dst: &mut [u8]) -> io::Result<()> 
     Ok(())
 }
 
+fn send_all(pipe: &Pipe, parts: &[&[u8]]) -> io::Result<()> {
+    for p in parts {
+        pipe.write_all(p)?;
+    }
+    Ok(())
+}
+
 /// Streams payload output into `sink` and answers RDY lines with `steps` in
 /// order, then `q` once the list is drained. Lines the payload marks with a
 /// leading `P` are script output and reach the sink with a `» ` prefix so the
 /// UI can tell them apart from protocol chatter.
 pub fn drive(pipe: &Pipe, steps: &[Step], mut sink: impl Write) -> io::Result<()> {
-    drive_until(pipe, steps, &mut sink, false, None, None)
+    drive_until(pipe, steps, &mut sink, false, None, None).map(|_| ())
 }
 
 /// `wait_done` keeps the session open after the last step until the payload
@@ -465,7 +472,7 @@ pub fn drive(pipe: &Pipe, steps: &[Step], mut sink: impl Write) -> io::Result<()
 /// chunk runs inside the step itself, so there is nothing left to wait for.
 pub fn drive_wait(pipe: &Pipe, steps: &[Step], sink: impl Write,
                   wait_done: bool) -> io::Result<()> {
-    drive_until(pipe, steps, sink, wait_done, None, None)
+    drive_until(pipe, steps, sink, wait_done, None, None).map(|_| ())
 }
 
 /// Same driver with a wall-clock ceiling and an outside completion flag. A
@@ -473,9 +480,28 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], sink: impl Write,
 /// client's scheduler, a client that froze mid-run) leaves the caller holding a
 /// thread and a UI stuck on "running". Both exits here are independent of the
 /// payload behaving.
+///
+/// Returns whether the payload reached END. A write that fails because the
+/// payload closed the pipe first is the session ending, not an error: the
+/// caller's authority on "the chunk ran" is END or the log sentinel, never a
+/// control byte that lost a race with `CloseHandle`.
 pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                    wait_done: bool, deadline: Option<std::time::Instant>,
-                   done: Option<&std::sync::atomic::AtomicBool>) -> io::Result<()> {
+                   done: Option<&std::sync::atomic::AtomicBool>)
+                   -> io::Result<bool> {
+    let mut session_gone = false;
+    // Every protocol byte goes through here. A dead pipe means the session is
+    // over; reporting `ERROR_NO_DATA` (232) instead turned a run that had
+    // already printed its result into a red failure in the UI.
+    macro_rules! send {
+        ($($b:expr),+ $(,)?) => {
+            if let Err(e) = send_all(pipe, &[$($b),+]) {
+                eprintln!("[pipe] write failed: {e}");
+                session_gone = true;
+            }
+        };
+    }
+
     let mut buf = [0u8; 4096];
     let mut acc = Vec::new();
     let mut idx = 0usize;
@@ -495,14 +521,14 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("[pipe] script signalled done");
                 let _ = pipe.write_all(b"q");
-                return Ok(());
+                return Ok(seen_end);
             }
         }
         if let Some(limit) = deadline {
             if std::time::Instant::now() >= limit {
                 eprintln!("[pipe] deadline reached, detaching");
                 let _ = pipe.write_all(b"x");
-                return Ok(());
+                return Ok(seen_end);
             }
         }
         // Poll: a blocking read hands the timeout decision to the client, and
@@ -521,7 +547,7 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
             }
             if wait_done && !sent_quit && idx >= steps.len() && idle >= wait_limit {
                 eprintln!("[pipe] no done signal, detaching");
-                pipe.write_all(b"x")?;
+                let _ = pipe.write_all(b"x");
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -548,23 +574,22 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                     .unwrap_or(0);
                 let mut src = vec![0u8; want.min(262144)];
                 if want == 0 || want > 262144 {
-                    pipe.write_all(b"E 0\n")?;
+                    send!(b"E 0\n");
                 } else {
                     take_bytes(pipe, &mut acc, &mut src)?;
                     match crate::compile_str(&String::from_utf8_lossy(&src)) {
                         Ok(blob) => {
                             eprintln!("[pipe] loadstring {} bytes -> {} bytes", want, blob.len());
-                            pipe.write_all(format!("K {}\n", blob.len()).as_bytes())?;
-                            pipe.write_all(&blob)?;
+                            send!(format!("K {}\n", blob.len()).as_bytes(), &blob);
                         }
                         Err(e) => {
                             eprintln!("[pipe] loadstring failed: {e}");
                             let msg = e.into_bytes();
-                            pipe.write_all(format!("E {}\n", msg.len()).as_bytes())?;
-                            pipe.write_all(&msg)?;
+                            send!(format!("E {}\n", msg.len()).as_bytes(), &msg);
                         }
                     }
                 }
+                if session_gone { break; }
                 sink.flush()?;
                 continue;
             }
@@ -591,7 +616,7 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                 let mut path = vec![0u8; plen.min(4096)];
                 let mut data = vec![0u8; dlen.min(1 << 20)];
                 if plen == 0 || plen > 4096 || dlen > (1 << 20) {
-                    pipe.write_all(b"E 0\n")?;
+                    send!(b"E 0\n");
                 } else {
                     take_bytes(pipe, &mut acc, &mut path)?;
                     if dlen > 0 {
@@ -646,21 +671,20 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                         match crate::compile_str(&src) {
                             Ok(blob) => {
                                 eprintln!("[pipe] fs reply {} bytes", blob.len());
-                                pipe.write_all(format!("K {}\n", blob.len()).as_bytes())?;
-                                pipe.write_all(&blob)?;
+                                send!(format!("K {}\n", blob.len()).as_bytes(), &blob);
                             }
                             Err(e) => {
                                 let msg = e.into_bytes();
-                                pipe.write_all(format!("E {}\n", msg.len()).as_bytes())?;
-                                pipe.write_all(&msg)?;
+                                send!(format!("E {}\n", msg.len()).as_bytes(), &msg);
                             }
                         }
                     } else if let Some(line) = reply {
-                        pipe.write_all(line.as_bytes())?;
+                        send!(line.as_bytes());
                     } else {
-                        pipe.write_all(format!("A {}\n", ok).as_bytes())?;
+                        send!(format!("A {}\n", ok).as_bytes());
                     }
                 }
+                if session_gone { break; }
                 sink.flush()?;
                 continue;
             }
@@ -677,7 +701,7 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                     .filter_map(|f| std::str::from_utf8(f).ok()?.trim().parse().ok())
                     .collect();
                 if fields.len() != 6 || fields.iter().zip(CAPS).any(|(n, cap)| *n > cap) {
-                    pipe.write_all(b"R 0 0\n")?;
+                    send!(b"R 0 0\n");
                 } else {
                     let mut parts: Vec<Vec<u8>> = Vec::with_capacity(6);
                     for n in &fields {
@@ -720,8 +744,9 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                         }
                         Err(e) => eprintln!("[pipe] http failed: {e}"),
                     }
-                    pipe.write_all(format!("R {} {}\n", status, ok).as_bytes())?;
+                    send!(format!("R {} {}\n", status, ok).as_bytes());
                 }
+                if session_gone { break; }
                 sink.flush()?;
                 continue;
             }
@@ -730,25 +755,19 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                     match steps[idx] {
                         Step::Cmd(c) => {
                             eprintln!("[pipe] sending cmd {}", c as char);
-                            pipe.write_all(&[c])?;
+                            send!(&[c]);
                         }
                         Step::Chunk(chunk) => {
                             eprintln!("[pipe] sending chunk {} bytes", chunk.len());
-                            pipe.write_all(b"L")?;
-                            pipe.write_all(&(chunk.len() as u32).to_le_bytes())?;
-                            pipe.write_all(chunk)?;
+                            send!(b"L", (chunk.len() as u32).to_le_bytes().as_slice(), chunk);
                         }
                         Step::Ident(chunk, id) => {
                             eprintln!("[pipe] sending ident chunk {} bytes id {}", chunk.len(), id);
-                            pipe.write_all(b"i")?;
-                            pipe.write_all(&[id])?;                            pipe.write_all(&(chunk.len() as u32).to_le_bytes())?;
-                            pipe.write_all(chunk)?;
+                            send!(b"i", &[id], (chunk.len() as u32).to_le_bytes().as_slice(), chunk);
                         }
                         Step::Defer(chunk) => {
                             eprintln!("[pipe] sending deferred chunk {} bytes", chunk.len());
-                            pipe.write_all(b"d")?;
-                            pipe.write_all(&(chunk.len() as u32).to_le_bytes())?;
-                            pipe.write_all(chunk)?;
+                            send!(b"d", (chunk.len() as u32).to_le_bytes().as_slice(), chunk);
                         }
                     }
                     idx += 1;
@@ -761,7 +780,7 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                         // loop: the next run reuses this image instead of mapping
                         // a second one into the client.
                         eprintln!("[pipe] session over");
-                        pipe.write_all(b"q")?;
+                        send!(b"q");
                         sent_quit = true;
                     }
                 }
@@ -769,10 +788,18 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                 seen_end = true;
                 if wait_done && !sent_quit {
                     eprintln!("[pipe] script done, session over");
-                    pipe.write_all(b"q")?;
+                    send!(b"q");
                     sent_quit = true;
                 }
             } else if body.first() == Some(&b'P') {
+                // Normally the sentinel reaches the host through the client's
+                // own log. If print capture was left armed, it arrives here
+                // instead, and completion must not depend on which path won.
+                if std::str::from_utf8(&body[1..]).map(|s| s.trim()) == Ok(crate::DONE_SENTINEL) {
+                    if let Some(flag) = done {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 sink.write_all("\u{bb} ".as_bytes())?;
                 sink.write_all(&body[1..])?;
                 sink.write_all(b"\n")?;
@@ -780,10 +807,49 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                 sink.write_all(&line)?;
             }
             sink.flush()?;
+            if session_gone { break; }
         }
-        if seen_end && sent_quit {
+        if session_gone || (seen_end && sent_quit) {
             break;
         }
     }
-    Ok(())
+    Ok(seen_end)
+}
+
+#[cfg(test)]
+mod close_race {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// The payload writes END and closes the pipe. The host then answers `q`
+    /// into a handle the client already closed, which is ERROR_NO_DATA (232).
+    /// That is the session ending, not a failed run: the driver must report END
+    /// and let the caller decide from the sentinel.
+    #[test]
+    fn end_then_close_is_not_an_error() {
+        let name = format!(r"\\.\pipe\zendo-selftest-{}", std::process::id());
+        let server = Pipe::create(&name).expect("create");
+        let pending = server.begin_accept();
+        let client = std::thread::spawn(move || {
+            let mut f = loop {
+                match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+                    Ok(f) => break f,
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            };
+            f.write_all(b"RDY\n").expect("rdy");
+            let mut step = [0u8; 6]; // 'd', u32 len, one chunk byte
+            f.read_exact(&mut step).expect("step");
+            f.write_all(b"END\n").expect("end");
+            drop(f);
+        });
+        assert!(pending.wait(2_000).expect("accept"));
+        let chunk = b"x";
+        let out = drive_until(&server, &[Step::Defer(chunk)], std::io::sink(),
+                              true,
+                              Some(std::time::Instant::now() + Duration::from_secs(5)),
+                              None);
+        client.join().expect("client");
+        assert!(matches!(out, Ok(true)), "got {:?}", out.map_err(|e| e.to_string()));
+    }
 }

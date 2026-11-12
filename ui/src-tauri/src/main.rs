@@ -474,11 +474,12 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     let driven = pipe::drive_until(&server, &steps, tap, true,
                                    Some(Instant::now() + std::time::Duration::from_secs(30)),
                                    Some(done.as_ref()));
-    runlog(&format!("drive returned ok={} elapsed={}ms sentinel={}",
-                    driven.is_ok(), t0.elapsed().as_millis(),
+    let ended = matches!(&driven, Ok(true));
+    runlog(&format!("drive returned ok={} ended={} elapsed={}ms sentinel={}",
+                    driven.is_ok(), ended, t0.elapsed().as_millis(),
                     done.load(Ordering::Relaxed)));
     live.store(false, Ordering::Relaxed);
-    let seen = watcher.join().unwrap_or_default();
+    let mut seen = watcher.join().unwrap_or_default();
     runlog(&format!("watcher joined out={}B", seen.len()));
     // The payload restores the borrowed thread once the pipe closes, so there is
     // no ack to wait for. The injector is only reaped when this run borrowed one.
@@ -495,21 +496,45 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
             ));
         }
     }
-    driven.map_err(|e| format!("pipe: {e}"))?;
 
     let _ = app.emit("zendo://stage", "tail");
 
-    // One last look for lines the client flushes as the session closes.
-    for _ in 0..6 {
+    // One last look for lines the client flushes as the session closes. The
+    // sentinel is written by a scheduler thread, so it can land after the pipe
+    // is already gone; a run that has it must not be reported as a failure just
+    // because the payload got to CloseHandle first. A run that never reports
+    // pays the longer wait exactly once.
+    let polls = if done.load(Ordering::Relaxed) { 2 } else { 24 };
+    for i in 0..polls {
         std::thread::sleep(std::time::Duration::from_millis(250));
         let raw = tail(log_start.clone());
+        if !done.load(Ordering::Relaxed) && raw.contains(zendo_core::DONE_SENTINEL) {
+            done.store(true, Ordering::Relaxed);
+            runlog("sentinel seen late");
+        }
         let clean = strip_sentinel(&raw);
         if clean.len() > seen.len() && clean.starts_with(&seen) {
             let delta = clean[seen.len()..].to_string();
             let _ = app.emit("zendo://out", delta.clone());
             buf.lock().unwrap().extend_from_slice(delta.as_bytes());
+            seen = clean;
+        }
+        if done.load(Ordering::Relaxed) && i >= 1 {
             break;
         }
+    }
+
+    if let Err(e) = &driven {
+        if done.load(Ordering::Relaxed) || ended {
+            // ERROR_NO_DATA (232) is the payload closing the pipe after END,
+            // racing the host's last control byte. The run itself completed.
+            runlog(&format!("pipe closed early ({e}); completion already seen"));
+        } else {
+            return Err(format!("pipe: {e}"));
+        }
+    } else if !done.load(Ordering::Relaxed) && !ended {
+        runlog("session ended without END or sentinel");
+        return Err("session ended before the script reported completion".into());
     }
 
     let output = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();

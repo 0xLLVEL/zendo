@@ -664,18 +664,23 @@ These exist because each one was learned the hard way.
    injection. A resident payload is a speed optimization, never a requirement.
    The corollary: `work/loop.bin` must never be trusted as proof of life beyond
    the next inject decision.
-2. **Kill the client after a crash.** An elevated `taskkill` — a medium shell
+2. **A closed pipe is not a failed run.** The payload answers END and closes the
+   connection in the same breath, so the host's last control byte can lose the
+   race and fail with `ERROR_NO_DATA` (232). Completion is END or the log
+   sentinel; a write error after either one is the session ending. The driver
+   keeps that write non-fatal and reports what it saw.
+3. **Kill the client after a crash.** An elevated `taskkill` — a medium shell
    cannot touch it. A client that lost its scheduler has one thread and no
    window and cannot be terminated at all; only a reboot clears it.
-3. **Never re-run the linear image scan** (stage `x`). It died mid-walk twice,
+4. **Never re-run the linear image scan** (stage `x`). It died mid-walk twice,
    leaving the process gone. The load config names the same target without
    touching a page.
-4. **Every probe read uses a ≥48-byte buffer.** The host refuses to write into
+5. **Every probe read uses a ≥48-byte buffer.** The host refuses to write into
    short strings because they are interned; a 16-byte buffer silently fails and
    the probe reports garbage.
-5. **A function counts as working only if it touched a real structure.** No
+6. **A function counts as working only if it touched a real structure.** No
    stubs returning plausible values.
-6. **No offset is copied from another executor as fact.** Same client version
+7. **No offset is copied from another executor as fact.** Same client version
    makes a value a hypothesis to verify, nothing more.
 
 ---
@@ -690,6 +695,8 @@ These exist because each one was learned the hard way.
 | Crash right after `uget` on a reference capture | REF tag compared against decimal 10 instead of `0x10` | compare against `0x10` |
 | `setupvalue` returns `nil` on a writable page | hardcoded `VirtualProtect(start, 0x2000, ...)` | use `api_write`, which sizes the range from the page |
 | Second Execute hangs on "running" | resident payload thread was killed by the client, and a mutex claim outlived it, so the fresh image parked and nothing served | fixed: no claim, pipe is the semaphore, host injects after 1.5 s and fails in 8 s instead of 30 |
+| Fourth Execute fails with `pipe: The pipe is being closed. (os error 232)` | payload wrote END and closed the pipe while the host was writing its closing `q` | fixed in `pipe.rs`: control writes are non-fatal; END or the sentinel marks the run complete, late sentinel is polled for 6 s |
+| Deferred script reports no completion | payload left the session after 3 s of silence, before the scheduler printed the sentinel | payload waits 30 s after a `d` session; host polls the log 6 s after the pipe closes |
 | Load-config probe leaves the client gone | session landed on a thread the protector already saw | relaunch before the next probe |
 
 ---
