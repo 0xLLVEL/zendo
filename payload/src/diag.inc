@@ -1,3 +1,4 @@
+#if ZENDO_STAGE != 64
 inline DWORD run_diag(bool do_call) {
     DWORD st = resolve_api();
     if (st) return 30 + st;
@@ -289,14 +290,19 @@ inline DWORD run_diag(bool do_call) {
     a.CloseHandle(pipe);
     return 111;
 }
+#endif
 
+#if ZENDO_STAGE != 64
 inline DWORD run_diag_only() {
     return run_diag(false);
 }
+#endif
 
+#if ZENDO_STAGE != 64
 inline DWORD run_diag_call() {
     return run_diag(true);
 }
+#endif
 
 // Stage 24: register our own exception table, then walk the whole path with a
 // marker flushed after every statement, and guard the frame push plus the
@@ -304,6 +310,7 @@ inline DWORD run_diag_call() {
 // the VM state instead of letting the process die mid-unwind.
 static DWORD g_seh_code = 0;
 
+#if ZENDO_STAGE != 64
 inline void dump_mode11_results(Api& a, HANDLE pipe, Out& o, unsigned long long base_ci) {
     unsigned long long fn = 0;
     read_u64(base_ci + 48 + 0x10, &fn);
@@ -349,6 +356,7 @@ inline void dump_mode11_results(Api& a, HANDLE pipe, Out& o, unsigned long long 
     }
     flush_out(a, pipe, o);
 }
+#endif
 
 inline void dump_val(Out& o, const char* tag, unsigned long long slot) {
     unsigned long long v = 0, w = 0;
@@ -400,6 +408,7 @@ static unsigned long long g_full_mask = 0xFFFFFFFFFFFFFFFFull;
 static bool g_patch_proto = false;
 static bool g_sentinel = false;
 
+#if ZENDO_STAGE != 64
 inline bool slot_is_str(unsigned long long slot, const char* lit) {
     unsigned long long v = 0, w = 0;
     if (!read_u64(slot, &v) || !read_u64(slot + 8, &w)) return false;
@@ -413,6 +422,7 @@ inline bool slot_is_str(unsigned long long slot, const char* lit) {
         if (*reinterpret_cast<char*>(v + 0x18 + i) != lit[i]) return false;
     return true;
 }
+#endif
 
 // Declared std::string size handed to LuaVMLoad. Non-zero lies about the blob
 // length so sub_43178A0's `size-8 >= 0x118` watermark gate never fires; the

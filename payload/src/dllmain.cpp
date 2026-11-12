@@ -64,6 +64,7 @@ extern "C" int _fltused = 1;
 #include "native.inc"
 #include "execraw.inc"
 #include "gc.inc"
+#include "caps.inc"
 #include "stages.inc"
 #include "repl.inc"
 #include "trace.inc"

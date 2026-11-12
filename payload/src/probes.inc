@@ -1,3 +1,4 @@
+#if ZENDO_STAGE != 64
 inline DWORD run_load() {
     DWORD st = resolve_api();
     if (st) return 30 + st;
@@ -110,9 +111,11 @@ inline DWORD run_load() {
     a.CloseHandle(pipe);
     return 111;
 }
+#endif
 
 inline void dump_tv(Out& o, unsigned long long slot, const char* tag);
 
+#if ZENDO_STAGE != 64
 inline void dump_tv(Out& o, unsigned long long slot, const char* tag) {
     unsigned long long v = 0, w = 0;
     if (!read_u64(slot, &v) || !read_u64(slot + 8, &w)) {
@@ -139,6 +142,7 @@ inline void dump_tv(Out& o, unsigned long long slot, const char* tag) {
     }
     o.nl();
 }
+#endif
 
 // MSVC std::string: inline buffer / heap pointer at +0, size at +0x10,
 // capacity at +0x18. LuaVMLoad checks size>8 and capacity>=16, then reads
@@ -152,6 +156,7 @@ struct ChunkName {
 
 // Loads plain Luau source with a well formed chunkname and reports exactly
 // what the loader pushed. No task machinery, no unproven calls.
+#if ZENDO_STAGE != 64
 inline DWORD run_chunk() {
     DWORD st = resolve_api();
     if (st) return 30 + st;
@@ -252,6 +257,7 @@ inline DWORD run_chunk() {
     a.CloseHandle(pipe);
     return 111;
 }
+#endif
 
 // Stage 18: real bytecode. LuaVMLoad's raw path compares the first qword of
 // the std::string against 0xE009325B4A107A52 (rodata 0x6AF9FF0) and, on match,
@@ -312,6 +318,7 @@ inline DWORD run_chunk() {
 #include "../chunks/zbind.inc"
 #include "../chunks/zcall.inc"
 
+#if ZENDO_STAGE != 64
 inline DWORD run_bc() {
     DWORD st = resolve_api();
     if (st) return 30 + st;
@@ -391,6 +398,7 @@ inline DWORD run_bc() {
     a.CloseHandle(pipe);
     return 111;
 }
+#endif
 
 // Writes whatever the report buffer holds and empties it. Stage diagnostics
 // flush after every section so a crash still leaves a trail on the pipe.
