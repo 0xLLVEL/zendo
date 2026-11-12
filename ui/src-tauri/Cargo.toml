@@ -1,0 +1,26 @@
+[package]
+name = "zendo-ui"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+# `cargo build --release --features custom-protocol` embeds `dist/` into the
+# binary and serves it over tauri:// instead of asking localhost:1420 for it.
+custom-protocol = ["tauri/custom-protocol"]
+
+[dependencies]
+zendo-exec = { path = "../../executor" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+# 16, not 1. codegen-units=1 serialises LLVM and makes every relink after a
+# main.rs touch a 3-minute wait; the UI is a shell, and the parallelism costs
+# nothing measurable here.
+codegen-units = 16
+strip = true

@@ -1,0 +1,298 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("./assets/fonts/outfit-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("./assets/fonts/outfit-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@theme {
+  --color-ink: #e7eaf0;
+  --color-dim: #9aa3b0;
+  --color-faint: #6c7583;
+  --color-line: rgb(255 255 255 / 0.1);
+  --color-iris: #b9a2ff;
+  --color-mint: #7df0d8;
+  --color-rose: #ff8fb4;
+  --color-amber: #ffca7a;
+  --color-danger: #ff6b81;
+
+  /* Neutral graphite ramp. Depth is a step, never a glow. */
+  --color-s0: #0a0b0e;
+  --color-s1: #101216;
+  --color-s2: #16191f;
+  --color-s3: #1c2028;
+  --color-s4: #242934;
+
+  --font-ui: "Outfit", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+}
+
+:root {
+  --accent: #aac1d5;
+  --accent-ink: #0a1016;
+}
+
+@layer base {
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+
+  body {
+    background: transparent;
+    color: var(--color-ink);
+    font: 14px/1.55 var(--font-ui);
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+
+  html.web body {
+    background: var(--color-s0);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(255 255 255 / 0.1);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgb(255 255 255 / 0.18);
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  :focus-visible {
+    outline: 1.5px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+}
+
+.field {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background: transparent;
+}
+
+/* Browser preview only: the page is not a window, so it needs its own floor. */
+html.web .field {
+  background: linear-gradient(168deg, #101318 0%, #0a0b0e 46%, #0c0e12 100%);
+}
+
+/* The window's own backdrop: a cool sheen over blurred desktop, not a floor.
+   The accent policy supplies the blur; this layer only tints and shapes it. */
+.desktop .field {
+  background:
+    radial-gradient(120% 90% at 18% 0%, rgb(122 150 190 / 0.12), transparent 58%),
+    linear-gradient(
+      168deg,
+      rgb(8 9 12 / 0.22) 0%,
+      rgb(5 6 8 / 0.14) 46%,
+      rgb(7 8 11 / 0.2) 100%
+    );
+  border-radius: 12px;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.07);
+}
+
+.desktop,
+.desktop body,
+.desktop #app {
+  background: transparent;
+}
+
+/* Frameless shell: the veil is the window edge, so the corners must clip. */
+.shell {
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+/* A panel is a frosted card: low fill, strong blur, a hairline of light. */
+.panel {
+  background: linear-gradient(
+    180deg,
+    rgb(92 102 120 / 0.12) 0%,
+    rgb(12 14 19 / 0.32) 100%
+  );
+  border: 1px solid rgb(255 255 255 / 0.1);
+  backdrop-filter: blur(30px) saturate(150%) brightness(1.05);
+  -webkit-backdrop-filter: blur(30px) saturate(150%) brightness(1.05);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.1),
+    0 18px 36px -24px rgb(0 0 0 / 0.85);
+}
+
+.raised {
+  background: rgb(38 44 54 / 0.5);
+  border: 1px solid rgb(255 255 255 / 0.14);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.1),
+    0 16px 30px -20px rgb(0 0 0 / 0.95);
+}
+
+.sheet {
+  background: rgb(16 19 25 / 0.62);
+  backdrop-filter: blur(30px) saturate(140%);
+  -webkit-backdrop-filter: blur(30px) saturate(140%);
+  border-left: 1px solid rgb(255 255 255 / 0.12);
+  box-shadow: -24px 0 48px -30px rgb(0 0 0 / 0.95);
+}
+
+/* Chrome that used to be painted solid now belongs to the same glass. */
+.desktop .panel > .bg-s1 {
+  background-color: rgb(255 255 255 / 0.045);
+}
+.desktop header .bg-s2 {
+  background-color: rgb(255 255 255 / 0.055);
+}
+.desktop .btn {
+  background: rgb(255 255 255 / 0.055);
+}
+.desktop .btn:hover {
+  background: rgb(255 255 255 / 0.1);
+}
+
+.winbtn {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--color-dim);
+}
+.winbtn:hover {
+  background: rgb(255 255 255 / 0.09);
+  color: var(--color-ink);
+}
+.winbtn.close:hover {
+  background: rgb(220 60 80 / 0.75);
+  color: #fff;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 7px;
+  border: 1px solid rgb(255 255 255 / 0.12);
+  background: var(--color-s3);
+  color: var(--color-ink);
+  font: 500 13px/1 var(--font-ui);
+  letter-spacing: -0.01em;
+  transition: background 140ms, border-color 140ms;
+}
+.btn:hover {
+  background: var(--color-s4);
+  border-color: rgb(255 255 255 / 0.2);
+}
+
+.btn-quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--color-dim);
+}
+.btn-quiet:hover {
+  background: var(--color-s3);
+  color: var(--color-ink);
+}
+
+.btn-run {
+  height: 32px;
+  padding: 0 15px 0 13px;
+  border: 1px solid color-mix(in srgb, var(--accent) 62%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent) 22%, var(--color-s3));
+  color: var(--color-ink);
+  font: 600 13.5px/1 var(--font-ui);
+}
+.btn-run:hover {
+  background: color-mix(in srgb, var(--accent) 32%, var(--color-s4));
+}
+.btn-run:disabled {
+  border-color: rgb(255 255 255 / 0.08);
+  background: var(--color-s3);
+  color: var(--color-faint);
+}
+
+kbd {
+  font: 500 11px/1.5 var(--font-mono);
+  border: 1px solid rgb(255 255 255 / 0.16);
+  border-radius: 4px;
+  padding: 0 3px;
+  opacity: 0.7;
+}
+
+.cm-host {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.cm-host .cm-editor {
+  height: 100%;
+}
+.cm-host .cm-editor.cm-focused {
+  outline: none;
+}
+.cm-host .cm-editor .cm-scroller {
+  font-family: var(--font-mono);
+}
+
+#log {
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+#log .line {
+  display: block;
+}
+#log .line.err {
+  color: var(--color-danger);
+}
+#log .line.warn {
+  color: var(--color-amber);
+}
+#log .line.ok {
+  color: var(--color-mint);
+}
+#log .line.meta {
+  color: var(--color-faint);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}

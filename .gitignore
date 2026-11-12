@@ -10,3 +10,6 @@ work/
 tests/
 tools/
 resource/
+
+node_modules/
+dist/

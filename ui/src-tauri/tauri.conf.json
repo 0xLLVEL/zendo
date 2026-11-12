@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "identifier": "dev.zendo.exec",
   "build": {
-    "frontendDist": "web"
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
   },
   "app": {
     "withGlobalTauri": true,
@@ -16,6 +17,9 @@
         "minWidth": 720,
         "minHeight": 480,
         "resizable": true,
+        "transparent": true,
+        "decorations": false,
+        "shadow": true,
         "theme": "Dark"
       }
     ],

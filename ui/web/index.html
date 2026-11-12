@@ -7,34 +7,98 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <header>
+    <header class="strip">
       <div class="brand">
-        <span class="dot" id="dot"></span>
+        <span class="lamp idle" id="dot"></span>
         <span class="name">zendo</span>
         <span class="ver">4080</span>
       </div>
-      <div class="client" id="client">looking for client…</div>
+      <div class="chips">
+        <span class="chip" id="client">no client</span>
+        <span class="chip" id="integrity">integrity ?</span>
+      </div>
+      <span class="spacer"></span>
       <button id="run" class="run">Run <kbd>ctrl</kbd><kbd>↵</kbd></button>
     </header>
 
     <main>
-      <section class="pane editor">
-        <div class="bar"><span>script.luau</span><span id="lines">0 lines</span></div>
-        <div class="wrap">
-          <div class="gutter" id="gutter"></div>
-          <textarea id="code" spellcheck="false" autocomplete="off" placeholder="print('scent at the door')"></textarea>
-        </div>
-      </section>
+      <aside class="rail">
+        <section class="block">
+          <div class="label">session</div>
+          <div class="row"><span>client</span><b id="r-client">—</b></div>
+          <div class="row"><span>integrity</span><b id="r-integrity">—</b></div>
+          <div class="row"><span>payload</span><b id="r-phase">idle</b></div>
+        </section>
 
-      <section class="pane output">
-        <div class="bar"><span>output</span><span id="stage">idle</span></div>
-        <pre id="log"></pre>
+        <section class="block">
+          <div class="label">wire</div>
+          <div class="row"><span>stage</span><b id="r-stage" class="val">—</b></div>
+          <div class="row"><span>age</span><b id="r-age">—</b></div>
+          <div class="row"><span>loop</span><b id="r-loop">—</b></div>
+          <div class="row"><span>mutex</span><b id="r-mutex" class="val">—</b></div>
+          <div class="row"><span>log</span><b id="r-log" class="val">—</b></div>
+        </section>
+
+        <section class="block grow">
+          <div class="label">runs</div>
+          <ol class="runs" id="runs"></ol>
+        </section>
+
+        <section class="block">
+          <div class="label">keys</div>
+          <div class="row"><span>run</span><b>ctrl ↵</b></div>
+          <div class="row"><span>comment</span><b>ctrl /</b></div>
+          <div class="row"><span>save</span><b>ctrl s</b></div>
+        </section>
+      </aside>
+
+      <section class="work">
+        <section class="pane editor">
+          <div class="bar">
+            <div class="bar-left">
+              <span class="tab-name">script.luau</span>
+              <span class="dirty" id="dirty" hidden>unsaved</span>
+            </div>
+            <div class="bar-right">
+              <span id="cursor">Ln 1, Col 1</span>
+              <span id="lines">0 lines</span>
+            </div>
+          </div>
+          <div class="wrap">
+            <div class="gutter" id="gutter"></div>
+            <div class="code-area" id="codeArea">
+              <pre id="hl" aria-hidden="true"></pre>
+              <textarea id="code" wrap="off" spellcheck="false" autocomplete="off"
+                        autocapitalize="off" placeholder="-- ctrl+enter runs"></textarea>
+              <span class="errline" id="errline" hidden></span>
+            </div>
+          </div>
+        </section>
+
+        <div class="split" id="split" role="separator" aria-orientation="horizontal"
+             tabindex="0" aria-label="resize console"><span></span></div>
+
+        <section class="pane console">
+          <div class="bar">
+            <div class="bar-left">
+              <span>output</span>
+              <span class="chip" id="stage">idle</span>
+              <span class="stamp" id="stamp"></span>
+            </div>
+            <div class="bar-right">
+              <label class="toggle"><input type="checkbox" id="noise" /> engine noise</label>
+              <button id="copy" class="ghost">copy</button>
+              <button id="clear" class="ghost">clear</button>
+            </div>
+          </div>
+          <pre id="log"></pre>
+        </section>
       </section>
     </main>
 
-    <footer>
+    <footer class="strip foot">
       <span id="status">ready</span>
-      <span class="spacer"></span>
+      <span class="grow"></span>
       <span id="timing"></span>
     </footer>
 
