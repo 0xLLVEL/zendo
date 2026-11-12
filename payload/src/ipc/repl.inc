@@ -42,9 +42,14 @@ static const ReplEntry kReplTable[] = {
     {'5', "live1", kChunkL1Body, kChunkL1Len},
 };
 
+// Place id the host read from the client's own log, sent as `G` before a chunk.
+// A chunk that lands between a leave and the next join writes into a DataModel
+// the transition is already freeing; this is the number the payload checks
+// before it touches the VM.
+static unsigned long long g_want_place = 0;
+
 inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
-                           unsigned long long L) {
-    static Out o;
+                           unsigned long long L) {    static Out o;
     o.reset();
     o.str("ZEND1 repl L=");
     o.hex(L);
@@ -64,6 +69,9 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     // print has to reach the client's own log, so the global `print` must stay
     // the client's, not our buffering wrapper.
     g_cap_pipe = pipe;
+    // The place the host read from the client's own log. Zero means the host had
+    // nothing to say, and the guard stays fail-open.
+    g_want_place = 0;
     // Nothing else is armed here on purpose. A `d` session must touch the VM
     // exactly once - the wrapper that hands the body to the scheduler. Capture
     // setup and global bindings are raw-only and happen in that branch below.
@@ -129,6 +137,14 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         // client. Only the idle timeout leaves DllMain for good, and that path
         // restores the borrowed thread's saved context on the way out.
         if (cmd[0] == 'q') break;
+        // Place hint: eight bytes, no reply. It has to land before the chunk it
+        // guards, and it must never disturb the session, so silence and
+        // `continue` - a malformed hint leaves the guard fail-open.
+        if (cmd[0] == 'G') {
+            unsigned long long want = 0;
+            if (read_all(a, pipe, &want, 8)) g_want_place = want;
+            continue;
+        }
         if (cmd[0] == 'L' || cmd[0] == 'i' || cmd[0] == 'd') {
             unsigned int want_id = 7;
             if (cmd[0] == 'i') {
@@ -216,6 +232,30 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
                     o.str("wait for the place to finish loading, then Execute\nEND\n");
                     flush_out(a, pipe, o);
                     stage_mark(a, "STALE");
+                    if (swapped) wr64(E2 + 0x70, oldid);
+                    continue;
+                }
+                // Same failure, one step earlier: the script context survived
+                // but it belongs to another place. A transition swaps the
+                // DataModel first and the context later, so this window exists
+                // even when L2 == L. Fail open when the field is zero - a wrong
+                // offset must never brick a working build.
+                unsigned long long dplace = 0, dloaded = 0;
+                read_u64(dm2 + 0x180, &dplace);
+                read_u64(dm2 + 0x588, &dloaded);
+                trace_kv(a, "want", g_want_place);
+                trace_kv(a, "place", dplace);
+                trace_kv(a, "loaded", dloaded);
+                if (g_want_place && dplace && dplace != g_want_place) {
+                    o.str("place mismatch: client log says place ");
+                    o.dec64(g_want_place);
+                    o.str(", DataModel says ");
+                    o.dec64(dplace);
+                    o.str(" loaded=");
+                    o.dec(static_cast<unsigned int>(dloaded & 0xFF));
+                    o.str("\nwait for the join to finish, then Execute\nEND\n");
+                    flush_out(a, pipe, o);
+                    stage_mark(a, "PLACE");
                     if (swapped) wr64(E2 + 0x70, oldid);
                     continue;
                 }

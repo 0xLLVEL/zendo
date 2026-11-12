@@ -710,6 +710,27 @@ fn rebase_error(err: &str, offset: usize, max_line: usize) -> String {
 /// Completion is a log line, not a pipe write: the body finishes on a thread
 /// the payload does not own, so the only signal it can leave without touching
 /// the pipe is `print`. The host watches the client's own CreatorOutput for it.
+/// Fired once per script context, after the run: the only outward sign that this
+/// place is actually serving zendo. The place gate refuses during a transition,
+/// so a notification on screen means a run touched the DataModel under the
+/// place the client logged. The flag lives in the global table, and a place
+/// switch builds a new context with a new one - exactly the right granularity.
+const TOAST_LUA: &str = r#"
+pcall(function()
+	local __znd_g = getfenv(0)
+	if __znd_g.__zendo_loaded == true then return end
+	local __znd_tok, __znd_terr = pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification",
+			{Title = "zendo", Text = "loaded", Duration = 3})
+	end)
+	if __znd_tok then
+		__znd_g.__zendo_loaded = true
+	else
+		print("zendo://toast " .. tostring(__znd_terr))
+	end
+end)
+"#;
+
 pub fn compile_deferred(src: &str) -> Result<Vec<u8>, String> {
     // task.delay, not task.defer. defer enqueues the body and the scheduler can
     // resume it on its own thread while this pcall is still unwinding on ours -
@@ -725,14 +746,68 @@ pub fn compile_deferred(src: &str) -> Result<Vec<u8>, String> {
          end)\n\
          if not __znd_ok then warn(tostring(__znd_err)) end\n\
          print(\"{}\")\n\
+         {}\
          end)\n",
         prelude(),
-        DONE_SENTINEL
+        DONE_SENTINEL,
+        TOAST_LUA
     ))
     .map_err(|e| rebase_error(&e, offset, src.lines().count()))
 }
 
 pub const DONE_SENTINEL: &str = "zendo://done";
+
+/// The place the client last said it joined, read out of its own log text.
+/// A chunk written between `leaveUGCGameInternal` and the next `! Joining game`
+/// lands in a DataModel the transition is already freeing; `Err` means the
+/// newest transition is a leave and nothing has joined since, so injecting now
+/// is exactly the crash this guards against.
+pub fn place_from_log(text: &str) -> Result<Option<u64>, String> {
+    let leave = text.rfind("leaveUGCGameInternal").map(|i| (i, 0u64));
+    let join = text.rfind("! Joining game").and_then(|i| {
+        let rest = &text[i..];
+        let at = rest.find(" place ")? + 7;
+        let digits: String = rest[at..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().ok().map(|id| (i, id))
+    });
+    match (leave, join) {
+        (Some((li, _)), Some((ji, id))) if ji > li => Ok(Some(id)),
+        (Some(_), _) => Err("client left the place and has not joined another yet".into()),
+        _ => Ok(join.map(|(_, id)| id)),
+    }
+}
+
+/// Same, against the newest Player log this machine has. Reads only the tail:
+/// joins and leaves are minutes apart, and the head of a long session log is
+/// tens of megabytes of engine noise.
+pub fn place_hint() -> Result<Option<u64>, String> {
+    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("no LOCALAPPDATA")?)
+        .join("Roblox")
+        .join("logs");
+    let mut best: Option<(std::time::SystemTime, PathBuf, u64)> = None;
+    for entry in std::fs::read_dir(&dir).map_err(|e| format!("read logs: {e}"))? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.contains("_Player_") || name.contains("CrashHandler") || !name.ends_with(".log") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if best.as_ref().map(|(t, _, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, entry.path(), meta.len()));
+        }
+    }
+    let (_, path, len) = best.ok_or("no player log")?;
+    let start = len.saturating_sub(2 * 1024 * 1024);
+    let mut bytes = Vec::new();
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&path).map_err(|e| format!("open log: {e}"))?;
+        f.seek(SeekFrom::Start(start)).map_err(|e| format!("seek log: {e}"))?;
+        f.read_to_end(&mut bytes).map_err(|e| format!("read log: {e}"))?;
+    }
+    place_from_log(&String::from_utf8_lossy(&bytes))
+}
 
 /// Start the injector beside a pipe that is already being served. The payload
 /// hosts a long-lived REPL, so the injector must not wait for DllMain to end.
@@ -865,5 +940,35 @@ mod tests {
         }
         let blob = compile_deferred("print(\"ok\")").expect("clean script compiles");
         assert!(!blob.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::place_from_log;
+
+    const JOIN: &str = "2026-11-12T18:14:44.632Z,16.6,4640,6 [FLog::Output] ! Joining game 'da0f871c-e391-4525-b677-77e605c60a2f' place 123974602339071 at 10.32.8.137\n";
+    const LEAVE: &str = "2026-11-12T18:15:42.765Z,74.7,4640,6 [FLog::Network] leaveUGCGameInternal\n";
+
+    #[test]
+    fn joins_alone_report_the_place() {
+        assert_eq!(place_from_log(JOIN), Ok(Some(123974602339071)));
+    }
+
+    #[test]
+    fn leave_without_a_join_refuses() {
+        assert!(place_from_log(LEAVE).is_err());
+        assert!(place_from_log(&format!("{JOIN}{LEAVE}")).is_err());
+    }
+
+    #[test]
+    fn the_newest_join_wins() {
+        let text = format!("{JOIN}{LEAVE}{JOIN}");
+        assert_eq!(place_from_log(&text), Ok(Some(123974602339071)));
+    }
+
+    #[test]
+    fn an_empty_log_has_no_hint() {
+        assert_eq!(place_from_log(""), Ok(None));
     }
 }

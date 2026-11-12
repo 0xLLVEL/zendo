@@ -377,6 +377,10 @@ pub enum Step<'a> {
     /// and returns at once; the real body runs on the client's scheduler, so the
     /// VM is never entered from two threads at once.
     Defer(&'a [u8]),
+    /// Sent as `G`: the place id the client says it joined. The payload refuses
+    /// a chunk whose DataModel still carries a different place - that is a
+    /// transition in progress, and writing into it corrupts a heap being freed.
+    Place(u64),
 }
 
 /// A connection attempt started by `Pipe::begin_accept`.
@@ -768,6 +772,10 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                         Step::Defer(chunk) => {
                             eprintln!("[pipe] sending deferred chunk {} bytes", chunk.len());
                             send!(b"d", (chunk.len() as u32).to_le_bytes().as_slice(), chunk);
+                        }
+                        Step::Place(id) => {
+                            eprintln!("[pipe] sending place hint {id}");
+                            send!(b"G", id.to_le_bytes().as_slice());
                         }
                     }
                     idx += 1;

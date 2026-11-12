@@ -25,6 +25,16 @@ struct Out {
         while (k) ch(tmp[--k]);
     }
     void nl() { ch('\n'); }
+    void dec64(unsigned long long v) {
+        char tmp[20];
+        int k = 0;
+        if (!v) tmp[k++] = '0';
+        while (v) {
+            tmp[k++] = static_cast<char>('0' + v % 10);
+            v /= 10;
+        }
+        while (k) ch(tmp[--k]);
+    }
 };
 
 inline void dump_state(Out& o, unsigned long long L) {

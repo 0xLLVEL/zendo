@@ -265,13 +265,23 @@ fn tail(snap: Option<(PathBuf, u64)>) -> String {
     out
 }
 
-/// Drops the completion line the deferred wrapper prints. The client writes it
-/// into CreatorOutput like any other script line, and it is protocol, not
-/// script output.
+/// The place the client last said it joined, read from its own log. A chunk
+/// written between `leaveUGCGameInternal` and the next `! Joining game` lands in
+/// a DataModel that is being torn down, and the deferred body then allocates
+/// into a heap that is already free - that is the crash on a place switch.
+/// `Err` means "do not inject at all right now": the newest transition is a
+/// leave and nothing has joined since.
+fn place_hint() -> Result<Option<u64>, String> {
+    zendo_core::place_hint()
+}
+
+/// Drops the protocol lines the deferred wrapper prints - the completion
+/// sentinel and the toast diagnostic. The client writes them into CreatorOutput
+/// like any script line, and they are not script output.
 fn strip_sentinel(text: &str) -> String {
     let mut out = String::new();
     for line in text.split_inclusive('\n') {
-        if line.trim() == zendo_core::DONE_SENTINEL {
+        if line.trim().starts_with("zendo://") {
             continue;
         }
         out.push_str(line);
@@ -361,6 +371,18 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
         t_compile.elapsed().as_millis()
     ));
 
+    // Half a second after `Joining game` the client is still building the new
+    // DataModel. Injecting there is what killed it on every place switch: the
+    // deferred body allocated inside a heap the transition was already freeing.
+    // If the newest transition is a leave, refuse before spending an injection.
+    match place_hint() {
+        Ok(hint) => runlog(&format!("place hint={hint:?}")),
+        Err(why) => {
+            runlog(&format!("place refused: {why}"));
+            return Err(why);
+        }
+    }
+
     let server =
         pipe::Pipe::create(r"\\.\pipe\zendo-dev").map_err(|e| format!("pipe: {e}"))?;
 
@@ -410,7 +432,15 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     let _ = app.emit("zendo://stage", "running");
 
     let buf = Arc::new(Mutex::new(Vec::new()));
-    let steps = steps_of(&spec, &chunk)?;
+    let mut steps = steps_of(&spec, &chunk)?;
+    // Re-read after the injection wait: the join that was in flight when this
+    // ran may have completed, and the payload compares this id against the
+    // DataModel it actually finds before touching the VM.
+    match place_hint() {
+        Ok(Some(id)) => steps.insert(0, pipe::Step::Place(id)),
+        Ok(None) => {}
+        Err(why) => return Err(why),
+    }
     let tap = Tap { app: app.clone(), buf: buf.clone() };
 
     // print/warn never reach the pipe: the client writes them to its own
