@@ -144,19 +144,24 @@ therefore borrows a thread:
 - suspend, read context, redirect RIP to a stub in the payload, resume,
 - the stub runs the entry point and restores the original context.
 
-A named mutex (`zendo-live-0x<pid>`) is the **one-payload claim**, scoped to the
-client process so two Roblox windows on one desktop stay independent. It is
-created unowned and nothing ever waits on it; the handle exists so that the
-*name* exists, and `CreateMutexA` returning `ERROR_ALREADY_EXISTS` is what tells
-a second image it has no session to serve — it parks and touches nothing. The
-claim handle is closed when the seek loop ends, so the name dies with the
-session and the next injection gets a clean slot. Ownership was tried and
-dropped: a thread that parks forever kept the mutex owned, and every later
-inject waited for a release that was never coming.
+There is **no one-payload claim**. Three versions of a named mutex were tried
+and each one deadlocked the client in the same way: a mutex handle is owned by
+the *process*, so when the client kills or suspends the payload thread the name
+survives with nobody behind it. The next injection read "a payload is already
+here", parked, and the run had no session to talk to. Measured on a live client:
+the seek loop stopped four seconds after a clean session (`work/loop.bin` frozen)
+while the mutex handle was still open.
 
-The host does not read the mutex. Its liveness oracle is the mtime of
-`work/loop.bin`, which the seek loop rewrites every second: a fresh stamp means
-a payload thread is hunting for a server and will reach the next pipe on its own.
+The pipe is the semaphore instead. One server instance accepts one payload, so
+two images can never be inside a session at the same time; a second image's
+`CreateFile` blocks until that instance is gone. A resident payload is still the
+fast path — a live seek loop answers a new server in under a second — but it is
+not required, and a dead one cannot block a later injection.
+
+The host's only liveness signal is the mtime of `work/loop.bin`, which the seek
+loop rewrites every second. It is a hint for how long to wait (1.5 s) and never
+a gate: the stamp freezes when the client kills the thread, so the host injects
+after that window regardless.
 
 ### 2. Control-flow guard
 
@@ -653,13 +658,12 @@ layout measurements behind items 30–36 live in `docs/re.md`.
 
 These exist because each one was learned the hard way.
 
-1. **One payload image per client.** The per-process `zendo-live-0x<pid>` name is
-   the claim; a second image gets `ERROR_ALREADY_EXISTS` and parks without a
-   session. Reusing the resident payload is the design — re-injecting into a
-   client that already has one is what used to put two owners inside one
-   `lua_State` and freeze it.
-   The mirror rule: the claim handle is closed when the seek loop ends, so a
-   payload that parked must never be counted as alive.
+1. **The pipe decides who serves.** One server instance accepts one payload, so
+   two images cannot be inside a session at once, and no mutex claim is involved
+   — a claim outlived the thread the client killed and deadlocked every later
+   injection. A resident payload is a speed optimization, never a requirement.
+   The corollary: `work/loop.bin` must never be trusted as proof of life beyond
+   the next inject decision.
 2. **Kill the client after a crash.** An elevated `taskkill` — a medium shell
    cannot touch it. A client that lost its scheduler has one thread and no
    window and cannot be terminated at all; only a reboot clears it.
@@ -685,7 +689,7 @@ These exist because each one was learned the hard way.
 | `read()` returns nothing / wrong bytes | buffer ≤ 40 bytes (interned string) | use `string.rep("A", 48)` or larger |
 | Crash right after `uget` on a reference capture | REF tag compared against decimal 10 instead of `0x10` | compare against `0x10` |
 | `setupvalue` returns `nil` on a writable page | hardcoded `VirtualProtect(start, 0x2000, ...)` | use `api_write`, which sizes the range from the page |
-| Client dies minutes after several Executes | a second payload image served the same `lua_State` | fixed in the payload: `zendo-live` claim returns `222` on `ERROR_ALREADY_EXISTS`, duplicate parks without a session |
+| Second Execute hangs on "running" | resident payload thread was killed by the client, and a mutex claim outlived it, so the fresh image parked and nothing served | fixed: no claim, pipe is the semaphore, host injects after 1.5 s and fails in 8 s instead of 30 |
 | Load-config probe leaves the client gone | session landed on a thread the protector already saw | relaunch before the next probe |
 
 ---

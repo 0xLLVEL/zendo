@@ -1301,11 +1301,13 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     return 0;
 }
 
-// One injection, many sessions. The session thread waits for the next pipe
-// server instead of ending after one chunk, so the UI can push another script
-// without re-mapping the image. Ten minutes with no server at all and the
-// thread drops the live name and parks, so a dead UI cannot leave a payload
-// that blocks the next injection forever.
+// One injection, as many sessions as the image survives. The session thread
+// waits for the next pipe server instead of ending after one chunk, so a
+// second Execute can reuse the image instead of mapping another one. It is a
+// best-effort reuse: this client kills or suspends foreign threads within
+// seconds of DllMain returning (measured: loop.bin frozen 4 s after a clean
+// session while the process kept running), and when that happens the host
+// injects again, which is safe because the pipe admits one client at a time.
 inline DWORD run_repl() {
     DWORD st = resolve_api();
     if (st) {
@@ -1315,12 +1317,11 @@ inline DWORD run_repl() {
     Api& a = api();
     stage_mark(a, "E1-API");
     trace_tag(a, "enter");
-    // The single-instance claim already happened in beacon(): an image that did
-    // not create the name returned 222 and never reaches this line. The two
-    // earlier attempts that hurt both parked the borrowed client thread while
-    // asking; this claim parks nothing and rejects nothing the host needs - a
-    // duplicate image has no session to serve, and the resident one keeps its
-    // pipe. The host's oracle for "someone is alive" is still loop.bin.
+    // No single-instance claim. Every version of it deadlocked the same way:
+    // the claim outlives the thread the client kills. The pipe is the
+    // semaphore - one server instance accepts one payload, so two images can
+    // never be inside a session at once - and the host's liveness oracle for
+    // a parked payload is still loop.bin.
     stage_mark(a, "E2-OWN");
 
     Module exe = find_module(fnv1a_w(L"RobloxPlayerBeta.exe"));
@@ -1391,12 +1392,11 @@ inline DWORD run_repl() {
             // writes it, so a stale stamp means the thread is gone.
             if ((idle % 20) == 0) loop_mark(a, ++g_seek_n);
             if ((idle % 100) == 0) trace_tag(a, "seek");
-            // Ten minutes. Every Execute should reuse this image; mapping a
-            // second one into the same lua_State is what the client does not
-            // survive, so the seek loop stays alive across any realistic gap
-            // between runs instead of dying ten seconds after the last one.
-            // When it does end, release_live() drops the name and the next
-            // injection starts from a clean slot.
+            // Ten minutes. Every Execute should reuse this image when it can;
+            // mapping a second one is safe now that the pipe is the only
+            // admission, but a fresh image is still more expensive than a
+            // resident one. When the loop does end the thread parks with no
+            // claim to leak.
             if (idle > 12000) {
                 // Leave DllMain: the stub restores the borrowed thread's
                 // original context, so nothing is left parked inside this
@@ -1426,10 +1426,9 @@ inline DWORD run_repl() {
             stage_mark(a, "EXIT-DETACH");
             return 111;
         }
-        // Stay here. This thread is the only payload in the client; the next
-        // Execute has to connect to it, not map a second image on top. Three
-        // images in one client is what froze it - one image serving three runs
-        // is the design.
+        // Stay here while this thread survives. The next Execute connects to
+        // it if it can, and injects a fresh image if this one has been killed
+        // in the meantime; the pipe lets exactly one of them serve.
         if (a.Sleep) a.Sleep(150);
         loop_mark(a, ++g_loop_n);
     }

@@ -83,6 +83,7 @@ extern "C" BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID reserved) {
         unsigned long long start =
             zendo::thread_trampoline(reinterpret_cast<void*>(&zendo::session_thread));
         zendo::stage_mark(zendo::api(), start ? "D2-TRAMP" : "D2-NOTRAMP");
+        zendo::trace_tag(zendo::api(), start ? "D2-TRAMP" : "D2-NOTRAMP");
         DWORD tid = 0;
         HANDLE worker = (start && zendo::api().CreateThread)
             ? zendo::api().CreateThread(nullptr, 0,
@@ -90,15 +91,18 @@ extern "C" BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID reserved) {
             : nullptr;
         zendo::stage_mark(zendo::api(), worker ? "D3-OK" : "D3-NULL");
         if (worker) {
+            zendo::trace_tag(zendo::api(), "D3-OK");
             if (zendo::api().CloseHandle) zendo::api().CloseHandle(worker);
             return TRUE;
         }
         // No worker means no session; run it inline rather than lose the
-        // injection. The stub reloads the context once this returns. The name
-        // is dropped here too: the image is never unmapped, so a handle left
-        // open would block every later injection from claiming the slot.
+        // injection. The stub reloads the context once this returns. This is
+        // the path that costs the client a thread for the length of a session,
+        // so it is traced separately from a normal one: a run of these in the
+        // per-image files says thread creation is being refused, not that the
+        // pipe is broken.
+        zendo::trace_tag(zendo::api(), "D3-NULL");
         zendo::beacon();
-        zendo::release_live();
     }
     return TRUE;
 }

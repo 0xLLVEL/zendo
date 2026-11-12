@@ -125,11 +125,6 @@ static int g_bind_ready = 0;
 // the process in a state the anti-cheat refuses to terminate - the window dies
 // but the pid survives, and only a reboot clears it.
 static int g_leave = 0;
-// The `zendo-live` mutex, owned by whichever thread is serving the session.
-// Hoisted out of beacon() so the session thread can hand the ownership back
-// before it parks: a parked thread that still owns it would read as a live
-// payload forever and every later injection would be skipped.
-static HANDLE g_live_mutex = nullptr;
 // Counts completed sessions. Written to work/loop.bin after each one, which is
 // how "the seek loop is alive" is proven instead of assumed.
 static unsigned int g_loop_n = 0;

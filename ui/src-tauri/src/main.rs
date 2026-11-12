@@ -309,11 +309,13 @@ fn runlog(msg: &str) {
     }
 }
 
-/// True while a payload thread is still hunting for a server. The seek loop
-/// rewrites `work/loop.bin` once a second, so a fresh stamp means a payload is
-/// parked in the client and will reach the next pipe on its own. The mutex
-/// probe answered "dead" against a live payload, which is what pushed the host
-/// into mapping a second image.
+/// True while `work/loop.bin` is fresh. The seek loop rewrites it once a
+/// second, so a fresh stamp is evidence that a payload thread is hunting for a
+/// server right now. It is a hint, never a gate: the stamp freezes the moment
+/// the client kills or suspends that thread, and a stale stamp that still reads
+/// "fresh" cost four seconds of dead air on the second Execute. Nothing is
+/// decided on it alone - if the resident does not connect in 1.5 s, injecting
+/// is the next step either way.
 fn payload_seeking() -> bool {
     std::fs::metadata(r"D:\zendo\work\loop.bin")
         .and_then(|m| m.modified())
@@ -366,23 +368,25 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     // only lasting record is the log line the client writes itself.
     let log_start = player_log();
 
-    // A resident payload polls this pipe between sessions, so it connects within
-    // one poll period. A cold client has nothing to poll with. The old code
-    // waited 3 s, then another 1.5 s, before injecting - 4.5 s of dead air that
-    // was most of the gap between Execute and the first output line.
+    // A resident payload polls this pipe every 50 ms, so a live one answers
+    // almost immediately. 1.5 s is enough for the case that actually needs it:
+    // the thread was inside a session when this one started. Anything longer
+    // just makes the user wait while the resident is dead - and dead residents
+    // are the normal outcome here, because this client kills foreign threads a
+    // few seconds after DllMain returns. Injection is safe now: the pipe
+    // instance admits one client, so a fresh image cannot overlap a session.
     let seeking = payload_seeking();
-    let mut connected = if seeking {
-        pending.wait(600).map_err(|e| format!("accept: {e}"))?
-    } else {
-        false
-    };
-    if !connected && seeking {
-        // A live payload can be mid-exec and miss a single poll. One more window
-        // is cheaper than mapping a second image into a client that already has
-        // one waiting.
-        connected = matches!(pending.wait(1500), Ok(true));
+    let mut connected = false;
+    if seeking {
+        let until = Instant::now() + std::time::Duration::from_millis(1500);
+        while Instant::now() < until {
+            if pending.wait(250).map_err(|e| format!("accept: {e}"))? {
+                connected = true;
+                break;
+            }
+        }
     }
-    runlog(&format!("accept first={connected} seeking={seeking}"));
+    runlog(&format!("accept connected={connected} seeking={seeking}"));
     if !connected {
         let _ = app.emit("zendo://stage", "injecting");
         match zendo_core::spawn_inject(&["--hijack"]) {
@@ -390,10 +394,12 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
             Err(e) => return Err(e),
         }
         runlog("injected");
-        match pending.wait(30_000) {
-            Ok(true) => {}
-            Ok(false) => return Err("payload never connected".into()),
-            Err(e) => return Err(format!("accept: {e}")),
+        // A fresh image connects in about a second. Eight seconds is the
+        // difference between "slow" and "will never answer", and a UI that
+        // waits thirty is indistinguishable from a hung one.
+        connected = pending.wait(8_000).map_err(|e| format!("accept: {e}"))?;
+        if !connected {
+            return Err("payload injected but no session connected within 8s".into());
         }
     }
     runlog("attached");
