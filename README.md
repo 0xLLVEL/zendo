@@ -144,14 +144,15 @@ therefore borrows a thread:
 - suspend, read context, redirect RIP to a stub in the payload, resume,
 - the stub runs the entry point and restores the original context.
 
-A named mutex (`zendo-live`) is the **one-payload claim**. It is created unowned
-and nothing ever waits on it; the handle exists so that the *name* exists, and
-`CreateMutexA` returning `ERROR_ALREADY_EXISTS` is what tells a second image it
-has no session to serve — it parks and touches nothing. The claim handle is
-closed when the seek loop ends, so the name dies with the session and the next
-injection gets a clean slot. Ownership was tried and dropped: a thread that
-parks forever kept the mutex owned, and every later inject waited for a release
-that was never coming.
+A named mutex (`zendo-live-0x<pid>`) is the **one-payload claim**, scoped to the
+client process so two Roblox windows on one desktop stay independent. It is
+created unowned and nothing ever waits on it; the handle exists so that the
+*name* exists, and `CreateMutexA` returning `ERROR_ALREADY_EXISTS` is what tells
+a second image it has no session to serve — it parks and touches nothing. The
+claim handle is closed when the seek loop ends, so the name dies with the
+session and the next injection gets a clean slot. Ownership was tried and
+dropped: a thread that parks forever kept the mutex owned, and every later
+inject waited for a release that was never coming.
 
 The host does not read the mutex. Its liveness oracle is the mtime of
 `work/loop.bin`, which the seek loop rewrites every second: a fresh stamp means
@@ -652,10 +653,11 @@ layout measurements behind items 30–36 live in `docs/re.md`.
 
 These exist because each one was learned the hard way.
 
-1. **One payload image per client.** The `zendo-live` name is the claim; a second
-   image gets `ERROR_ALREADY_EXISTS` and parks without a session. Reusing the
-   resident payload is the design — re-injecting into a client that already has
-   one is what used to put two owners inside one `lua_State` and freeze it.
+1. **One payload image per client.** The per-process `zendo-live-0x<pid>` name is
+   the claim; a second image gets `ERROR_ALREADY_EXISTS` and parks without a
+   session. Reusing the resident payload is the design — re-injecting into a
+   client that already has one is what used to put two owners inside one
+   `lua_State` and freeze it.
    The mirror rule: the claim handle is closed when the seek loop ends, so a
    payload that parked must never be counted as alive.
 2. **Kill the client after a crash.** An elevated `taskkill` — a medium shell

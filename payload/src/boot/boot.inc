@@ -13,7 +13,18 @@ inline DWORD beacon() {
     if (!api().CreateMutexA) resolve_api();
     DWORD claimed = 0;
     if (!g_live_mutex && api().CreateMutexA) {
-        g_live_mutex = api().CreateMutexA(nullptr, FALSE, "zendo-live");
+        // The claim is per client process, not per Windows session: two Roblox
+        // windows on one desktop must each be injectable, and a session-wide
+        // name would turn the second window's payload into a parked duplicate.
+        // ClientId.UniqueProcess is TEB+0x40; the thread id next to it is
+        // already used for the trace names.
+        static char live_name[40];
+        char* np = live_name;
+        const char* pre = "zendo-live-";
+        while (*pre) *np++ = *pre++;
+        np = append_hex(np, __readgsqword(0x40));
+        *np = 0;
+        g_live_mutex = api().CreateMutexA(nullptr, FALSE, live_name);
         // The handle alone says nothing: CreateMutexA opens the existing object
         // when another image already holds the name. ERROR_ALREADY_EXISTS is the
         // one-payload claim. A second image that runs a session is what froze
