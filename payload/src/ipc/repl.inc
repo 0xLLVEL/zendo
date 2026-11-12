@@ -1303,9 +1303,9 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
 
 // One injection, many sessions. The session thread waits for the next pipe
 // server instead of ending after one chunk, so the UI can push another script
-// without re-mapping the image. Twenty minutes with no server at all and the
-// thread hands the live mutex back and parks, so a dead UI cannot leave a
-// payload that the host mistakes for a live one.
+// without re-mapping the image. Ten minutes with no server at all and the
+// thread drops the live name and parks, so a dead UI cannot leave a payload
+// that blocks the next injection forever.
 inline DWORD run_repl() {
     DWORD st = resolve_api();
     if (st) {
@@ -1315,10 +1315,12 @@ inline DWORD run_repl() {
     Api& a = api();
     stage_mark(a, "E1-API");
     trace_tag(a, "enter");
-    // No single-instance guard here. A mutex was tried twice and both versions
-    // hurt: the first rejected the second injection outright, the second parked
-    // the borrowed thread for seconds and the client dropped its websocket. The
-    // pipe session is the only authority on who is live, so nothing else talks.
+    // The single-instance claim already happened in beacon(): an image that did
+    // not create the name returned 222 and never reaches this line. The two
+    // earlier attempts that hurt both parked the borrowed client thread while
+    // asking; this claim parks nothing and rejects nothing the host needs - a
+    // duplicate image has no session to serve, and the resident one keeps its
+    // pipe. The host's oracle for "someone is alive" is still loop.bin.
     stage_mark(a, "E2-OWN");
 
     Module exe = find_module(fnv1a_w(L"RobloxPlayerBeta.exe"));
@@ -1389,13 +1391,13 @@ inline DWORD run_repl() {
             // writes it, so a stale stamp means the thread is gone.
             if ((idle % 20) == 0) loop_mark(a, ++g_seek_n);
             if ((idle % 100) == 0) trace_tag(a, "seek");
-            // Ten seconds, not twenty minutes. The session now runs on the
-            // borrowed client thread, so this loop is the thread's whole
-            // lifetime: after one run the thread has to go back to its wait
-            // before anything scans for foreign code. A long-lived seek loop
-            // was the previous design and it lost the thread seconds after
-            // every session anyway.
-            if (idle > 200) {
+            // Ten minutes. Every Execute should reuse this image; mapping a
+            // second one into the same lua_State is what the client does not
+            // survive, so the seek loop stays alive across any realistic gap
+            // between runs instead of dying ten seconds after the last one.
+            // When it does end, release_live() drops the name and the next
+            // injection starts from a clean slot.
+            if (idle > 12000) {
                 // Leave DllMain: the stub restores the borrowed thread's
                 // original context, so nothing is left parked inside this
                 // client for a watchdog to find.

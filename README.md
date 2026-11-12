@@ -144,12 +144,18 @@ therefore borrows a thread:
 - suspend, read context, redirect RIP to a stub in the payload, resume,
 - the stub runs the entry point and restores the original context.
 
-A named mutex (`zendo-live`) exists, but it is created **unowned** and nothing
-ever waits on it. Liveness is the mtime of `work/loop.bin`, which the seek loop
-rewrites every second: a fresh stamp means a payload thread is parked in the
-client and will reach the next pipe on its own. Ownership was tried and dropped —
-a session that ends cleanly leaves its thread alive, so a dead image read as a
-live owner and the next injection either waited forever or mapped a second one.
+A named mutex (`zendo-live`) is the **one-payload claim**. It is created unowned
+and nothing ever waits on it; the handle exists so that the *name* exists, and
+`CreateMutexA` returning `ERROR_ALREADY_EXISTS` is what tells a second image it
+has no session to serve — it parks and touches nothing. The claim handle is
+closed when the seek loop ends, so the name dies with the session and the next
+injection gets a clean slot. Ownership was tried and dropped: a thread that
+parks forever kept the mutex owned, and every later inject waited for a release
+that was never coming.
+
+The host does not read the mutex. Its liveness oracle is the mtime of
+`work/loop.bin`, which the seek loop rewrites every second: a fresh stamp means
+a payload thread is hunting for a server and will reach the next pipe on its own.
 
 ### 2. Control-flow guard
 
@@ -646,11 +652,15 @@ layout measurements behind items 30–36 live in `docs/re.md`.
 
 These exist because each one was learned the hard way.
 
-1. **One client per run.** Reusing a client across many injections accumulates
-   payload images and ends with a crash *after* the script prints `done`. The
-   crash is the accumulation, not the script.
-2. **Kill the client after every run.** An elevated `taskkill` — a medium shell
-   cannot touch it.
+1. **One payload image per client.** The `zendo-live` name is the claim; a second
+   image gets `ERROR_ALREADY_EXISTS` and parks without a session. Reusing the
+   resident payload is the design — re-injecting into a client that already has
+   one is what used to put two owners inside one `lua_State` and freeze it.
+   The mirror rule: the claim handle is closed when the seek loop ends, so a
+   payload that parked must never be counted as alive.
+2. **Kill the client after a crash.** An elevated `taskkill` — a medium shell
+   cannot touch it. A client that lost its scheduler has one thread and no
+   window and cannot be terminated at all; only a reboot clears it.
 3. **Never re-run the linear image scan** (stage `x`). It died mid-walk twice,
    leaving the process gone. The load config names the same target without
    touching a page.
@@ -673,7 +683,7 @@ These exist because each one was learned the hard way.
 | `read()` returns nothing / wrong bytes | buffer ≤ 40 bytes (interned string) | use `string.rep("A", 48)` or larger |
 | Crash right after `uget` on a reference capture | REF tag compared against decimal 10 instead of `0x10` | compare against `0x10` |
 | `setupvalue` returns `nil` on a writable page | hardcoded `VirtualProtect(start, 0x2000, ...)` | use `api_write`, which sizes the range from the page |
-| Client dies minutes after a run | several payloads mapped into one process | relaunch the client per run |
+| Client dies minutes after several Executes | a second payload image served the same `lua_State` | fixed in the payload: `zendo-live` claim returns `222` on `ERROR_ALREADY_EXISTS`, duplicate parks without a session |
 | Load-config probe leaves the client gone | session landed on a thread the protector already saw | relaunch before the next probe |
 
 ---

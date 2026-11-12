@@ -1,22 +1,29 @@
 inline DWORD beacon() {
     g_veh_tid = __readgsqword(0x48);
-    // Claim the one-payload slot. Nothing else in the image created this
-    // mutex, which is why every run of the executor read "no session": the
-    // host was asking a question nobody had answered. The handle is never
-    // released on purpose - owning it for the life of the thread is what says
-    // "a payload is parked here". The kernel abandons it when this thread
-    // dies, so a dead payload reads as no session instead of blocking injects.
+    // Claim the one-payload slot. Existence of the name - not ownership - is
+    // the claim: the handle is created unowned, nothing ever waits on it, and
+    // ERROR_ALREADY_EXISTS is what a second image sees. The kernel keeps the
+    // name alive only while a handle is open, so release_live() closes it the
+    // moment the seek loop ends and the next injection can claim the slot
+    // again. An owned mutex was tried and abandoned: it stayed owned by a
+    // thread that parks forever, so every later inject waited on a release
+    // that was never coming.
     //
-    // The mutex is created unowned and never waited on: an owned handle is
-    // abandoned only when its thread dies, and a session that ends cleanly
-    // leaves the thread alive - the next image would then wait forever on a
-    // mutex nobody is going to release. Ownership is not a liveness signal the
-    // host needs; the heartbeat file is.
+    // The host does not read this mutex. Its oracle is the loop.bin heartbeat.
     if (!api().CreateMutexA) resolve_api();
+    DWORD claimed = 0;
     if (!g_live_mutex && api().CreateMutexA) {
         g_live_mutex = api().CreateMutexA(nullptr, FALSE, "zendo-live");
+        // The handle alone says nothing: CreateMutexA opens the existing object
+        // when another image already holds the name. ERROR_ALREADY_EXISTS is the
+        // one-payload claim. A second image that runs a session is what froze
+        // this client - three Executes more than ten seconds apart each mapped
+        // a fresh image into the same lua_State, and the VM does not survive
+        // two owners. A duplicate becomes a parked thread and nothing else.
+        if (api().GetLastError) claimed = api().GetLastError();
     }
     mutex_diag(api(), g_live_mutex);
+    if (claimed == ERROR_ALREADY_EXISTS) return 222;
 #if ZENDO_STAGE == 65
     return 111;
 #elif ZENDO_STAGE == 64
@@ -227,9 +234,10 @@ inline DWORD beacon() {
 // TerminateProcess to give up.
 static unsigned long long g_restore_ctx = 0;
 
-// The handle is created unowned, so this only exists for symmetry: a session
-// that ends cleanly must not leave the next image staring at a mutex nobody
-// owns. Nothing waits on it, nothing parks.
+// Drops the name. The mutex is created unowned and never waited on, so closing
+// the last handle is the whole protocol: while one image holds a handle, every
+// later injection reads ERROR_ALREADY_EXISTS and parks; once the holder leaves
+// the seek loop, the next injection gets the slot.
 inline void release_live() {
     if (g_live_mutex && api().CloseHandle) {
         api().CloseHandle(g_live_mutex);
@@ -253,22 +261,21 @@ inline void leave_thread() {
 // the borrowed client thread never returned to its wait; here the client gets
 // its thread back before the first pipe is even opened.
 //
-// When the seek loop ends (twenty minutes without a server, or an explicit
-// detach) the mutex is handed back and the thread parks instead of exiting.
+// When the seek loop ends (ten minutes without a server, or an explicit
+// detach) the name is handed back and the thread parks instead of exiting.
 // Exiting would run the loader's thread-detach path, which this client has
 // already killed threads for (STATUS_BAD_TLS_INDEX); a parked thread costs one
-// stack and holds nothing, and because the mutex is free the host reads "no
-// session" and injects cleanly next time.
+// stack and holds nothing. release_live() closes the handle first, which is
+// what lets the next injection claim the slot instead of finding an orphaned
+// name that no session can ever serve.
 inline DWORD WINAPI session_thread(void*) {
     DWORD code = beacon();
     Api& a = api();
-    // A duplicate image parks without releasing anything: it never owned the
-    // mutex, never installed a hook, and must not wake up to serve a session.
-    if (code == 222) {
-        if (a.Sleep) a.Sleep(0x7fffffff);
-        return code;
-    }
-    if (g_live_mutex && a.ReleaseMutex) a.ReleaseMutex(g_live_mutex);
+    // Both outcomes close the handle, for different reasons. A duplicate only
+    // ever held a second reference to the owner's mutex; leaving it open would
+    // keep the name alive after the owner leaves. The owner gives the name up
+    // here because its seek loop is over. Then the thread parks either way.
+    release_live();
     if (a.Sleep) a.Sleep(0x7fffffff);
     return code;
 }

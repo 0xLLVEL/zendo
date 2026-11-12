@@ -94,8 +94,11 @@ extern "C" BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID reserved) {
             return TRUE;
         }
         // No worker means no session; run it inline rather than lose the
-        // injection. The stub reloads the context once this returns.
+        // injection. The stub reloads the context once this returns. The name
+        // is dropped here too: the image is never unmapped, so a handle left
+        // open would block every later injection from claiming the slot.
         zendo::beacon();
+        zendo::release_live();
     }
     return TRUE;
 }
