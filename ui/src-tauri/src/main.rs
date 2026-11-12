@@ -330,7 +330,22 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     // VM is never entered from the payload thread while the client runs it. A
     // raw chunk here is what made the client stutter and then freeze.
     let t_compile = Instant::now();
-    let chunk = zendo_core::compile_deferred(&source)?;
+    let chunk = match zendo_core::compile_deferred(&source) {
+        Ok(c) => c,
+        Err(e) => {
+            // Without this line a compile failure left no trace anywhere: the
+            // console showed the message and the log jumped from nothing to
+            // nothing, so there was no way to tell a typo from a broken
+            // wrapper after the fact.
+            runlog(&format!(
+                "compile failed src={} ms={} err={}",
+                source.len(),
+                t_compile.elapsed().as_millis(),
+                e.replace('\n', " | ")
+            ));
+            return Err(e);
+        }
+    };
     runlog(&format!(
         "start src={} chunk={} spec={} compile={}ms",
         source.len(),

@@ -633,8 +633,17 @@ pub fn build(src: &Path) -> Result<Vec<u8>, String> {
 /// Compile Luau source text with the same offline pipeline `build` uses. This is
 /// the other half of `zendo:loadstring`: the client has no compiler, so every
 /// live loadstring call lands here while the script is waiting for it.
+///
+/// The scratch name carries a counter, not just the pid. The pipe driver
+/// compiles a live `loadstring` while a run is still holding its own scratch
+/// file, and both landed on `zendo-ls-<pid>.luau`: the second write truncated
+/// the first, and the compiler reported whatever survived. Two compiles in one
+/// process have to be two files.
 pub fn compile_str(src: &str) -> Result<Vec<u8>, String> {
-    let tmp = std::env::temp_dir().join(format!("zendo-ls-{}.luau", std::process::id()));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SCRATCH: AtomicU64 = AtomicU64::new(0);
+    let n = SCRATCH.fetch_add(1, Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("zendo-ls-{}-{n}.luau", std::process::id()));
     std::fs::write(&tmp, src).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     let blob = compile(&tmp);
     let _ = std::fs::remove_file(&tmp);
@@ -649,6 +658,47 @@ pub fn compile_str(src: &str) -> Result<Vec<u8>, String> {
 /// would change what it returns.
 pub fn compile_script(src: &str) -> Result<Vec<u8>, String> {
     compile_str(&format!("{}\n{}", prelude(), src))
+}
+
+/// Rewrite a compiler error so the position means the script, not the scratch
+/// file. `luau-compile` prints `<temp path>(<line>,<col>): ...` where `<line>`
+/// counts the whole deferred wrapper — a script error on its first line is
+/// reported at 524, which points at nothing the person at the editor wrote.
+/// The offset is exactly what `compile_deferred` prepends: the prelude plus the
+/// two wrapper lines. Anything at or before that offset is a prelude error and
+/// keeps its original text; anything after is clamped to the source's last line,
+/// which is where "expected 'end'" belongs.
+fn rebase_error(err: &str, offset: usize, max_line: usize) -> String {
+    // The path itself can contain a paren, so the position is the first `(`
+    // whose body is `digits,digits)`. Matching the shape, not the first paren,
+    // is what keeps a directory named "Program Files (x86)" intact.
+    let mut position = None;
+    for (open, _) in err.match_indices('(') {
+        let Some(comma_off) = err[open..].find(',') else { continue };
+        let comma = open + comma_off;
+        let Some(close_off) = err[comma..].find(')') else { continue };
+        let close = comma + close_off;
+        if comma == open + 1 || !err[open + 1..comma].bytes().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if !err[comma + 1..close].bytes().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        position = Some((open, comma, close));
+        break;
+    }
+    let Some((open, comma, close)) = position else { return err.to_string() };
+    let Ok(line) = err[open + 1..comma].parse::<usize>() else {
+        return err.to_string();
+    };
+    if line <= offset {
+        return err.to_string();
+    }
+    // Past the source's last line is the wrapper's own tail (`end)`, the
+    // sentinel print). Those belong to the script's last line: an unclosed
+    // block is reported there, not one line below the editor's content.
+    let mapped = (line - offset).min(max_line.max(1));
+    format!("zendo.luau({},{}){}", mapped, &err[comma + 1..close], &err[close + 1..])
 }
 
 /// Compile a script whose body is handed to `task.defer`. The payload only runs
@@ -666,6 +716,7 @@ pub fn compile_deferred(src: &str) -> Result<Vec<u8>, String> {
     // two threads inside one lua_State for a few microseconds, and that is the
     // client dying a second later with no script output. A 50 ms delay puts the
     // first resume well after this call has left the VM.
+    let offset = prelude().lines().count() + 2;
     compile_str(&format!(
         "{}\
          task.delay(0.05, function()\n\
@@ -678,6 +729,7 @@ pub fn compile_deferred(src: &str) -> Result<Vec<u8>, String> {
         prelude(),
         DONE_SENTINEL
     ))
+    .map_err(|e| rebase_error(&e, offset, src.lines().count()))
 }
 
 pub const DONE_SENTINEL: &str = "zendo://done";
@@ -727,4 +779,91 @@ pub fn inject_blocking(extra: &[&str]) -> Result<std::process::Output, String> {
     spawn_inject(extra)?
         .wait_with_output()
         .map_err(|e| format!("injector wait: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact offset the wrapper produces: 521-line prelude + 2 wrapper
+    /// lines. If the prelude grows, this test fails instead of the mapping
+    /// silently pointing one line off.
+    const OFFSET: usize = 523;
+
+    #[test]
+    fn offset_matches_wrapper_shape() {
+        assert_eq!(prelude().lines().count() + 2, OFFSET);
+    }
+
+    #[test]
+    fn first_source_line_maps_to_one() {
+        let err = r"D:\Temp\zendo-ls-14828.luau(524,1): SyntaxError: Incomplete statement: expected assignment or a function call";
+        assert_eq!(
+            rebase_error(err, OFFSET, 3),
+            "zendo.luau(1,1): SyntaxError: Incomplete statement: expected assignment or a function call"
+        );
+    }
+
+    #[test]
+    fn later_source_line_keeps_its_offset() {
+        let err = "C:/Temp/zendo-ls-1.luau(529,7): TypeError: something";
+        assert_eq!(rebase_error(err, OFFSET, 20), "zendo.luau(6,7): TypeError: something");
+    }
+
+    #[test]
+    fn prelude_errors_are_untouched() {
+        let err = "C:/Temp/zendo-ls-1.luau(100,3): SyntaxError: prelude broke";
+        assert_eq!(rebase_error(err, OFFSET, 10), err);
+        let at_offset = "C:/Temp/zendo-ls-1.luau(523,1): SyntaxError: wrapper broke";
+        assert_eq!(rebase_error(at_offset, OFFSET, 10), at_offset);
+    }
+
+    #[test]
+    fn eof_errors_clamp_to_last_source_line() {
+        let err = "C:/Temp/zendo-ls-1.luau(900,1): SyntaxError: Expected 'end'";
+        assert_eq!(rebase_error(err, OFFSET, 4), "zendo.luau(4,1): SyntaxError: Expected 'end'");
+    }
+
+    #[test]
+    fn empty_source_clamps_to_one() {
+        let err = "C:/Temp/zendo-ls-1.luau(525,1): SyntaxError: bad";
+        assert_eq!(rebase_error(err, OFFSET, 0), "zendo.luau(1,1): SyntaxError: bad");
+    }
+
+    #[test]
+    fn text_without_a_position_is_untouched() {
+        let err = "spawn compiler: program not found";
+        assert_eq!(rebase_error(err, OFFSET, 10), err);
+    }
+
+    #[test]
+    fn paren_in_the_path_is_not_a_position() {
+        let err = r"C:\Program Files (x86)\zendo\zendo-ls-1.luau(524,2): SyntaxError: x";
+        assert_eq!(
+            rebase_error(err, OFFSET, 10),
+            r"zendo.luau(1,2): SyntaxError: x"
+        );
+    }
+
+    /// The one error that was actually hit in the client: a stray `w` left by
+    /// a keystroke. End to end, through the real compiler, the message must
+    /// point at line 1 of the script.
+    #[test]
+    fn real_compiler_reports_the_stray_letter_on_line_one() {
+        if !compiler().exists() {
+            return;
+        }
+        let err = compile_deferred("w-- ctrl+enter runs, ctrl+s saves\nprint(\"nigerlitikali\")")
+            .expect_err("stray expression must not compile");
+        assert!(err.starts_with("zendo.luau(1,1): SyntaxError"), "{err}");
+    }
+
+    #[test]
+    fn real_compiler_accepts_a_clean_script() {
+        if !compiler().exists() {
+            return;
+        }
+        let blob = compile_deferred("print(\"ok\")").expect("clean script compiles");
+        assert!(!blob.is_empty());
+    }
 }

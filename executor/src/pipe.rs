@@ -522,7 +522,6 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
             if wait_done && !sent_quit && idx >= steps.len() && idle >= wait_limit {
                 eprintln!("[pipe] no done signal, detaching");
                 pipe.write_all(b"x")?;
-                sent_quit = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
