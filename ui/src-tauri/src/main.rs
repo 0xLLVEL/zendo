@@ -368,19 +368,16 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     // only lasting record is the log line the client writes itself.
     let log_start = player_log();
 
-    // A resident payload polls this pipe every 50 ms, so a live one answers
-    // almost immediately. 1.5 s is enough for the case that actually needs it:
-    // the thread was inside a session when this one started. Anything longer
-    // just makes the user wait while the resident is dead - and dead residents
-    // are the normal outcome here, because this client kills foreign threads a
-    // few seconds after DllMain returns. Injection is safe now: the pipe
-    // instance admits one client, so a fresh image cannot overlap a session.
+    // A payload now serves exactly one session and returns, so a fresh connect
+    // is the normal case. The hint only covers the narrow window where the
+    // previous injection is still polling for its server: its seek loop writes
+    // loop.bin every second, and it answers a new pipe in 50 ms.
     let seeking = payload_seeking();
     let mut connected = false;
     if seeking {
-        let until = Instant::now() + std::time::Duration::from_millis(1500);
+        let until = Instant::now() + std::time::Duration::from_millis(300);
         while Instant::now() < until {
-            if pending.wait(250).map_err(|e| format!("accept: {e}"))? {
+            if pending.wait(100).map_err(|e| format!("accept: {e}"))? {
                 connected = true;
                 break;
             }

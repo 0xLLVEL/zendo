@@ -236,21 +236,14 @@ inline void leave_thread() {
     if (restore) restore(reinterpret_cast<void*>(ctx), 0);
 }
 
-// The whole session lives on this thread. DllMain used to host it, which meant
-// the borrowed client thread never returned to its wait; here the client gets
-// its thread back before the first pipe is even opened.
-//
-// When the seek loop ends (ten minutes without a server, or an explicit
-// detach) the thread parks instead of exiting. Exiting would run the loader's
-// thread-detach path, which this client has already killed threads for
-// (STATUS_BAD_TLS_INDEX); a parked thread costs one stack and holds nothing.
-// It also holds no claim, which is the point: the pipe decides who serves, so
-// a thread the client kills or suspends cannot block a later injection.
+// The session lives on this thread when a legal start address could be built.
+// One injection serves one session, then returns: a borrowed client thread is
+// given back by the stub, and a thread we created is allowed to exit normally.
+// Parking either one forever is what turned a place change into a crash - the
+// client recycles threads on its own schedule, and a thread killed inside the
+// payload's session code can hold a heap lock the next place needs.
 inline DWORD WINAPI session_thread(void*) {
-    DWORD code = beacon();
-    Api& a = api();
-    if (a.Sleep) a.Sleep(0x7fffffff);
-    return code;
+    return beacon();
 }
 
 // A start routine inside a manually mapped image is not a legal call target.
@@ -266,12 +259,18 @@ inline DWORD WINAPI session_thread(void*) {
 // checks.
 inline unsigned long long thread_trampoline(void* fn) {
     Api& a = api();
-    if (!a.VirtualAlloc || !a.SetProcessValidCallTargets || !fn) return 0;
+    if (!a.VirtualAlloc || !a.SetProcessValidCallTargets || !fn) {
+        trace_tag(a, "T-API");
+        return 0;
+    }
     constexpr DWORD kTargetsInvalid = 0x40000000;
     unsigned char* page = static_cast<unsigned char*>(
         a.VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
                        PAGE_EXECUTE_READWRITE | kTargetsInvalid));
-    if (!page) return 0;
+    if (!page) {
+        trace_kv(a, "T-ALLOC", a.GetLastError ? a.GetLastError() : 0xffffffffull);
+        return 0;
+    }
     page[0] = 0x48;  // mov rax, imm64
     page[1] = 0xB8;
     unsigned long long target = reinterpret_cast<unsigned long long>(fn);
@@ -285,6 +284,7 @@ inline unsigned long long thread_trampoline(void* fn) {
     info[0].Offset = 0;
     info[0].Flags = 1;  // CFG_CALL_TARGET_VALID
     if (!a.SetProcessValidCallTargets(self, page, 0x1000, 1, info)) {
+        trace_kv(a, "T-CFG", a.GetLastError ? a.GetLastError() : 0xffffffffull);
         a.VirtualFree(page, 0, MEM_RELEASE);
         return 0;
     }

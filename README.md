@@ -154,14 +154,19 @@ while the mutex handle was still open.
 
 The pipe is the semaphore instead. One server instance accepts one payload, so
 two images can never be inside a session at the same time; a second image's
-`CreateFile` blocks until that instance is gone. A resident payload is still the
-fast path — a live seek loop answers a new server in under a second — but it is
-not required, and a dead one cannot block a later injection.
+`CreateFile` blocks until that instance is gone.
 
-The host's only liveness signal is the mtime of `work/loop.bin`, which the seek
-loop rewrites every second. It is a hint for how long to wait (1.5 s) and never
-a gate: the stamp freezes when the client kills the thread, so the host injects
-after that window regardless.
+One injection serves exactly one session. The seek loop that kept a payload
+resident between runs was removed after it froze a client: the session runs on a
+hijacked thread (the CFG trampoline is refused in this build), and a thread held
+for ten minutes is a thread the client kills during a place change — mid-
+`DllMain`, possibly holding a lock the next place needs. Now the borrowed thread
+goes back as soon as the session ends, and the next Execute maps a fresh image.
+The cost is the injection (~0.6 s); the resident it replaces rarely survived.
+
+The host still reads `work/loop.bin` as a hint that an injection from the
+previous second is polling for its server, but the window is 300 ms and it is
+never a gate.
 
 ### 2. Control-flow guard
 
@@ -658,12 +663,11 @@ layout measurements behind items 30–36 live in `docs/re.md`.
 
 These exist because each one was learned the hard way.
 
-1. **The pipe decides who serves.** One server instance accepts one payload, so
-   two images cannot be inside a session at once, and no mutex claim is involved
-   — a claim outlived the thread the client killed and deadlocked every later
-   injection. A resident payload is a speed optimization, never a requirement.
-   The corollary: `work/loop.bin` must never be trusted as proof of life beyond
-   the next inject decision.
+1. **The pipe decides who serves, and one image serves one session.** One server
+   instance accepts one payload, so two images cannot be inside a session at once,
+   and no mutex claim is involved — a claim outlived the thread the client killed
+   and deadlocked every later injection. A payload never parks after its session:
+   the borrowed thread goes back to the client, and the next Execute injects.
 2. **A closed pipe is not a failed run.** The payload answers END and closes the
    connection in the same breath, so the host's last control byte can lose the
    race and fail with `ERROR_NO_DATA` (232). Completion is END or the log
@@ -696,6 +700,8 @@ These exist because each one was learned the hard way.
 | `setupvalue` returns `nil` on a writable page | hardcoded `VirtualProtect(start, 0x2000, ...)` | use `api_write`, which sizes the range from the page |
 | Second Execute hangs on "running" | resident payload thread was killed by the client, and a mutex claim outlived it, so the fresh image parked and nothing served | fixed: no claim, pipe is the semaphore, host injects after 1.5 s and fails in 8 s instead of 30 |
 | Fourth Execute fails with `pipe: The pipe is being closed. (os error 232)` | payload wrote END and closed the pipe while the host was writing its closing `q` | fixed in `pipe.rs`: control writes are non-fatal; END or the sentinel marks the run complete, late sentinel is polled for 6 s |
+| Game freezes/crashes on Execute in a new place | payload ran inline on a hijacked client thread and then parked there in the seek loop; the place transition killed it inside `DllMain` | fixed: one injection serves one session, then the borrowed thread is restored; no resident thread, no lock left orphaned |
+| Second Execute after switching games uses a dead DataModel | a resident payload decoded `L` once at injection and kept it across place changes | fixed by the same change: every Execute injects a fresh image, so `L` is always the current place's |
 | Deferred script reports no completion | payload left the session after 3 s of silence, before the scheduler printed the sentinel | payload waits 30 s after a `d` session; host polls the log 6 s after the pipe closes |
 | Load-config probe leaves the client gone | session landed on a thread the protector already saw | relaunch before the next probe |
 

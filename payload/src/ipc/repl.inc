@@ -79,8 +79,9 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     // wait on the client's own log for the completion line. Three seconds of
     // silence was not enough: the payload broke out of the session (and closed
     // the pipe) while the host was still waiting for that line, and the host's
-    // closing `q` then failed with ERROR_NO_DATA. Thirty seconds matches the
-    // host's own patience for a deferred run.
+    // closing `q` then failed with ERROR_NO_DATA. Ten seconds is enough for a
+    // scheduler that was busy without holding a hijacked client thread longer
+    // than a place change can tolerate.
     bool deferred = false;
     for (;;) {
         stage_mark(a, "RDY");
@@ -94,7 +95,7 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         // image, and two payloads end up in one client.
         if (a.PeekNamedPipe && a.Sleep) {
             bool ready = false;
-            const int spins = deferred ? 600 : 60;
+            const int spins = deferred ? 200 : 60;
             for (int spin = 0; spin < spins; ++spin) {
                 DWORD avail = 0;
                 if (!a.PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) {
@@ -1401,12 +1402,11 @@ inline DWORD run_repl() {
             // writes it, so a stale stamp means the thread is gone.
             if ((idle % 20) == 0) loop_mark(a, ++g_seek_n);
             if ((idle % 100) == 0) trace_tag(a, "seek");
-            // Ten minutes. Every Execute should reuse this image when it can;
-            // mapping a second one is safe now that the pipe is the only
-            // admission, but a fresh image is still more expensive than a
-            // resident one. When the loop does end the thread parks with no
-            // claim to leak.
-            if (idle > 12000) {
+            // One injection, one session. Eight seconds is the host's own
+            // connect window; after that there is no server to serve, and
+            // holding a hijacked client thread any longer is how a place
+            // transition ends up killing a thread mid-DllMain.
+            if (idle > 160) {
                 // Leave DllMain: the stub restores the borrowed thread's
                 // original context, so nothing is left parked inside this
                 // client for a watchdog to find.
@@ -1435,11 +1435,16 @@ inline DWORD run_repl() {
             stage_mark(a, "EXIT-DETACH");
             return 111;
         }
-        // Stay here while this thread survives. The next Execute connects to
-        // it if it can, and injects a fresh image if this one has been killed
-        // in the meantime; the pipe lets exactly one of them serve.
-        if (a.Sleep) a.Sleep(150);
-        loop_mark(a, ++g_loop_n);
+        // One session per injection, then the thread goes back to the client.
+        // A resident payload was tried and cost far more than it saved: the
+        // client kills foreign threads on its own schedule (a place change is
+        // the reliable one), and a thread killed inside DllMain is a thread
+        // killed while it may hold a lock the next place needs. The host
+        // already injects on every run because the resident rarely survived;
+        // this makes that explicit instead of leaving a 10-minute thread
+        // parked behind every Execute.
+        stage_mark(a, "EXIT-ONE");
+        return 0;
     }
 }
 
