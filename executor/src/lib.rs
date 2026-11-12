@@ -21,10 +21,32 @@ fn quiet(cmd: &mut Command) -> &mut Command {
         .creation_flags(CREATE_NO_WINDOW)
 }
 
+/// The Luau compiler the client's VM was built against. Vendored and pinned -
+/// a compiler from a different revision emits a bytecode version the client
+/// rejects - so the search is: explicit override, repo copy, the old pinned
+/// checkout, then PATH. The repo copy is found by walking up from the running
+/// executable, because `cargo run` puts the binary four levels deep.
 pub fn compiler() -> PathBuf {
-    std::env::var_os("ZENDO_COMPILER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"D:\zend\test\luau\luau-compile.exe"))
+    if let Some(p) = std::env::var_os("ZENDO_COMPILER") {
+        return PathBuf::from(p);
+    }
+    let rel = Path::new("vendor").join("luau").join("luau-compile.exe");
+    for start in [std::env::current_exe().ok(), std::env::current_dir().ok()]
+        .into_iter()
+        .flatten()
+    {
+        for dir in start.ancestors().take(7) {
+            let candidate = dir.join(&rel);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    let legacy = PathBuf::from(r"D:\zend\test\luau\luau-compile.exe");
+    if legacy.is_file() {
+        return legacy;
+    }
+    PathBuf::from("luau-compile.exe")
 }
 
 pub fn injector() -> PathBuf {

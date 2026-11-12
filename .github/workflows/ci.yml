@@ -21,6 +21,17 @@ jobs:
             injector
             ui
 
+      # The compiler sits in the trust boundary: host builds bytecode with it,
+      # the client's VM runs the bytes. Pin it by hash so a swapped file fails
+      # here instead of producing bytecode the client refuses.
+      - name: luau compiler pin
+        shell: pwsh
+        run: |
+          $want = "870665FDC7E751EB266EA8BEEC2CDA64762C9B6B689E8A466FEEDAAEEFC8DD3D"
+          $got = (Get-FileHash vendor\luau\luau-compile.exe -Algorithm SHA256).Hash
+          if ($got -ne $want) { throw "luau-compile.exe hash mismatch: $got" }
+          "luau-compile pinned ok"
+
       # build.bat finds the MSVC toolset through vswhere, so the same script
       # works on a runner (Enterprise) and on a dev box (BuildTools/Community).
       # Stage 64 is the long-lived dispatcher build; the default stage 4 is a
@@ -47,6 +58,18 @@ jobs:
 
       - name: executor
         run: cargo build --release --manifest-path executor/Cargo.toml
+
+      - name: executor tests
+        run: cargo test --release --manifest-path executor/Cargo.toml
+
+      # Proves the checkout is self-contained: no ZENDO_COMPILER, no D:\zend.
+      - name: compiler resolves to vendor
+        shell: pwsh
+        run: |
+          $out = cargo run --release --manifest-path executor/Cargo.toml --example compilercheck
+          $out | ForEach-Object { Write-Host $_ }
+          if (-not ($out -match 'vendor\\luau\\luau-compile.exe \(exists=True')) { throw "compiler did not resolve to vendor" }
+          if (-not ($out -match 'deferred chunk ok')) { throw "deferred chunk failed to compile" }
 
       - name: injector
         run: cargo build --release --manifest-path injector/Cargo.toml
