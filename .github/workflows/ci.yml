@@ -14,12 +14,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Every crate keeps its own target directory, so the cache has to name each
+      # one. `ui` alone would miss ui/src-tauri/target, which is where the exe
+      # actually lands.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             executor
             injector
-            ui
+            ui/src-tauri
 
       # The compiler sits in the trust boundary: host builds bytecode with it,
       # the client's VM runs the bytes. Pin it by hash so a swapped file fails
@@ -74,8 +77,22 @@ jobs:
       - name: injector
         run: cargo build --release --manifest-path injector/Cargo.toml
 
+      # The frontend is git-ignored (dist/), and tauri with custom-protocol
+      # embeds it at compile time - cargo build alone fails on a fresh clone.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: ui frontend
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
       - name: ui
-        run: cargo build --release --manifest-path ui/Cargo.toml
+        run: cargo build --release --features custom-protocol --manifest-path ui/src-tauri/Cargo.toml
 
       - uses: actions/upload-artifact@v7
         with:
@@ -85,4 +102,4 @@ jobs:
             payload/build/zendo.dll
             injector/target/release/zendo-inject.exe
             executor/target/release/zendo-exec.exe
-            ui/target/release/zendo-ui.exe
+            ui/src-tauri/target/release/zendo-ui.exe
