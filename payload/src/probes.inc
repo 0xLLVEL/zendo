@@ -263,9 +263,9 @@ inline DWORD run_chunk() {
 // the std::string against 0xE009325B4A107A52 (rodata 0x6AF9FF0) and, on match,
 // hands data+8 / size-8 to the protected undump. Body compiled offline by
 // luau-compile; header is the build's 8 byte magic.
-#include "chunk.inc"
-#include "probe.inc"
-#include "raw.inc"
+#include "blobs/chunk.inc"
+#include "blobs/probe.inc"
+#include "blobs/raw.inc"
 #include "../chunks/live_a.inc"
 #include "../chunks/live_b.inc"
 #include "../chunks/live_c.inc"

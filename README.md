@@ -102,7 +102,7 @@ A run looks like this:
 
 | Path | Language | Role |
 |---|---|---|
-| `payload/` | C++20 | The injected DLL. One translation unit (`src/dllmain.cpp`), built `/NODEFAULTLIB /ENTRY:DllMain`, empty import table, Win32 entry points resolved from the PEB by export hash. |
+| `payload/` | C++20 | The injected DLL. One translation unit assembled from role files under `src/` (`core/`, `luau/`, `ipc/`, `boot/`, plus the `stages` museum), built `/NODEFAULTLIB /ENTRY:DllMain`, empty import table, Win32 entry points resolved from the PEB by export hash. |
 | `injector/` | Rust, no crates | PE loader. Parses the image locally, applies relocations, resolves imports, then maps into the target. Supports both a private manual map and a `SEC_IMAGE` mapping. Provides `--hijack` to run an entry stub on an existing thread. |
 | `executor/` | Rust | Host library + CLI. Compiles Luau source with `luau-compile`, parses LBC, hosts the pipe, drives the command/chunk exchange, tails the client log for script output. |
 | `ui/` | Rust + Tauri + JS | Desktop front end on the same `zendo_core`: process list, editor, run button, live output. |
@@ -144,10 +144,12 @@ therefore borrows a thread:
 - suspend, read context, redirect RIP to a stub in the payload, resume,
 - the stub runs the entry point and restores the original context.
 
-A named mutex (`zendo-live`) marks whether a payload thread is currently parked
-in the client. Ownership is what is checked, not existence: a dead payload
-leaves an abandoned mutex, which reads as "no session" instead of blocking every
-later injection.
+A named mutex (`zendo-live`) exists, but it is created **unowned** and nothing
+ever waits on it. Liveness is the mtime of `work/loop.bin`, which the seek loop
+rewrites every second: a fresh stamp means a payload thread is parked in the
+client and will reach the next pipe on its own. Ownership was tried and dropped —
+a session that ends cleanly leaves its thread alive, so a dead image read as a
+live owner and the next injection either waited forever or mapped a second one.
 
 ### 2. Control-flow guard
 
@@ -237,8 +239,12 @@ closure; returning `1` hands it back to Lua.
 
 Two execution modes exist:
 
-- **wrapped** (default) — the chunk runs from `task.defer`, so it outlives the
-  pipe and the scheduler thread owns the frame;
+- **wrapped** (default) — the chunk is handed to `task.delay(0.05, …)`, so it
+  outlives the pipe and the scheduler thread owns the frame. `task.defer` was
+  the first choice and it lost the client: the scheduler can resume the body on
+  its own thread while the `pcall` that queued it is still unwinding on ours,
+  which is two threads inside one `lua_State`. 50 ms puts the first resume well
+  after the queueing call has left the VM;
 - **raw** (`ZENDO_RAW=1`) — the chunk runs synchronously inside the pipe step, no
   wrapper. Every probe in `work/` uses this, because it makes frame behaviour
   observable.
@@ -254,7 +260,7 @@ The Lua layer talks to native code through one captured C closure. `zendo(op,
 ...)` is dispatched on the op string; each op reads its arguments, does its work,
 and returns values by writing into the frame.
 
-Ops implemented today (`payload/src/dllmain.cpp`):
+Ops implemented today (`payload/src/luau/native.inc`, dispatched by `native_api`; 46 names):
 
 | Group | Ops |
 |---|---|
@@ -390,17 +396,18 @@ cargo build --release --manifest-path injector\Cargo.toml
 cargo build --release --manifest-path executor\Cargo.toml
 
 :: desktop UI (optional, needs Tauri)
-cargo build --release --manifest-path ui\Cargo.toml
+cd ui && npm run build
+cargo build --release --manifest-path ui\src-tauri\Cargo.toml --features custom-protocol
 ```
 
 Artifacts:
 
 | Artifact | Path | Size (this build) |
 |---|---|---|
-| payload DLL | `payload/build/zendo.dll` | ~133 KB |
+| payload DLL | `payload/build/zendo.dll` | ~141 KB |
 | injector | `injector/target/release/zendo-inject.exe` | ~207 KB |
 | CLI | `executor/target/release/zendo-exec.exe` | ~373 KB |
-| UI | `ui/target/release/zendo-ui.exe` | ~7.9 MB (Tauri + WebView2 bindings) |
+| UI | `ui/src-tauri/target/release/zendo-ui.exe` | ~8.4 MB (Tauri + WebView2 bindings) |
 
 ### What the payload build does
 
@@ -679,9 +686,23 @@ zendo/
 ├── .github/workflows/ci.yml   payload + rust builds, import-table check
 ├── payload/
 │   ├── build.bat              cl, /NODEFAULTLIB, /ENTRY:DllMain
-│   ├── src/dllmain.cpp        the whole payload: PEB, ops, Lua reader/writer
-│   ├── src/*.inc              embedded blobs and probe chunks
-│   └── chunks/                compiled Luau chunks used by the probes
+│   ├── src/dllmain.cpp        include order + DllMain, nothing else
+│   ├── src/core/              api.inc    resolver, Api table, PEB walk
+│   │                          mem.inc    read/write, offset gate
+│   │                          proto.inc  framing, diag lines
+│   │                          trace.inc  trace files, loop heartbeat
+│   │                          veh.inc    exception filter
+│   ├── src/luau/              out.inc    Out buffer, state dumps, service walk
+│   │                          capture.inc, native.inc     print hook, op dispatcher
+│   │                          exec.inc, execraw.inc, protected.inc
+│   │                          gc.inc, loadstring.inc, caps.inc
+│   ├── src/ipc/repl.inc       serve_session, run_repl
+│   ├── src/boot/boot.inc      beacon, stage dispatch, threads
+│   ├── src/stages.inc         bisect harnesses, behind #if ZENDO_STAGE != 64
+│   ├── src/diag.inc           bisect harnesses (gated, same guard)
+│   ├── src/probes.inc         loader probes + the blob includes (gated)
+│   ├── src/blobs/             generated bytecode: chunk.inc probe.inc raw.inc
+│   └── chunks/                52 Luau files, 12 in use, the rest probe debris
 ├── injector/
 │   └── src/main.rs            PE parser, manual map, SEC_IMAGE map, hijack
 ├── executor/
@@ -693,9 +714,9 @@ zendo/
 │       ├── tables.rs          opcode/table dumps
 │       └── main.rs            CLI: run / build / serve / probe / detach
 ├── ui/
-│   ├── src/main.rs            Tauri commands, process discovery, run loop
-│   ├── web/                   index.html, app.js, style.css
-│   └── tauri.conf.json
+│   ├── src-tauri/src/main.rs  Tauri commands, process discovery, run loop
+│   ├── src/                   Svelte 5 app: App, Editor, Console, Hub, Settings
+│   └── index.html             vite entry, builds to dist/
 ├── docs/                      re.md, sunc.md                (local only)
 ├── resource/                  IDA db, client image, offsets  (local only)
 ├── tools/                     IDA/disasm helpers             (local only)
