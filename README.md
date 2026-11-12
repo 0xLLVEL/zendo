@@ -159,9 +159,9 @@ two images can never be inside a session at the same time; a second image's
 One injection serves exactly one session. The seek loop that kept a payload
 resident between runs was removed after it froze a client: the session runs on a
 hijacked thread (the CFG trampoline is refused in this build), and a thread held
-for ten minutes is a thread the client kills during a place change — mid-
-`DllMain`, possibly holding a lock the next place needs. Now the borrowed thread
-goes back as soon as the session ends, and the next Execute maps a fresh image.
+for ten minutes is a thread the client kills during a place change — mid-DllMain,
+possibly holding a lock the next place needs. Now the borrowed thread goes back
+as soon as the session ends, and the next Execute maps a fresh image.
 The cost is the injection (~0.6 s); the resident it replaces rarely survived.
 
 The host still reads `work/loop.bin` as a hint that an injection from the
