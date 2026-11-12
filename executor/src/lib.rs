@@ -563,6 +563,15 @@ put("fireclickdetector", function(cd, dist)    local ok, sig = pcall(function() 
     return false, tostring(err)
 end)
 
+-- Instances the tree still owns. The client already knows them, so this walks
+-- the real DataModel instead of the GC heap: cheaper, and it cannot hand back
+-- an object the game has already dropped.
+put("getinstances", function()
+    local ok, list = pcall(function() return game:GetDescendants() end)
+    if ok and type(list) == "table" then return list end
+    return {}
+end)
+
 for _, name in ipairs({ "getgc", "getreg", "getconnections" }) do
     if rawget(__znd_env, name) == nil then
         api.missing[#api.missing + 1] = name
@@ -641,6 +650,37 @@ pub fn compile_str(src: &str) -> Result<Vec<u8>, String> {
 pub fn compile_script(src: &str) -> Result<Vec<u8>, String> {
     compile_str(&format!("{}\n{}", prelude(), src))
 }
+
+/// Compile a script whose body is handed to `task.defer`. The payload only runs
+/// the wrapper on the borrowed thread and returns; the body then runs on the
+/// client's own scheduler, serialized with the client's VM. Keeping the Lua
+/// frame inside the payload thread while the scheduler kept running was a data
+/// race on `lua_State` - the stutter-then-freeze after Execute.
+///
+/// Completion is a log line, not a pipe write: the body finishes on a thread
+/// the payload does not own, so the only signal it can leave without touching
+/// the pipe is `print`. The host watches the client's own CreatorOutput for it.
+pub fn compile_deferred(src: &str) -> Result<Vec<u8>, String> {
+    // task.delay, not task.defer. defer enqueues the body and the scheduler can
+    // resume it on its own thread while this pcall is still unwinding on ours -
+    // two threads inside one lua_State for a few microseconds, and that is the
+    // client dying a second later with no script output. A 50 ms delay puts the
+    // first resume well after this call has left the VM.
+    compile_str(&format!(
+        "{}\
+         task.delay(0.05, function()\n\
+         local __znd_ok, __znd_err = pcall(function()\n\
+         {src}\n\
+         end)\n\
+         if not __znd_ok then warn(tostring(__znd_err)) end\n\
+         print(\"{}\")\n\
+         end)\n",
+        prelude(),
+        DONE_SENTINEL
+    ))
+}
+
+pub const DONE_SENTINEL: &str = "zendo://done";
 
 /// Start the injector beside a pipe that is already being served. The payload
 /// hosts a long-lived REPL, so the injector must not wait for DllMain to end.

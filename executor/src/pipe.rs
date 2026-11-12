@@ -373,6 +373,10 @@ pub enum Step<'a> {
     /// Same blob as `Chunk`, sent as `i`: the payload runs it synchronously on
     /// the borrowed thread with the given identity, then restores the old one.
     Ident(&'a [u8], u8),
+    /// Sent as `d`: the blob is only the scheduling wrapper. The payload runs it
+    /// and returns at once; the real body runs on the client's scheduler, so the
+    /// VM is never entered from two threads at once.
+    Defer(&'a [u8]),
 }
 
 /// A connection attempt started by `Pipe::begin_accept`.
@@ -452,15 +456,26 @@ fn take_bytes(pipe: &Pipe, acc: &mut Vec<u8>, dst: &mut [u8]) -> io::Result<()> 
 /// leading `P` are script output and reach the sink with a `» ` prefix so the
 /// UI can tell them apart from protocol chatter.
 pub fn drive(pipe: &Pipe, steps: &[Step], mut sink: impl Write) -> io::Result<()> {
-    drive_wait(pipe, steps, &mut sink, false)
+    drive_until(pipe, steps, &mut sink, false, None, None)
 }
 
 /// `wait_done` keeps the session open after the last step until the payload
 /// signals END. A wrapped chunk runs on a scheduler thread and only touches the
 /// pipe later; closing it early is what made `loadstring` return nil. A raw
 /// chunk runs inside the step itself, so there is nothing left to wait for.
-pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
+pub fn drive_wait(pipe: &Pipe, steps: &[Step], sink: impl Write,
                   wait_done: bool) -> io::Result<()> {
+    drive_until(pipe, steps, sink, wait_done, None, None)
+}
+
+/// Same driver with a wall-clock ceiling and an outside completion flag. A
+/// session that never sends END and never closes (a chunk parked in the
+/// client's scheduler, a client that froze mid-run) leaves the caller holding a
+/// thread and a UI stuck on "running". Both exits here are independent of the
+/// payload behaving.
+pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
+                   wait_done: bool, deadline: Option<std::time::Instant>,
+                   done: Option<&std::sync::atomic::AtomicBool>) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     let mut acc = Vec::new();
     let mut idx = 0usize;
@@ -476,6 +491,20 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(60));
     loop {
+        if let Some(flag) = done {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[pipe] script signalled done");
+                let _ = pipe.write_all(b"q");
+                return Ok(());
+            }
+        }
+        if let Some(limit) = deadline {
+            if std::time::Instant::now() >= limit {
+                eprintln!("[pipe] deadline reached, detaching");
+                let _ = pipe.write_all(b"x");
+                return Ok(());
+            }
+        }
         // Poll: a blocking read hands the timeout decision to the client, and
         // any byte written to break the wait would land inside a reply the
         // payload is still assembling (a loadstring header, for example).
@@ -484,6 +513,12 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
             Err(_) => break,
         };
         if avail == 0 {
+            // Once the session is over the payload may reconnect with a fresh
+            // RDY that no step is waiting for. Nothing else is coming, so a
+            // short quiet window is the end of the run, not a hang.
+            if sent_quit && idle >= Duration::from_millis(500) {
+                break;
+            }
             if wait_done && !sent_quit && idx >= steps.len() && idle >= wait_limit {
                 eprintln!("[pipe] no done signal, detaching");
                 pipe.write_all(b"x")?;
@@ -710,6 +745,12 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                             pipe.write_all(&[id])?;                            pipe.write_all(&(chunk.len() as u32).to_le_bytes())?;
                             pipe.write_all(chunk)?;
                         }
+                        Step::Defer(chunk) => {
+                            eprintln!("[pipe] sending deferred chunk {} bytes", chunk.len());
+                            pipe.write_all(b"d")?;
+                            pipe.write_all(&(chunk.len() as u32).to_le_bytes())?;
+                            pipe.write_all(chunk)?;
+                        }
                     }
                     idx += 1;
                 } else if !sent_quit {
@@ -717,16 +758,19 @@ pub fn drive_wait(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                         // The script is still running on a scheduler thread and
                         // may call loadstring any moment. Stay silent.
                     } else {
-                        eprintln!("[pipe] detaching");
-                        pipe.write_all(b"x")?;
+                        // `q` ends the session but keeps the payload in its seek
+                        // loop: the next run reuses this image instead of mapping
+                        // a second one into the client.
+                        eprintln!("[pipe] session over");
+                        pipe.write_all(b"q")?;
                         sent_quit = true;
                     }
                 }
             } else if body == b"END" {
                 seen_end = true;
                 if wait_done && !sent_quit {
-                    eprintln!("[pipe] script done, detaching");
-                    pipe.write_all(b"x")?;
+                    eprintln!("[pipe] script done, session over");
+                    pipe.write_all(b"q")?;
                     sent_quit = true;
                 }
             } else if body.first() == Some(&b'P') {
