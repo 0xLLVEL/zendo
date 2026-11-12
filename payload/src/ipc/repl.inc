@@ -75,14 +75,12 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     // writer beside the client's own scheduler, and that race is what killed
     // the client seconds after a session ended with its body never running.
 
-    // A deferred body finishes on the client's scheduler, so the host has to
-    // wait on the client's own log for the completion line. Three seconds of
-    // silence was not enough: the payload broke out of the session (and closed
-    // the pipe) while the host was still waiting for that line, and the host's
-    // closing `q` then failed with ERROR_NO_DATA. Ten seconds is enough for a
-    // scheduler that was busy without holding a hijacked client thread longer
-    // than a place change can tolerate.
-    bool deferred = false;
+    // A deferred body finishes on the client's scheduler, so the host waits on
+    // the client's own log for the completion line. This thread has nothing
+    // left to do at that point: holding it for even one extra second is a
+    // second of a client thread that the engine may be waiting on during a
+    // place load. Raw chunks still keep the short grace below so the host can
+    // close the session without a broken-pipe error.
     for (;;) {
         stage_mark(a, "RDY");
         o.str("RDY\n");
@@ -95,16 +93,11 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         // image, and two payloads end up in one client.
         if (a.PeekNamedPipe && a.Sleep) {
             bool ready = false;
-            // After a deferred chunk there is exactly one thing left: the host
-            // closing the session. Give it a full second to do that, then go
-            // home. Holding a borrowed client thread longer than this is the
-            // difference between a clean run and a stalled scheduler: a
-            // deferred body can only start once this thread is back in the
-            // client, and the engine starts timing a script out at ~24 s. One
-            // second of grace is 20x the round trip the host actually needs,
-            // and it caps the damage if the borrowed thread turns out to be one
-            // the engine wanted.
-            const int spins = deferred ? 20 : 60;
+            // After a raw chunk there is exactly one thing left: the host
+            // closing the session. Give it three seconds to do that, then go
+            // home. A deferred chunk never gets here - it leaves the moment
+            // its body is queued.
+            const int spins = 60;
             for (int spin = 0; spin < spins; ++spin) {
                 DWORD avail = 0;
                 if (!a.PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) {
@@ -124,7 +117,6 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
             break;
         }
         cmd[1] = 0;
-        if (cmd[0] == 'd') deferred = true;
         trace_tag(a, cmd);
         stage_mark(a, cmd);
         // Detach: leave the client with no payload thread parked inside it.
@@ -207,6 +199,27 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
                 wr64(E2 + 0x70, want_id);
             }
             stage_mark(a, "EXEC");
+            // The state was resolved before this pipe connected. A place change
+            // tears the DataModel down and builds a new script context: writing
+            // into the old one means allocating in a VM whose heap is being
+            // freed, which surfaces later as an unrelated thread dying inside
+            // ntdll's heap code. Re-resolve and refuse instead.
+            {
+                unsigned long long fake2 = 0, dm2 = 0, sc2 = 0, L2 = 0;
+                if (read_u64(base + k_fake_dm_static, &fake2) && fake2 &&
+                    read_u64(fake2 + k_fake_dm_to_dm, &dm2) && dm2) {
+                    sc2 = find_service(base, base + k_script_context_vtable, dm2);
+                    if (sc2) L2 = decode_split(sc2 + k_slot_a);
+                }
+                if (L2 != L) {
+                    o.str("stale state: the script context moved under this run\n");
+                    o.str("wait for the place to finish loading, then Execute\nEND\n");
+                    flush_out(a, pipe, o);
+                    stage_mark(a, "STALE");
+                    if (swapped) wr64(E2 + 0x70, oldid);
+                    continue;
+                }
+            }
             // Raw-only setup. A deferred session never reaches this branch, so
             // it never swaps the print closure and never installs bindings:
             // one VM entry, the wrapper, and nothing else.
@@ -237,11 +250,16 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
                 o.nl();
                 flush_out(a, pipe, o);
             }
-            // A deferred chunk hands its body to the client scheduler and returns
-            // immediately. Draining the capture buffer here would put this
-            // payload thread back inside the VM while the scheduler owns it -
-            // the exact race the deferred path exists to avoid.
-            if (cmd[0] != 'd') flush_capture(a, o, L, base);
+            // A deferred chunk hands its body to the client scheduler and is
+            // done: the queue owns the closure now, so this thread leaves the
+            // client immediately instead of holding a borrowed game thread for
+            // a second that a place load may be waiting on. A raw chunk drains
+            // its capture first, then waits out the host's close.
+            if (cmd[0] == 'd') {
+                stage_mark(a, "DONE");
+                break;
+            }
+            flush_capture(a, o, L, base);
             stage_mark(a, "DONE");
             continue;
         }

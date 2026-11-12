@@ -846,7 +846,16 @@ fn hijack(proc: Handle, pid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64,
     // our stub page for a while, and a long list of those is itself a wedge.
     for &(tid, prio, label) in candidates.iter().take(4) {
         println!("  candidate {tid} ({label}, prio {prio})");
-        pick_log(&format!("try tid={tid} label={label} prio={prio}"));
+        // Which thread this actually is, in the log. A client that dies an hour
+        // later cannot be attributed to a tid that was reused three times.
+        let origin = match thread_start(tid) {
+            Some(s) => match module_offset(proc, s) {
+                Some((m, o)) => format!("start={s:#x} {m}+{o:#x}"),
+                None => format!("start={s:#x}"),
+            },
+            None => "start=?".to_string(),
+        };
+        pick_log(&format!("try tid={tid} label={label} prio={prio} {origin}"));
         match hijack_on(proc, tid, stub_addr, stub, flag_addr) {
             Attempt::Finished(code) => {
                 pick_log(&format!("finished tid={tid} code={code}"));
