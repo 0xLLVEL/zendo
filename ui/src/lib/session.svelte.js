@@ -60,9 +60,18 @@ export function stageFresh(s) {
 }
 
 export function scanError(text) {
-  const m = /([\w.-]+\.luau):(\d+)/.exec(text) || /\bline (\d+)\b/i.exec(text);
+  // Three shapes reach the console: the compiler's own position
+  // (`zendo.luau(12,4): SyntaxError`, already rebased to the script by the
+  // host), a raw runtime error (`script.luau:12: attempt to index nil`), and
+  // a bare `line 12`. The parenthesised form has to be tried first: a path
+  // like `C:\Temp\zendo-ls-1.luau(524,1)` also contains `.luau`, and matching
+  // on the colon form would find nothing at all.
+  const m =
+    /\.luau\((\d+)\s*,\s*\d+\)/.exec(text) ||
+    /[\w.-]+\.luau:(\d+)/.exec(text) ||
+    /\bline (\d+)\b/i.exec(text);
   if (!m) return 0;
-  const n = Number(m[2] || m[1]);
+  const n = Number(m[1]);
   return n > 0 ? n : 0;
 }
 
@@ -95,9 +104,14 @@ export async function runScript(source) {
       pushRun(false);
     }, 45000);
   } catch (err) {
-    addOutput(String(err));
+    // A compile failure never reaches the run thread, so this is the only
+    // place its position can reach the editor: without the scan the console
+    // printed `zendo.luau(1,1)` and the cursor stayed where it was.
+    const text = String(err);
+    addOutput(text + "\n");
     session.phase = "failed";
-    session.note = "failed";
+    session.note = "compile failed";
+    session.errorLine = scanError(text);
     pushRun(false);
   }
 }
@@ -126,6 +140,7 @@ function finishRun(ev) {
     if (ev.error) addOutput(ev.error + "\n");
     session.phase = "failed";
     session.note = ev.timeout ? "timed out" : "failed";
+    session.errorLine = scanError((ev.error || "") + "\n" + (ev.output || ""));
     pushRun(false);
   }
   refreshTelemetry();

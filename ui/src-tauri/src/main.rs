@@ -472,7 +472,7 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
                     driven.is_ok(), t0.elapsed().as_millis(),
                     done.load(Ordering::Relaxed)));
     live.store(false, Ordering::Relaxed);
-    let mut seen = watcher.join().unwrap_or_default();
+    let seen = watcher.join().unwrap_or_default();
     runlog(&format!("watcher joined out={}B", seen.len()));
     // The payload restores the borrowed thread once the pipe closes, so there is
     // no ack to wait for. The injector is only reaped when this run borrowed one.
@@ -502,7 +502,6 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
             let delta = clean[seen.len()..].to_string();
             let _ = app.emit("zendo://out", delta.clone());
             buf.lock().unwrap().extend_from_slice(delta.as_bytes());
-            seen = clean;
             break;
         }
     }
