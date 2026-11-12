@@ -141,8 +141,20 @@ therefore borrows a thread:
 - enumerate threads, prefer ones parked inside an `ntdll` wait,
 - skip threads sitting in waits that never return to user mode (a patched RIP
   there freezes the process),
+- **never borrow the client's scheduler thread.** It is the one thread that owns
+  the game window and the one whose start address is the image entry point. The
+  session parks the borrowed thread while it waits for the deferred body, and
+  the deferred body can only run on that scheduler — borrow it and the window
+  stops pumping, the sentinel never arrives, and the client times the script out
+  and shuts the place down. Measured: three runs on an alertable worker
+  (`0x452c`) finished in under a second; the fourth picked `0x2014`, froze the
+  window, and left a live process with no UI,
 - suspend, read context, redirect RIP to a stub in the payload, resume,
 - the stub runs the entry point and restores the original context.
+
+Every pick is appended to `%TEMP%\zendo-pick.log`: which threads were offered,
+which were refused and why (`start`, `entry`, `window`), and which one was
+borrowed. It is written before the hijack, so it survives a frozen client.
 
 There is **no one-payload claim**. Three versions of a named mutex were tried
 and each one deadlocked the client in the same way: a mutex handle is owned by
@@ -701,6 +713,7 @@ These exist because each one was learned the hard way.
 | Second Execute hangs on "running" | resident payload thread was killed by the client, and a mutex claim outlived it, so the fresh image parked and nothing served | fixed: no claim, pipe is the semaphore, host injects after 1.5 s and fails in 8 s instead of 30 |
 | Fourth Execute fails with `pipe: The pipe is being closed. (os error 232)` | payload wrote END and closed the pipe while the host was writing its closing `q` | fixed in `pipe.rs`: control writes are non-fatal; END or the sentinel marks the run complete, late sentinel is polled for 6 s |
 | Game freezes/crashes on Execute in a new place | payload ran inline on a hijacked client thread and then parked there in the seek loop; the place transition killed it inside `DllMain` | fixed: one injection serves one session, then the borrowed thread is restored; no resident thread, no lock left orphaned |
+| Fourth Execute freezes the window, client log says `Script has run for over 24 seconds` | the picker borrowed the client's scheduler thread (`0x2014`); the session parked it waiting on a sentinel only that thread could produce | fixed: threads that own a window or start at the image entry point are never candidates; every pick is logged to `%TEMP%\zendo-pick.log` |
 | Second Execute after switching games uses a dead DataModel | a resident payload decoded `L` once at injection and kept it across place changes | fixed by the same change: every Execute injects a fresh image, so `L` is always the current place's |
 | Deferred script reports no completion | payload left the session after 3 s of silence, before the scheduler printed the sentinel | payload waits 30 s after a `d` session; host polls the log 6 s after the pipe closes |
 | Load-config probe leaves the client gone | session landed on a thread the protector already saw | relaunch before the next probe |

@@ -63,6 +63,8 @@ extern "system" {
 
 #[link(name = "ntdll")]
 extern "system" {
+    fn NtQueryInformationThread(thread: Handle, class: u32, info: *mut c_void,
+                                len: u32, ret: *mut u32) -> i32;
     fn NtCreateSection(section: *mut Handle, access: u32, attrs: *mut c_void,
                        max_size: *const u64, protect: u32, allocation: u32,
                        file: Handle) -> i32;
@@ -454,6 +456,78 @@ unsafe fn dead_wait(rip: u64) -> bool {
     rip >= base + 0x16_5900 && rip < base + 0x16_5A80
 }
 
+/// A thread's own start address. The primary thread of a process reports the
+/// image entry point; every other thread reports the routine handed to
+/// `CreateThread`. This is the field that separates the client's scheduler
+/// thread from its workers, and therefore the field that decides whether a
+/// hijack freezes the game window or runs cleanly beside it.
+fn thread_start(tid: u32) -> Option<u64> {
+    unsafe {
+        let th = OpenThread(0x0040, 0, tid); // THREAD_QUERY_INFORMATION
+        if th.is_null() {
+            return None;
+        }
+        let mut start: u64 = 0;
+        let mut ret = 0u32;
+        let st = NtQueryInformationThread(th, 9, &mut start as *mut u64 as *mut c_void, 8, &mut ret);
+        CloseHandle(th);
+        if st == 0 { Some(start) } else { None }
+    }
+}
+
+/// Address the primary thread starts at, read from the loader itself so nobody
+/// has to parse the client's PE copy.
+fn main_entry(proc: Handle) -> Option<u64> {
+    unsafe {
+        let mut mods = [ptr::null_mut::<c_void>(); 1];
+        let mut needed = 0u32;
+        if EnumProcessModules(proc, mods.as_mut_ptr(), 8, &mut needed) == 0 || needed < 8 {
+            return None;
+        }
+        let mut info: ModuleInfo = std::mem::zeroed();
+        if GetModuleInformation(proc, mods[0], &mut info,
+                                std::mem::size_of::<ModuleInfo>() as u32) == 0 {
+            return None;
+        }
+        Some(info.entry as u64)
+    }
+}
+
+unsafe extern "system" fn count_window(_w: *mut c_void, l: isize) -> i32 {
+    *(l as *mut u32) += 1;
+    0 // one is enough to disqualify the thread
+}
+
+/// True when this thread owns a top-level window. The client's window thread is
+/// its scheduler thread; hijacking it parks the message pump and the deferred
+/// body the session waits for can never run.
+fn owns_window(tid: u32) -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumThreadWindows(tid: u32,
+                             cb: Option<unsafe extern "system" fn(*mut c_void, isize) -> i32>,
+                             lparam: isize) -> i32;
+    }
+    let mut n = 0u32;
+    unsafe { EnumThreadWindows(tid, Some(count_window), &mut n as *mut u32 as isize) };
+    n > 0
+}
+
+/// One appended line per injection in the temp dir: which threads were offered,
+/// why the unsafe ones were refused, and which one was borrowed. Written before
+/// the hijack, so it survives a frozen client.
+fn pick_log(line: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("zendo-pick.log");
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{ms} {line}");
+    }
+}
+
 /// Prefer a thread parked inside an ntdll wait: its stack is shallow and its
 /// user-mode state is a syscall return, so an abandoned frame costs nothing.
 fn pick_threads(pid: u32) -> Vec<(u32, u8, &'static str)> {
@@ -495,6 +569,8 @@ fn pick_threads(pid: u32) -> Vec<(u32, u8, &'static str)> {
         if snap as usize == usize::MAX {
             return Vec::new();
         }
+        let proc = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+        let entry = if proc.is_null() { None } else { main_entry(proc) };
         let mut te: ThreadEntry32 = std::mem::zeroed();
         te.dw_size = std::mem::size_of::<ThreadEntry32>() as u32;
         let mut out: Vec<(u8, u32, &'static str)> = Vec::new();
@@ -502,8 +578,33 @@ fn pick_threads(pid: u32) -> Vec<(u32, u8, &'static str)> {
         let mut ok = Thread32First(snap, &mut te);
         while ok != 0 {
             if te.th32_owner_process_id == pid {
+                let tid = te.th32_thread_id;
+                // Never borrow the thread the client's scheduler runs on. Two
+                // measurements say it is that thread and not a worker: it owns
+                // the game window, and its start address is the image entry
+                // point. A hijacked scheduler parks the only thread that can
+                // run the deferred body, so the session waits on a sentinel
+                // that can never arrive and the window stops pumping. Runs 1-3
+                // hit an alertable worker and finished in under a second; run 4
+                // hit the window thread and froze the client.
+                let start = thread_start(tid);
+                let entry_thread = match (start, entry) {
+                    (Some(0), _) => true,
+                    (Some(s), Some(e)) => s >= e && s < e + 0x1000,
+                    _ => false,
+                };
+                let window = owns_window(tid);
+                if entry_thread || window {
+                    pick_log(&format!(
+                        "skip tid={tid} start={} entry={} window={window}",
+                        start.map(|s| format!("{s:#x}")).unwrap_or_else(|| "?".into()),
+                        entry.map(|e| format!("{e:#x}")).unwrap_or_else(|| "?".into())
+                    ));
+                    ok = Thread32Next(snap, &mut te);
+                    continue;
+                }
                 let ranges = wait_ranges();
-                let th = OpenThread(THREAD_ALL_ACCESS, 0, te.th32_thread_id);
+                let th = OpenThread(THREAD_ALL_ACCESS, 0, tid);
                 if !th.is_null() {
                     let mut ctx = ThreadContext([0u8; 0x4D0]);
                     ctx.0[0x30..0x34].copy_from_slice(&0x0010_000Bu32.to_le_bytes());
@@ -514,9 +615,9 @@ fn pick_threads(pid: u32) -> Vec<(u32, u8, &'static str)> {
                                 continue;
                             }
                             if dead_wait(rip) {
-                                spare.push((9, te.th32_thread_id, "dead"));
+                                spare.push((9, tid, "dead"));
                             } else {
-                                out.push((prio, te.th32_thread_id, label));
+                                out.push((prio, tid, label));
                             }
                             break;
                         }
@@ -531,7 +632,17 @@ fn pick_threads(pid: u32) -> Vec<(u32, u8, &'static str)> {
         if out.is_empty() {
             out = spare;
         }
-        out.into_iter().map(|(p, t, l)| (t, p, l)).collect()
+        let list: Vec<(u32, u8, &'static str)> =
+            out.into_iter().map(|(p, t, l)| (t, p, l)).collect();
+        pick_log(&format!(
+            "pid={pid} entry={} candidates={:?}",
+            entry.map(|e| format!("{e:#x}")).unwrap_or_else(|| "?".into()),
+            list.iter().map(|c| (c.0, c.2)).collect::<Vec<_>>()
+        ));
+        if !proc.is_null() {
+            CloseHandle(proc);
+        }
+        list
     }
 }
 
@@ -727,18 +838,32 @@ fn hijack(proc: Handle, pid: u32, stub_addr: u64, stub: &[u8], flag_addr: u64,
         pick_threads(pid)
     };
     if candidates.is_empty() {
-        return Err("no thread found".into());
+        pick_log("no safe thread: every parked thread owns a window or is the entry thread");
+        return Err("no safe thread: refusing to borrow the client's scheduler".into());
     }
     let mut last = String::from("no idle thread accepted the stub");
     // Four attempts is the whole budget. Every miss leaves a thread parked on
     // our stub page for a while, and a long list of those is itself a wedge.
     for &(tid, prio, label) in candidates.iter().take(4) {
         println!("  candidate {tid} ({label}, prio {prio})");
+        pick_log(&format!("try tid={tid} label={label} prio={prio}"));
         match hijack_on(proc, tid, stub_addr, stub, flag_addr) {
-            Attempt::Finished(code) => return Ok(Attempt::Finished(code)),
-            Attempt::Running => return Ok(Attempt::Running),
-            Attempt::Fatal(e) => return Err(e),
-            Attempt::Retry(e) => last = e,
+            Attempt::Finished(code) => {
+                pick_log(&format!("finished tid={tid} code={code}"));
+                return Ok(Attempt::Finished(code));
+            }
+            Attempt::Running => {
+                pick_log(&format!("running tid={tid}"));
+                return Ok(Attempt::Running);
+            }
+            Attempt::Fatal(e) => {
+                pick_log(&format!("fatal tid={tid} {e}"));
+                return Err(e);
+            }
+            Attempt::Retry(e) => {
+                pick_log(&format!("retry tid={tid} {e}"));
+                last = e;
+            }
         }
     }
     Err(last)
