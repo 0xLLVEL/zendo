@@ -154,6 +154,7 @@ struct Api {
     using ReleaseMutex_t = BOOL(WINAPI*)(HANDLE);
     using WriteFile_t = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
     using ReadFile_t = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+    using PeekNamedPipe_t = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPDWORD, LPDWORD);
     using CloseHandle_t = BOOL(WINAPI*)(HANDLE);
     using Sleep_t = void(WINAPI*)(DWORD);
     using GetLastError_t = DWORD(WINAPI*)();
@@ -165,6 +166,9 @@ struct Api {
     using SetCfgTargets_t = BOOL(WINAPI*)(HANDLE, void*, SIZE_T, ULONG, void*);
     using VirtualAlloc_t = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);
     using VirtualFree_t = BOOL(WINAPI*)(void*, SIZE_T, DWORD);
+    using CreateThread_t = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T,
+                                           LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+    using GetExitCodeThread_t = BOOL(WINAPI*)(HANDLE, LPDWORD);
 
     CreateFileA_t CreateFileA;
     CreateMutexA_t CreateMutexA;
@@ -172,6 +176,7 @@ struct Api {
     ReleaseMutex_t ReleaseMutex;
     WriteFile_t WriteFile;
     ReadFile_t ReadFile;
+    PeekNamedPipe_t PeekNamedPipe;
     CloseHandle_t CloseHandle;
     Sleep_t Sleep;
     GetLastError_t GetLastError;
@@ -183,6 +188,8 @@ struct Api {
     SetCfgTargets_t SetProcessValidCallTargets;
     VirtualAlloc_t VirtualAlloc;
     VirtualFree_t VirtualFree;
+    CreateThread_t CreateThread;
+    GetExitCodeThread_t GetExitCodeThread;
     using SetMitigation_t = BOOL(WINAPI*)(int, void*, SIZE_T);
     SetMitigation_t SetProcessMitigationPolicy;
 };
@@ -204,6 +211,7 @@ inline DWORD resolve_api() {
     a.ReleaseMutex = reinterpret_cast<Api::ReleaseMutex_t>(find_export(k32.base, fnv1a("ReleaseMutex")));
     a.WriteFile = reinterpret_cast<Api::WriteFile_t>(find_export(k32.base, fnv1a("WriteFile")));
     a.ReadFile = reinterpret_cast<Api::ReadFile_t>(find_export(k32.base, fnv1a("ReadFile")));
+    a.PeekNamedPipe = reinterpret_cast<Api::PeekNamedPipe_t>(find_export(k32.base, fnv1a("PeekNamedPipe")));
     a.CloseHandle = reinterpret_cast<Api::CloseHandle_t>(find_export(k32.base, fnv1a("CloseHandle")));
     a.Sleep = reinterpret_cast<Api::Sleep_t>(find_export(k32.base, fnv1a("Sleep")));
     a.GetLastError = reinterpret_cast<Api::GetLastError_t>(find_export(k32.base, fnv1a("GetLastError")));
@@ -211,6 +219,9 @@ inline DWORD resolve_api() {
     a.VirtualProtect = reinterpret_cast<Api::VirtualProtect_t>(find_export(k32.base, fnv1a("VirtualProtect")));
     a.VirtualAlloc = reinterpret_cast<Api::VirtualAlloc_t>(find_export(k32.base, fnv1a("VirtualAlloc")));
     a.VirtualFree = reinterpret_cast<Api::VirtualFree_t>(find_export(k32.base, fnv1a("VirtualFree")));
+    a.CreateThread = reinterpret_cast<Api::CreateThread_t>(find_export(k32.base, fnv1a("CreateThread")));
+    a.GetExitCodeThread =
+        reinterpret_cast<Api::GetExitCodeThread_t>(find_export(k32.base, fnv1a("GetExitCodeThread")));
     a.FlushInstructionCache =
         reinterpret_cast<Api::FlushICache_t>(find_export(k32.base, fnv1a("FlushInstructionCache")));
     a.AddVectoredExceptionHandler =
@@ -1355,6 +1366,12 @@ static unsigned long long g_veh_tid = 0;
 
 inline void stage_mark(Api& a, const char* s);
 inline void loop_mark(Api& a, unsigned int n);
+// Per-thread trace file (work/trace-<tid>.log). repl_stage.bin is one file for
+// every copy in the process, so a duplicate image erases the previous copy's
+// last step; this one cannot.
+inline void trace_tag(Api& a, const char* tag);
+inline void trace_kv(Api& a, const char* tag, unsigned long long v);
+inline void trace_text(Api& a, const char* text, unsigned int n);
 
 inline bool str_eq(const char* a, const char* b) {
     if (!a || !b) return false;
@@ -1465,6 +1482,9 @@ inline LONG CALLBACK veh_log(EXCEPTION_POINTERS* ep) {
 
     DWORD w = 0;
     if (g_veh_pipe) api().WriteFile(g_veh_pipe, h.buf, h.n, &w, nullptr);
+    // The pipe is gone the instant the session ends, and the faults that matter
+    // arrive seconds later. Land the record on disk too.
+    if (fatal) trace_text(api(), h.buf, h.n);
     if (in_payload && fatal) stage_mark(api(), "FAULT-INPAY");
     g_veh_depth = 0;
     return EXCEPTION_CONTINUE_SEARCH;
@@ -2235,6 +2255,26 @@ inline void stage_mark(Api& a, const char* s) {
     a.CloseHandle(f);
 }
 
+// Same file as stage_mark, with one number appended as hex. The stall between
+// two marks is a fact; the pointer behind it is what turns the fact into a
+// diagnosis. No separator, no newline: the file is one line by contract.
+inline void stage_mark_val(Api& a, const char* s, unsigned long long v) {
+    char buf[64];
+    unsigned int n = 0;
+    while (s[n] && n < 32) { buf[n] = s[n]; ++n; }
+    buf[n++] = '=';
+    char* p = append_hex(buf + n, v);
+    *p = 0;
+    n = static_cast<unsigned int>(p - buf);
+    HANDLE f = a.CreateFileA("D:\\zendo\\work\\repl_stage.bin", GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    a.WriteFile(f, buf, n, &w, nullptr);
+    a.CloseHandle(f);
+}
+
 // Every function we point a captured closure at has to pass the same CFG check
 // the dispatcher performs, so its map bit is armed here instead of relying on a
 // previous stage having done it. The page is brought in only when the map has
@@ -2729,20 +2769,47 @@ static unsigned long long g_cap_f = 0;
 static unsigned long long g_ours[16] = {};
 static int g_ours_n = 0;
 static HANDLE g_cap_pipe = INVALID_HANDLE_VALUE;
+// Set once the Lua-side print capture chunk has run in this process. A raw
+// chunk installs it on first use; a deferred session never does, so the
+// client's own `print` keeps writing to CreatorOutput where the host reads it.
+static int g_capi_ready = 0;
+// Raw-only setup (closure capture, CFG arm, global bindings) runs once, on the
+// first chunk that actually needs it. A deferred session must not trigger it.
+static int g_bind_ready = 0;
 // Set by the `x` command. It means "detach for good": unwind out of the REPL
 // so DllMain can restore the borrowed thread. A payload that stays parked keeps
 // the process in a state the anti-cheat refuses to terminate - the window dies
 // but the pid survives, and only a reboot clears it.
 static int g_leave = 0;
+// The `zendo-live` mutex, owned by whichever thread is serving the session.
+// Hoisted out of beacon() so the session thread can hand the ownership back
+// before it parks: a parked thread that still owns it would read as a live
+// payload forever and every later injection would be skipped.
+static HANDLE g_live_mutex = nullptr;
 // Counts completed sessions. Written to work/loop.bin after each one, which is
 // how "the seek loop is alive" is proven instead of assumed.
 static unsigned int g_loop_n = 0;
+// Bumped every second by the seek loop while no server is listening. Its mtime
+// is the host's liveness oracle: a mutex can read free while the owner lives,
+// a file that stops being touched cannot.
+static unsigned int g_seek_n = 0;
 static int g_cap_mode = 0;   // 0 = untouched, 1 = swap only, 2 = +read args, 3 = +pipe
-static int g_api_live = 0;   // the closure slot carries native_api for this session
+static int g_api_live = 0;   // the closure slot currently carries our C function
 static unsigned int g_cap_calls = 0;
+// The closure is swapped only for the window a chunk of ours is running, and
+// only on the thread running it. Everything else in the client - the game's own
+// prints, CoreGui chatter, the scheduler - takes the untouched function pointer
+// and pays one branch. Leaving the swap in place for the whole session is what
+// put a CreateFile/WriteFile/CloseHandle in the client's print path.
+static int g_cap_capture = 0;
+static int g_cap_depth = 0;
+static unsigned long long g_cap_tid = 0;
+static int g_cfg_done = 0;
+// Diagnostics write files. Off by default: the hook path must never touch disk.
+static int g_diag = 0;
 
 inline void cap_put(const char* s, unsigned int n) {
-    if (g_cap_pipe == INVALID_HANDLE_VALUE) return;
+    if (!g_cap_capture || g_cap_pipe == INVALID_HANDLE_VALUE) return;
     static char line[4224];
     unsigned int k = 0;
     line[k++] = 'P';
@@ -3063,6 +3130,7 @@ inline bool api_write(unsigned long long addr, const char* src, unsigned int len
 // last thing in the file, so a fault can be pinned to an operation without a
 // debugger attached.
 inline void api_step(char phase, int op) {
+    if (!g_diag) return;
     HANDLE f = api().CreateFileA("D:\\zendo\\work\\api_step.bin", GENERIC_WRITE,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -3308,9 +3376,17 @@ inline int lua_compile_remote(unsigned long long l, const char* src, unsigned in
 // Defined after exec_raw, next to the call machinery it borrows.
 int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen);
 int zendo_http_op(unsigned long long l);
+int zendo_gc_op(unsigned long long l, bool walk);
+int zendo_gcfill_op(unsigned long long l);
+int zendo_gspage_op(unsigned long long l);
+int zendo_gcforce_op(unsigned long long l);
 
 inline int native_api(void* L) {
     unsigned long long l = reinterpret_cast<unsigned long long>(L);
+    // Only meaningful while a chunk of ours is running on our own thread. A
+    // call that arrives outside that window is a stale reference from the
+    // client, and it gets nothing: no allocation, no Lua walk, no file.
+    if (!g_cap_capture) return 0;
     // A dedicated page, not a static in the image: the write op changes page
     // protection, and touching the page our own code lives on is a variable
     // this test does not need.
@@ -3329,7 +3405,7 @@ inline int native_api(void* L) {
     }
     // Every entry is recorded, matched or not: the fallback prints, so the log
     // cannot tell "dispatcher ran and fell through" from "never called".
-    {
+    if (g_diag) {
         HANDLE f = api().CreateFileA("D:\\zendo\\work\\api.bin", GENERIC_WRITE,
                                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -3427,6 +3503,36 @@ inline int native_api(void* L) {
             int r = zendo_http_op(l);
             api_step('E', 34);
             return r;
+        }
+
+        // The GC object list. probe answers with the offsets it proved, walk
+        // hands back the objects themselves as ordinary Lua values.
+        // No api_step here: this op runs in tight loops (one call per batch of
+        // objects), and two file writes per call dominated the run time and
+        // widened the window where the collector could move under the walk.
+        if (op_is(op, oplen, "zendo:gcprobe") || op_is(op, oplen, "zendo:gcpage")) {
+            return zendo_gc_op(l, op_is(op, oplen, "zendo:gcpage"));
+        }
+
+        // Bulk collector read: writes objects straight into a Lua table array
+        // instead of pushing each one through the frame. Same live-heap rules as
+        // the page walk, but the imported surface is one table instead of a
+        // borrowed stack window, which is what a full getgc needs.
+        if (op_is(op, oplen, "zendo:gcfill")) {
+            return zendo_gcfill_op(l);
+        }
+
+        // List geometry, measured against the live global_State instead of
+        // assumed: gspage walks listprev to the head of allgcopages and then
+        // reports the offset inside global_State that points at it.
+        if (op_is(op, oplen, "zendo:gspage")) {
+            return zendo_gspage_op(l);
+        }
+
+        // collectgarbage("collect") without going through the registration
+        // table: the same C entry, called directly on the caller's thread.
+        if (op_is(op, oplen, "zendo:gcforce")) {
+            return zendo_gcforce_op(l);
         }
 
         // A raw window into a closure's Proto. Nothing here interprets the
@@ -4178,7 +4284,12 @@ inline int native_loadbytecode(void* L) {
 inline int native_api(void* L);
 
 inline int cap_print(void* L) {
-    stage_mark(api(), "H1");
+    // Outside our window: hand straight back to the game's own print. No
+    // capture, no pipe, no file. This is the branch the client takes for every
+    // print it makes on its own.
+    if (!g_cap_capture) {
+        return g_cap_f ? reinterpret_cast<int (*)(void*)>(g_cap_f)(L) : 0;
+    }
     ++g_cap_calls;
     // Every script call that reaches our page passes through here, so this is
     // also where `zendo:op` is recognised: the first argument names the op,
@@ -4217,12 +4328,8 @@ inline int cap_print(void* L) {
         if (g_cap_mode >= 3) cap_put(d, n);
     }
     if (g_cap_f) {
-        stage_mark(api(), "H2");
-        int rc = reinterpret_cast<int (*)(void*)>(g_cap_f)(L);
-        stage_mark(api(), "H3");
-        return rc;
+        return reinterpret_cast<int (*)(void*)>(g_cap_f)(L);
     }
-    stage_mark(api(), "H4");
     return 0;
 }
 
@@ -4265,17 +4372,49 @@ inline int cfg_register(void* target) {
 }
 
 inline void cap_install() {
-    // A live dispatcher owns the closure slot for the whole session: swapping
-    // print in for the duration of every call would hide the native surface.
-    if (!g_api_live && g_cap_mode >= 1 && g_cap_closure && g_cap_f) {
-        g_cfg_status = cfg_register(reinterpret_cast<void*>(&cap_print));
-        wr64(g_cap_closure + 0x28, reinterpret_cast<unsigned long long>(&cap_print));
+    if (!g_cap_closure || !g_cap_f) return;
+    // Nesting: a session keeps the swap for its whole life, and every chunk run
+    // inside it takes the same swap again. Only the outermost install and
+    // restore touch the closure slot.
+    if (g_cap_depth++ > 0) {
+        g_cap_capture = 1;
+        return;
     }
+    // One CFG registration for the page; repeating it per chunk is a syscall
+    // that buys nothing.
+    if (!g_cfg_done) {
+        g_cfg_status = cfg_register(reinterpret_cast<void*>(&cap_print));
+        g_cfg_done = 1;
+    }
+    // The captured object is a GC closure: between sessions the collector may
+    // have taken it. Type-check it and use the guarded store so a dead object
+    // cannot turn into eight bytes of heap corruption.
+    unsigned long long tag = 0;
+    if (!readable(reinterpret_cast<const void*>(g_cap_closure), 0x30) ||
+        !read_u64(g_cap_closure + 8, &tag) ||
+        static_cast<unsigned int>((tag >> 32) & 0xff) != 8) {
+        --g_cap_depth;
+        return;
+    }
+    if (!wr64_live(g_cap_closure + 0x28,
+                   reinterpret_cast<unsigned long long>(&cap_print))) {
+        --g_cap_depth;
+        return;
+    }
+    g_cap_tid = __readgsqword(0x48);
+    g_cap_capture = 1;
+    g_api_live = 1;
 }
 
 inline void cap_restore() {
-    if (g_api_live) return;
-    if (g_cap_closure && g_cap_f) wr64(g_cap_closure + 0x28, g_cap_f);
+    if (g_cap_depth == 0) return;
+    if (--g_cap_depth > 0) return;
+    // The window closes before the pointer goes back: a print that lands between
+    // the two sees capture off and falls through to the original.
+    g_cap_capture = 0;
+    g_cap_tid = 0;
+    if (g_api_live && g_cap_closure && g_cap_f) wr64_live(g_cap_closure + 0x28, g_cap_f);
+    g_api_live = 0;
 }
 
 static bool g_flush_next = false;
@@ -4354,6 +4493,8 @@ inline int exec_raw(Api& a, HANDLE pipe, Out& o, unsigned long long L,
 
     unsigned long long t1 = 0;
     read_u64(L + 0x60, &t1);
+    trace_kv(a, "load-ret", static_cast<unsigned int>(ret));
+    trace_kv(a, "load-top", t1 - top0);
     o.str(tag);
     o.str(" load ret=");
     o.dec(static_cast<unsigned int>(ret));
@@ -4442,8 +4583,10 @@ inline int exec_raw(Api& a, HANDLE pipe, Out& o, unsigned long long L,
     beacon(a, "PRE");
     if (pipe != INVALID_HANDLE_VALUE) g_cap_pipe = pipe;
     cap_install();
+    trace_tag(a, "prot-in");
     int st = prot(reinterpret_cast<void*>(L),
                   reinterpret_cast<void*>(base + 0x2632230), &ctx);
+    trace_kv(a, "prot-st", static_cast<unsigned int>(st));
     cap_restore();
     beacon(a, "POST");
 
@@ -4706,15 +4849,536 @@ int zendo_http_op(unsigned long long l) {
     return r;
 }
 
+// --- GC pages -------------------------------------------------------------
+// This collector has no intrusive object list. Every GCO lives inside a
+// lua_Page and the pages are chained through listprev/listnext at +0x10/+0x18.
+// The page of a known object is recovered by walking the block grid backwards
+// from that object, and the head of the list by following listprev, so getgc
+// never has to trust a global_State offset. Nothing here calls the VM, and
+// every dereference is checked against the committed region map.
+
+// One VirtualQuery per region instead of one per read: a scan touching
+// thousands of blocks would otherwise spend its time in the page table.
+struct GcWindow {
+    bool live;
+    unsigned long long base;
+    unsigned long long end;
+};
+
+inline bool gc_ok(unsigned long long p, SIZE_T len, GcWindow* w) {
+    if (p < 0x10000) return false;
+    if (w->live && p >= w->base && p + len <= w->end) return true;
+    Mbi mbi;
+    if (!api().VirtualQuery) return false;
+    if (!api().VirtualQuery(reinterpret_cast<const void*>(p), &mbi, sizeof(mbi))) {
+        w->live = false;
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        w->live = false;
+        return false;
+    }
+    w->base = reinterpret_cast<unsigned long long>(mbi.BaseAddress);
+    w->end = w->base + mbi.RegionSize;
+    w->live = true;
+    return p + len <= w->end;
+}
+
+inline bool gc_u64(unsigned long long p, unsigned long long* v, GcWindow* w) {
+    if (!gc_ok(p, 8, w)) return false;
+    *v = *reinterpret_cast<volatile unsigned long long*>(p);
+    return true;
+}
+
+struct GcPage {
+    unsigned long long base;
+    unsigned long long prev;
+    unsigned long long next;
+    unsigned int pageSize;
+    unsigned int blockSize;
+    unsigned int busy;
+    int freeNext;
+};
+
+struct GcProbe {
+    unsigned long long page;
+    unsigned long long head;
+    unsigned long long index;
+    unsigned int pageSize;
+    unsigned int blockSize;
+    unsigned int busy;
+    unsigned int pages;
+    unsigned int stage;
+    unsigned int ttbyte;
+    unsigned int tag;
+};
+
+inline bool gc_page_read(unsigned long long p, GcWindow* w, GcPage* pg) {
+    if (!gc_ok(p, 0x40, w)) return false;
+    const char* b = reinterpret_cast<const char*>(p);
+    const unsigned int ps = *reinterpret_cast<const volatile unsigned int*>(b + 0x20);
+    const unsigned int bs = *reinterpret_cast<const volatile unsigned int*>(b + 0x24);
+    if (bs < 8 || bs > 0x10000 || ps < 0x40 + bs || ps > 0x400000) return false;
+    const unsigned long long blocks = (ps - 0x40ull) / bs;
+    if (!blocks || blocks > 0x40000) return false;
+    const unsigned int busy = *reinterpret_cast<const volatile unsigned int*>(b + 0x34);
+    if (busy > blocks) return false;
+    const int fn = *reinterpret_cast<const volatile int*>(b + 0x30);
+    if (fn < -static_cast<int>(bs) || fn > static_cast<int>((blocks - 1) * bs)) return false;
+    if (fn % static_cast<int>(bs)) return false;
+    unsigned long long prev = 0, next = 0;
+    if (!gc_u64(p + 0x10, &prev, w) || !gc_u64(p + 0x18, &next, w)) return false;
+    pg->base = p;
+    pg->prev = prev;
+    pg->next = next;
+    pg->pageSize = ps;
+    pg->blockSize = bs;
+    pg->busy = busy;
+    pg->freeNext = fn;
+    return true;
+}
+
+// A page is reachable from its own block grid: data starts at +0x40, blocks
+// are blockSize apart, and pages are 16-byte aligned heap blocks. Candidate
+// bases are rejected unless the neighbouring pages point back at them, which
+// is what separates a real page header from a table full of pointers.
+inline bool gc_page_linked(unsigned long long p, GcWindow* w) {
+    GcPage pg;
+    if (!gc_page_read(p, w, &pg)) return false;
+    unsigned long long cur = p;
+    for (int i = 0; i < 64; ++i) {
+        if (!pg.prev) break;
+        GcPage pp;
+        if (!gc_page_read(pg.prev, w, &pp)) return false;
+        if (pp.next != cur) return false;
+        cur = pg.prev;
+        pg = pp;
+    }
+    if (!gc_page_read(p, w, &pg)) return false;
+    cur = p;
+    for (int i = 0; i < 64; ++i) {
+        if (!pg.next) break;
+        GcPage nn;
+        if (!gc_page_read(pg.next, w, &nn)) return false;
+        if (nn.prev != cur) return false;
+        cur = pg.next;
+        pg = nn;
+    }
+    return true;
+}
+
+inline bool gc_find_page(unsigned long long obj, unsigned int tag, GcWindow* w,
+                         GcPage* out) {
+    for (unsigned long long back = 0x40; back <= 0x8000; back += 8) {
+        if (obj < back) break;
+        const unsigned long long p = obj - back;
+        GcPage pg;
+        if (!gc_page_read(p, w, &pg)) continue;
+        const unsigned long long off = back - 0x40;
+        if (off % pg.blockSize) continue;
+        if (off / pg.blockSize >= (pg.pageSize - 0x40ull) / pg.blockSize) continue;
+        // A header that validates is not proof: a run of pointers inside a big
+        // table can satisfy the same shape. The block at the target's index
+        // must also carry the collector tag the caller saw, which a wrong page
+        // cannot fake at the right grid offset.
+        if (tag) {
+            const unsigned int b0 = *reinterpret_cast<const volatile unsigned char*>(obj);
+            const unsigned int b1 = *reinterpret_cast<const volatile unsigned char*>(obj + 1);
+            if (b1 != tag && b0 != tag) continue;
+        }
+        if (!gc_page_linked(p, w)) continue;
+        *out = pg;
+        return true;
+    }
+    return false;
+}
+
+inline void gc_probe(unsigned long long target, unsigned int tag, GcProbe* pr) {
+    pr->page = pr->head = pr->index = 0;
+    pr->pageSize = pr->blockSize = pr->busy = pr->pages = 0;
+    pr->stage = 0;
+    pr->ttbyte = 1; // measured here: mark byte at +0, type byte at +1
+    pr->tag = 0;
+    if (!target) return;
+
+    GcWindow w{false, 0, 0};
+    if (!gc_ok(target, 2, &w)) return;
+    const unsigned int b0 = *reinterpret_cast<const volatile unsigned char*>(target);
+    const unsigned int b1 = *reinterpret_cast<const volatile unsigned char*>(target + 1);
+    if (tag && b1 == tag) pr->ttbyte = 1;
+    else if (tag && b0 == tag) pr->ttbyte = 0;
+    pr->tag = pr->ttbyte ? b1 : b0;
+    pr->stage |= 1;
+
+    GcPage pg;
+    if (!gc_find_page(target, tag, &w, &pg)) return;
+    pr->page = pg.base;
+    pr->pageSize = pg.pageSize;
+    pr->blockSize = pg.blockSize;
+    pr->busy = pg.busy;
+    pr->index = (target - (pg.base + 0x40)) / pg.blockSize;
+    pr->stage |= 2;
+
+    unsigned long long cur = pg.base;
+    for (unsigned int i = 0; i < 200000 && cur; ++i) {
+        GcPage c;
+        if (!gc_page_read(cur, &w, &c)) break;
+        if (!c.prev) { pr->head = cur; break; }
+        GcPage pp;
+        if (!gc_page_read(c.prev, &w, &pp) || pp.next != cur) break;
+        cur = c.prev;
+    }
+    if (!pr->head) return;
+    pr->stage |= 4;
+
+    unsigned int n = 0;
+    cur = pr->head;
+    while (cur && n < 200000) {
+        GcPage c;
+        if (!gc_page_read(cur, &w, &c)) break;
+        ++n;
+        if (!c.next) break;
+        GcPage nn;
+        if (!gc_page_read(c.next, &w, &nn) || nn.prev != cur) break;
+        cur = c.next;
+    }
+    pr->pages = n;
+    if (n) pr->stage |= 8;
+}
+
+// Measured on this client (s59): a live table reads `04 07 00 ff`, a string
+// `02 06 ...`, a closure `01 08 ...`. So CommonHeader here is marked at byte 0
+// and tt at byte 1 - the opposite of the open-source Luau order. luaM_freegco_
+// writes tt = LUA_TNIL there before a block joins the free list, which makes
+// byte 1 authoritative: live blocks name a collector tag, freed blocks read 0.
+inline unsigned int gc_block_tt(unsigned long long p, GcWindow* w) {
+    if (!gc_ok(p, 2, w)) return 0;
+    const unsigned int b1 = *reinterpret_cast<const volatile unsigned char*>(p + 1);
+    return (b1 >= 6 && b1 <= 13) ? b1 : 0;
+}
+
+// Same frame accounting as lua_ret_num, but the value qword and the type tag
+// are written as given. tag 7/8/9/10 is what the collector itself calls a
+// table, a closure, a userdata and a thread, so the VM sees an ordinary value.
+inline int lua_ret_gc(unsigned long long L, unsigned long long obj, unsigned int tag) {
+    unsigned long long top = 0;
+    if (!read_u64(L + 0x60, &top) || !top) return 0;
+    unsigned long long last = 0, ci = 0, citop = 0;
+    read_u64(L + 0x68, &last);
+    if (read_u64(L + 0x70, &ci) && ci) read_u64(ci + 0x8, &citop);
+    unsigned long long limit = last;
+    if (citop && citop < limit) limit = citop;
+    if (limit && top + 16 > limit) return 0;
+    wr64(top, obj);
+    wr64(top + 8, static_cast<unsigned long long>(tag) << 32);
+    wr64(L + 0x60, top + 16);
+    return 1;
+}
+
+inline unsigned int gc_room(unsigned long long L) {
+    unsigned long long top = 0, last = 0, ci = 0, citop = 0;
+    if (!read_u64(L + 0x60, &top) || !top) return 0;
+    read_u64(L + 0x68, &last);
+    if (read_u64(L + 0x70, &ci) && ci) read_u64(ci + 0x8, &citop);
+    unsigned long long limit = last;
+    if (citop && citop < limit) limit = citop;
+    if (!limit || top >= limit) return 0;
+    return static_cast<unsigned int>((limit - top) / 16);
+}
+
+// probe: stage, ttbyte, page, pageSize, blockSize, busy, head, pages, index, tag
+// page: page, startBlock, want -> n, nextBlock, nextPage, then the objects.
+int zendo_gc_op(unsigned long long l, bool walk) {
+    if (!walk) {
+        double tf = 0.0, tgf = 0.0;
+        unsigned long long target = 0;
+        unsigned int tag = 0;
+        if (lua_arg_num(l, 1, &tf) && tf > 0x10000)
+            target = static_cast<unsigned long long>(tf);
+        if (lua_arg_num(l, 2, &tgf) && tgf >= 0 && tgf < 32)
+            tag = static_cast<unsigned int>(tgf);
+        GcProbe pr;
+        gc_probe(target, tag, &pr);
+        int r = lua_ret_num(l, static_cast<double>(pr.stage));
+        r += lua_ret_num(l, static_cast<double>(pr.ttbyte));
+        r += lua_ret_num(l, static_cast<double>(pr.page));
+        r += lua_ret_num(l, static_cast<double>(pr.pageSize));
+        r += lua_ret_num(l, static_cast<double>(pr.blockSize));
+        r += lua_ret_num(l, static_cast<double>(pr.busy));
+        r += lua_ret_num(l, static_cast<double>(pr.head));
+        r += lua_ret_num(l, static_cast<double>(pr.pages));
+        r += lua_ret_num(l, static_cast<double>(pr.index));
+        r += lua_ret_num(l, static_cast<double>(pr.tag));
+        return r;
+    }
+
+    double pf = 0.0, bf = 0.0, wf = 16.0, rf = 0.0, ff = 0.0;
+    if (!lua_arg_num(l, 1, &pf) || pf < 0x10000) return 0;
+    if (!lua_arg_num(l, 2, &bf) || bf < 0) bf = 0;
+    if (!lua_arg_num(l, 3, &wf) || wf < 1) wf = 16;
+    lua_arg_num(l, 4, &rf);
+    lua_arg_num(l, 5, &ff);
+    const bool raw = rf > 0.5;
+    // A filter of 0 keeps tables, closures and userdata. Anything else keeps
+    // only that collector tag, so a caller can ask for one class at a time -
+    // which is also how a suspect class gets isolated without a crash fest.
+    const unsigned int keep_tt = (ff >= 6 && ff <= 13) ? static_cast<unsigned int>(ff) : 0;
+    const unsigned long long page = static_cast<unsigned long long>(pf);
+    unsigned int start = static_cast<unsigned int>(bf);
+    unsigned int want = static_cast<unsigned int>(wf);
+
+    const unsigned int room = gc_room(l);
+    const unsigned int per = raw ? 1u : 2u;
+    if (room < 8) return 0;
+    const unsigned int capwant = (room - 6) / per;
+    if (want > capwant) want = capwant;
+    if (want < 1) want = 1;
+    if (want > 48 / per) want = 48 / per;
+
+    GcWindow w{false, 0, 0};
+    GcPage pg;
+    if (!gc_page_read(page, &w, &pg)) return 0;
+    const unsigned long long blocks = (pg.pageSize - 0x40ull) / pg.blockSize;
+    // luaM_getpagewalkinfo, verbatim: blocks are handed out from the top of the
+    // page downward, so the walked region is [data + freeNext + blockSize,
+    // data + blockCount*blockSize). Everything below that was never handed out
+    // and holds uninitialised heap - reading it as objects fed garbage tags
+    // into the VM and killed the client.
+    unsigned int alloc_begin = 0;
+    const long long fn = static_cast<long long>(pg.freeNext);
+    if (fn >= 0) {
+        alloc_begin = static_cast<unsigned int>(static_cast<unsigned long long>(fn) / pg.blockSize) + 1;
+        if (alloc_begin > blocks) alloc_begin = static_cast<unsigned int>(blocks);
+    }
+    const unsigned int alloc_end = static_cast<unsigned int>(blocks);
+
+    unsigned int i = start;
+    if (i < alloc_begin) i = alloc_begin;
+    if (i > alloc_end) i = alloc_end;
+
+    unsigned long long objs[48];
+    unsigned int tags[48];
+    unsigned int got = 0;
+    while (i < alloc_end && got < want) {
+        const unsigned long long p = page + 0x40 + static_cast<unsigned long long>(i) * pg.blockSize;
+        const unsigned int tt = gc_block_tt(p, &w);
+        if (tt >= 7 && tt <= 9 && (!keep_tt || tt == keep_tt)) {
+            objs[got] = p;
+            tags[got] = tt;
+            ++got;
+        }
+        ++i;
+    }
+
+    const unsigned int nextb = i >= alloc_end ? 0u : i;
+    int r = lua_ret_num(l, static_cast<double>(got));
+    r += lua_ret_num(l, static_cast<double>(nextb));
+    r += lua_ret_num(l, static_cast<double>(pg.next));
+    r += lua_ret_num(l, static_cast<double>(pg.pageSize));
+    r += lua_ret_num(l, static_cast<double>(pg.blockSize));
+    r += lua_ret_num(l, static_cast<double>(pg.busy));
+    for (unsigned int k = 0; k < got; ++k) {
+        if (raw)
+            r += lua_ret_gc(l, objs[k], tags[k]);
+        else {
+            r += lua_ret_num(l, static_cast<double>(objs[k]));
+            r += lua_ret_num(l, static_cast<double>(tags[k]));
+        }
+    }
+    return r;
+}
+
+// zendo:gcfill(table, slot, page, startBlock, maxCount, filter)
+//
+// Fills the array part of an existing Lua table with collector objects taken
+// from one GC page. The destination is the table's own TValue array (+0x28)
+// with its capacity at +0x08, so nothing is pushed on the VM stack: one call
+// can import hundreds of objects while the borrowed frame stays untouched.
+//
+// Free blocks are the one lie the page grid tells: their first word is a
+// pointer to the next free block, and the low bytes of that pointer can land on
+// any value, including a valid collector tag. The page free list is walked
+// first and every node it names is skipped, which leaves only blocks the
+// allocator currently believes are live.
+int zendo_gcfill_op(unsigned long long l) {
+    LuaArg tab{};
+    double sf = 0.0, pf = 0.0, bf = 0.0, wf = 1.0, ff = 0.0;
+    if (!lua_arg(l, 1, &tab) || ((tab.w >> 32) & 0xff) != 7 || !tab.v) return 0;
+    if (!lua_arg_num(l, 2, &sf) || sf < 1) return 0;
+    if (!lua_arg_num(l, 3, &pf) || pf < 0x10000) return 0;
+    if (!lua_arg_num(l, 4, &bf) || bf < 0) bf = 0;
+    if (!lua_arg_num(l, 5, &wf) || wf < 1) wf = 1;
+    lua_arg_num(l, 6, &ff);
+
+    unsigned long long array = 0;
+    unsigned int size = 0;
+    read_u64(tab.v + 0x28, &array);
+    read_u32(tab.v + 0x08, &size);
+    if (!array || !size) return 0;
+
+    unsigned int slot = static_cast<unsigned int>(sf);
+    if (slot > size) return 0;
+    unsigned int want = static_cast<unsigned int>(wf);
+    const unsigned int room = size - slot + 1;
+    if (want > room) want = room;
+    if (want > 1024) want = 1024;
+
+    const unsigned int keep_tt = (ff >= 6 && ff <= 13) ? static_cast<unsigned int>(ff) : 0;
+    const unsigned long long page = static_cast<unsigned long long>(pf);
+
+    unsigned int got = 0, nextb = 0;
+    unsigned long long nextPage = 0;
+    GcWindow w{false, 0, 0};
+    GcPage pg;
+    if (!gc_page_read(page, &w, &pg)) return 0;
+    nextPage = pg.next;
+    if (!gc_ok(array + 16ull * (slot - 1), 16, &w)) return 0;
+
+    const unsigned long long blocks = (pg.pageSize - 0x40ull) / pg.blockSize;
+    // Same region luaM_visitpage walks: freeNext is the bump pointer that moves
+    // downward, so only [freeNext + blockSize, blockCount*blockSize) was ever
+    // handed out. Free blocks keep tt = LUA_TNIL (luaM_freegco_), which is the
+    // exact test the collector's own visitor uses - no free-list chase needed.
+    unsigned int alloc_begin = 0;
+    const long long fn = static_cast<long long>(pg.freeNext);
+    if (fn >= 0) {
+        alloc_begin = static_cast<unsigned int>(static_cast<unsigned long long>(fn) / pg.blockSize) + 1;
+        if (alloc_begin > blocks) alloc_begin = static_cast<unsigned int>(blocks);
+    }
+    const unsigned int alloc_end = static_cast<unsigned int>(blocks);
+
+    unsigned int i = static_cast<unsigned int>(bf);
+    if (i < alloc_begin) i = alloc_begin;
+    if (i > alloc_end) i = alloc_end;
+    while (i < alloc_end && got < want) {
+        const unsigned long long p = page + 0x40 + static_cast<unsigned long long>(i) * pg.blockSize;
+        const unsigned int tt = gc_block_tt(p, &w);
+        if (tt >= 7 && tt <= 9 && (!keep_tt || tt == keep_tt)) {
+            const unsigned long long dst = array + 16ull * (slot - 1 + got);
+            if (!gc_ok(dst, 16, &w)) break;
+            *reinterpret_cast<volatile unsigned long long*>(dst) = p;
+            *reinterpret_cast<volatile unsigned long long*>(dst + 8) =
+                static_cast<unsigned long long>(tt) << 32;
+            ++got;
+        }
+        ++i;
+    }
+    nextb = i >= alloc_end ? 0u : i;
+
+    int r = lua_ret_num(l, static_cast<double>(got));
+    r += lua_ret_num(l, static_cast<double>(nextb));
+    r += lua_ret_num(l, static_cast<double>(nextPage));
+    return r;
+}
+
+// zendo:gspage(page) -> stage, head, offset, pages, busy, global, prev, alive
+//
+// The all-pages list is a doubly linked list threaded through listprev/listnext
+// (+0x10/+0x18). Starting from any page that belongs to it, listprev walks to
+// the head; then global_State is searched for the qword that names that head.
+// Nothing is assumed: the offset is whatever this client's global_State reports,
+// and a bad guess simply fails to match and reports stage 0 for that bit.
+int zendo_gspage_op(unsigned long long l) {
+    double pf = 0.0;
+    if (!lua_arg_num(l, 1, &pf) || pf < 0x10000) return 0;
+    const unsigned long long page = static_cast<unsigned long long>(pf);
+
+    GcWindow w{false, 0, 0};
+    GcPage pg;
+    if (!gc_page_read(page, &w, &pg)) return 0;
+
+    unsigned int stage = 1;
+
+    // The anchor page itself may be mid-list; listprev walks to whatever head it
+    // can reach. This part is kept because it is cheap, but it is not trusted:
+    // the field order of lua_Page is being measured, not assumed.
+    unsigned long long ahead = page, aprev = pg.prev;
+    for (unsigned int i = 0; i < 200000 && aprev; ++i) {
+        GcPage pp;
+        if (!gc_page_read(aprev, &w, &pp) || pp.next != ahead) break;
+        ahead = aprev;
+        aprev = pp.prev;
+    }
+    unsigned int apages = 0;
+    {
+        unsigned long long cur = ahead;
+        for (unsigned int i = 0; i < 200000 && cur; ++i) {
+            GcPage c;
+            if (!gc_page_read(cur, &w, &c)) break;
+            ++apages;
+            if (!c.next) break;
+            GcPage nn;
+            if (!gc_page_read(c.next, &w, &nn) || nn.prev != cur) break;
+            cur = c.next;
+        }
+    }
+    if (apages) stage |= 8;
+
+    // global_State scan: every qword that points at a readable page is a
+    // candidate field. The real all-pages head is the one whose +0x18 chain is
+    // longest, which no incidental pointer can satisfy.
+    unsigned long long gs = 0, best = 0, bestoff = 0;
+    unsigned int bestpages = 0, bestbusy = 0;
+    read_u64(l + 0x50, &gs);
+    if (gs) {
+        for (unsigned long long off = 0; off + 8 <= 0x8000; off += 8) {
+            unsigned long long v = 0;
+            if (!gc_u64(gs + off, &v, &w)) break;
+            if (v < 0x10000) continue;
+            GcPage c;
+            if (!gc_page_read(v, &w, &c)) continue;
+            unsigned int n = 1, busy = c.busy;
+            unsigned long long cur = v, prev2 = 0;
+            while (n < 200000) {
+                GcPage cc;
+                if (!gc_page_read(cur, &w, &cc)) break;
+                if (!cc.next || cc.next == cur || cc.next == v || cc.next == prev2) break;
+                GcPage nn;
+                if (!gc_page_read(cc.next, &w, &nn)) break;
+                ++n;
+                busy += nn.busy;
+                prev2 = cur;
+                cur = cc.next;
+            }
+            if (n > bestpages) { bestpages = n; best = v; bestoff = off; bestbusy = busy; }
+        }
+    }
+    if (bestpages > 1) stage |= 2;
+    if (bestoff) stage |= 4;
+
+    int r = lua_ret_num(l, static_cast<double>(stage));
+    r += lua_ret_num(l, static_cast<double>(best));
+    r += lua_ret_num(l, static_cast<double>(bestoff));
+    r += lua_ret_num(l, static_cast<double>(bestpages));
+    r += lua_ret_num(l, static_cast<double>(bestbusy));
+    r += lua_ret_num(l, static_cast<double>(gs));
+    r += lua_ret_num(l, static_cast<double>(ahead));
+    r += lua_ret_num(l, static_cast<double>(apages));
+    return r;
+}
+
+// collectgarbage("collect") is this call: registration RVA 0x71b8290 names the
+// C function at 0x4320A80, whose collect path passes only L to 0x265D9F0. Call
+// the callee, not the registration: no string argument to build, no table walk.
+int zendo_gcforce_op(unsigned long long l) {
+    if (!g_base) return 0;
+    typedef void (*FullGcFn)(void*);
+    FullGcFn fullgc = reinterpret_cast<FullGcFn>(g_base + 0x265D9F0);
+    fullgc(reinterpret_cast<void*>(l));
+    return lua_ret_num(l, 1.0);
+}
+
 // Runs the flush chunk with the report pipe muted: the payload's chatter would
 // otherwise flood the UI on every script. Only `P` lines survive.
 inline void flush_capture(Api& a, Out& o, unsigned long long L, unsigned long long base) {
     if (g_cap_pipe == INVALID_HANDLE_VALUE) return;
     static Out quiet;
     quiet.reset();
-    g_flush_next = true;
-    exec_raw(a, INVALID_HANDLE_VALUE, quiet, L, base, kChunkFlush, kChunkFlushLen, "flush");
+    // cap_print already wrote every line straight to the pipe as it happened.
+    // The flush chunk only clears the Luau-side buffer; re-emitting its return
+    // value is what printed each line twice.
     g_flush_next = false;
+    exec_raw(a, INVALID_HANDLE_VALUE, quiet, L, base, kChunkFlush, kChunkFlushLen, "flush");
 }
 
 inline DWORD run_pcall() {
@@ -8628,42 +9292,21 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     g_veh_base = base;
     g_veh_L = L;
 
-    // Lua-side print capture. Every later chunk's `print` output lands in a
-    // buffer this same thread drains after the chunk returns. Re-running the
-    // chunk on each session is safe: the wrapper is idempotent and the buffer
-    // starts empty.
+    // print capture is installed lazily: only a raw chunk needs the pipe to
+    // carry its print traffic. A deferred body runs on the scheduler and its
+    // print has to reach the client's own log, so the global `print` must stay
+    // the client's, not our buffering wrapper.
     g_cap_pipe = pipe;
-    exec_raw(a, pipe, o, L, base, kChunkCapi, kChunkCapiLen, "capi");
-    flush_capture(a, o, L, base);
-    // The closure every script call travels through. Captured once; its C
-    // function pointer is what the dispatcher replaces.
-    if (!g_cap_closure)
-        exec_raw(a, pipe, o, L, base, kChunkKCaptureBody, kChunkKCaptureLen, "zcapture");
+    // Nothing else is armed here on purpose. A `d` session must touch the VM
+    // exactly once - the wrapper that hands the body to the scheduler. Capture
+    // setup and global bindings are raw-only and happen in that branch below.
 
-    // Install the dispatcher for the session. The captured print closure keeps
-    // its identity; only its C function pointer is swapped, so an armed call
-    // target is all CFG needs. Capture stays on (mode 3): the dispatcher falls
-    // back into cap_print for anything that is not a zendo op.
-    if (g_cap_closure && g_cap_f) {
-        g_cap_mode = 3;
-        if (arm_cfg(a, o, reinterpret_cast<unsigned long long>(&native_api), "api cfg")) {
-            wr64(g_cap_closure + 0x28, reinterpret_cast<unsigned long long>(&native_api));
-            g_api_live = 1;
-            o.str("api live clo=");
-            o.hex(g_cap_closure);
-            o.nl();
-        } else {
-            o.str("api cfg failed, surface off\n");
-        }
-        flush_out(a, pipe, o);
-    }
-
-    // Global bindings. Runs while the dispatcher already owns the closure, so
-    // the setup chunk can hand plain Luau scripts the same door under their own
-    // names: `loadstring(src)`, `read`, `write`, `dm`, `base`, `svc`, `svcs`.
-    // The chunk gets the closure as its vararg, exactly like a pipe chunk.
-    if (g_api_live)
-        exec_raw(a, pipe, o, L, base, kZGlobalBody, kZGlobalLen, "gbind");
+    // Nothing is armed here on purpose. Every VM entry below happens inside
+    // exec_raw's window, on this thread, with the closure swapped back the
+    // moment the call returns. Leaving the swap installed for the whole session
+    // - or entering the VM from here to install global bindings - is a second
+    // writer beside the client's own scheduler, and that race is what killed
+    // the client seconds after a session ended with its body never running.
 
     for (;;) {
         stage_mark(a, "RDY");
@@ -8671,11 +9314,32 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         flush_out(a, pipe, o);
         char cmd[16];
         DWORD rd = 0;
+        // Peek before reading. A blocking ReadFile on a connection whose server
+        // is already gone parks this thread forever, and a parked payload is
+        // worse than a missing one: the host reads "no session", maps a second
+        // image, and two payloads end up in one client.
+        if (a.PeekNamedPipe && a.Sleep) {
+            bool ready = false;
+            for (int spin = 0; spin < 60; ++spin) {
+                DWORD avail = 0;
+                if (!a.PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) {
+                    trace_tag(a, "peek-gone");
+                    break;
+                }
+                if (avail) { ready = true; break; }
+                a.Sleep(50);
+            }
+            if (!ready) {
+                beacon(a, "PEEKIDLE");
+                break;
+            }
+        }
         if (!a.ReadFile(pipe, cmd, 1, &rd, nullptr) || rd == 0) {
             beacon(a, "EOF");
             break;
         }
         cmd[1] = 0;
+        trace_tag(a, cmd);
         stage_mark(a, cmd);
         // Detach: leave the client with no payload thread parked inside it.
         if (cmd[0] == 'x') {
@@ -8687,7 +9351,7 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         // client. Only the idle timeout leaves DllMain for good, and that path
         // restores the borrowed thread's saved context on the way out.
         if (cmd[0] == 'q') break;
-        if (cmd[0] == 'L' || cmd[0] == 'i') {
+        if (cmd[0] == 'L' || cmd[0] == 'i' || cmd[0] == 'd') {
             unsigned int want_id = 7;
             if (cmd[0] == 'i') {
                 char idb[1];
@@ -8757,7 +9421,29 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
                 wr64(E2 + 0x70, want_id);
             }
             stage_mark(a, "EXEC");
-            exec_raw(a, pipe, o, L, base, lbuf, blen, cmd[0] == 'i' ? "ident" : "raw dyn");
+            // Raw-only setup. A deferred session never reaches this branch, so
+            // it never swaps the print closure and never installs bindings:
+            // one VM entry, the wrapper, and nothing else.
+            if (cmd[0] != 'd' && !g_bind_ready) {
+                if (!g_cap_closure)
+                    exec_raw(a, pipe, o, L, base, kChunkKCaptureBody, kChunkKCaptureLen, "zcapture");
+                if (g_cap_closure && g_cap_f)
+                    arm_cfg(a, o, reinterpret_cast<unsigned long long>(&native_api), "api cfg");
+                if (g_cap_closure && g_cap_f)
+                    exec_raw(a, pipe, o, L, base, kZGlobalBody, kZGlobalLen, "gbind");
+                g_bind_ready = 1;
+            }
+            if (cmd[0] != 'd' && !g_capi_ready) {
+                exec_raw(a, pipe, o, L, base, kChunkCapi, kChunkCapiLen, "capi");
+                g_capi_ready = 1;
+            }
+            // A raw chunk is the only place print traffic is captured, and it
+            // owns the pipe while it runs. A deferred body never captures: its
+            // print has to reach the client's log where the host reads it.
+            if (cmd[0] != 'd') g_cap_mode = 3;
+            exec_raw(a, pipe, o, L, base, lbuf, blen,
+                     cmd[0] == 'i' ? "ident" : (cmd[0] == 'd' ? "defer" : "raw dyn"));
+            if (cmd[0] != 'd') g_cap_mode = 0;
             if (swapped) {
                 wr64(E2 + 0x70, oldid);
                 o.str("ident restored=");
@@ -8765,7 +9451,11 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
                 o.nl();
                 flush_out(a, pipe, o);
             }
-            flush_capture(a, o, L, base);
+            // A deferred chunk hands its body to the client scheduler and returns
+            // immediately. Draining the capture buffer here would put this
+            // payload thread back inside the VM while the scheduler owns it -
+            // the exact race the deferred path exists to avoid.
+            if (cmd[0] != 'd') flush_capture(a, o, L, base);
             stage_mark(a, "DONE");
             continue;
         }
@@ -9830,8 +10520,8 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     // GC closure, and between sessions the collector may already have taken it
     // back. A blind store there is what ended the payload thread right after
     // `q` and left the client alive with an abandoned mutex.
-    if (g_api_live && g_cap_closure && g_cap_f)
-        wr64_live(g_cap_closure + 0x28, g_cap_f);
+    cap_restore();
+    g_cap_depth = 0;
     g_api_live = 0;
     g_cap_mode = 0;
     g_cap_closure = 0;
@@ -9844,11 +10534,11 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     return 0;
 }
 
-// One injection, many sessions. The payload keeps the borrowed thread open and
-// waits for the next pipe server instead of returning from DllMain, so the UI
-// can push another chunk without re-mapping the image. 90 s with no server at
-// all and the thread goes back to the stub, so a dead UI cannot leave a stray
-// image pinned in the client forever.
+// One injection, many sessions. The session thread waits for the next pipe
+// server instead of ending after one chunk, so the UI can push another script
+// without re-mapping the image. Twenty minutes with no server at all and the
+// thread hands the live mutex back and parks, so a dead UI cannot leave a
+// payload that the host mistakes for a live one.
 inline DWORD run_repl() {
     DWORD st = resolve_api();
     if (st) {
@@ -9857,6 +10547,7 @@ inline DWORD run_repl() {
     }
     Api& a = api();
     stage_mark(a, "E1-API");
+    trace_tag(a, "enter");
     // No single-instance guard here. A mutex was tried twice and both versions
     // hurt: the first rejected the second injection outright, the second parked
     // the borrowed thread for seconds and the client dropped its websocket. The
@@ -9885,11 +10576,20 @@ inline DWORD run_repl() {
     unsigned long long fake = 0, dm = 0;
     read_u64(base + k_fake_dm_static, &fake);
     read_u64(fake + k_fake_dm_to_dm, &dm);
-    stage_mark(a, "E4-DM");
+    stage_mark_val(a, "E4-DM", dm);
+    stage_mark(a, "E4a-FS");
     unsigned long long sc = find_service(base, base + k_script_context_vtable, dm);
+    if (!sc) {
+        stage_mark_val(a, "E4b-FS0", dm);
+    } else {
+        stage_mark_val(a, "E4b-FS1", sc);
+    }
     unsigned long long L = sc ? decode_split(sc + k_slot_a) : 0;
     if (!L) {
+        if (sc) stage_mark_val(a, "E4c-SCOK", decode_split(sc + k_slot_a));
+        stage_mark(a, "E4c-NOSTATE");
         for (int i = 0; i < 100; ++i) {
+            stage_mark(a, "E4d-PIPE");
             HANDLE pipe = a.CreateFileA("\\\\.\\pipe\\zendo-dev",
                                         GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                         OPEN_EXISTING, 0, nullptr);
@@ -9916,12 +10616,19 @@ inline DWORD run_repl() {
                                     OPEN_EXISTING, 0, nullptr);
         if (pipe == INVALID_HANDLE_VALUE) {
             if ((idle++ % 100) == 0) stage_mark(a, "SEEK");
-            // Twenty minutes, not one second. A session is one run; the next run
-            // creates a new server and this loop is what connects to it. Bailing
-            // out early is what forced a fresh injection (and a fresh image) for
-            // every script, which is the opposite of what a repeated test loop
-            // needs.
-            if (idle > 24000) {
+            // Heartbeat: the mtime of loop.bin answers "is a payload thread
+            // still hunting for a server" from the host, without a mutex that
+            // can be read free while the owner is alive. Only the seek loop
+            // writes it, so a stale stamp means the thread is gone.
+            if ((idle % 20) == 0) loop_mark(a, ++g_seek_n);
+            if ((idle % 100) == 0) trace_tag(a, "seek");
+            // Ten seconds, not twenty minutes. The session now runs on the
+            // borrowed client thread, so this loop is the thread's whole
+            // lifetime: after one run the thread has to go back to its wait
+            // before anything scans for foreign code. A long-lived seek loop
+            // was the previous design and it lost the thread seconds after
+            // every session anyway.
+            if (idle > 200) {
                 // Leave DllMain: the stub restores the borrowed thread's
                 // original context, so nothing is left parked inside this
                 // client for a watchdog to find.
@@ -9937,7 +10644,10 @@ inline DWORD run_repl() {
         }
         idle = 0;
         beacon(a, "PIPE");
-        serve_session(a, pipe, base, L);
+        trace_tag(a, "conn");
+        DWORD served = serve_session(a, pipe, base, L);
+        trace_tag(a, "ret");
+        stage_mark_val(a, "SESS-RET", served);
         g_cap_pipe = INVALID_HANDLE_VALUE;
         stage_mark(a, "PRE-CLOSE");
         a.CloseHandle(pipe);
@@ -9947,12 +10657,11 @@ inline DWORD run_repl() {
             stage_mark(a, "EXIT-DETACH");
             return 111;
         }
-        // The server that just ended is still closing its instance. Give it a
-        // moment so this loop reconnects to the next server, not the corpse.
+        // Stay here. This thread is the only payload in the client; the next
+        // Execute has to connect to it, not map a second image on top. Three
+        // images in one client is what froze it - one image serving three runs
+        // is the design.
         if (a.Sleep) a.Sleep(150);
-        // Heartbeat: the number grows only while this thread keeps looping, so
-        // two reads of work/loop.bin a few seconds apart answer "is the payload
-        // still alive" without a debugger and without a second injection.
         loop_mark(a, ++g_loop_n);
     }
 }
@@ -10010,6 +10719,10 @@ inline void mutex_diag(Api& a, HANDLE h) {
 // Same as STAGE_MARK but a different file, and it takes a number: proof that
 // the seek loop is still iterating after a session ended. The stage file is
 // overwritten by whatever runs last, so it cannot answer that question.
+// Written by the seek loop only; the host reads its mtime as the liveness
+// heartbeat ("a payload thread is still hunting for a server").
+// Written by the seek loop only; the host reads its mtime as the liveness
+// heartbeat ("a payload thread is still hunting for a server").
 inline void loop_mark(Api& a, unsigned int n) {
     char buf[16];
     char* p = buf;
@@ -10028,6 +10741,72 @@ inline void loop_mark(Api& a, unsigned int n) {
     a.CloseHandle(f);
 }
 
+inline HANDLE trace_open(Api& a) {
+    // One file per step, not an append: the payload has no SetFilePointer and
+    // CREATE_ALWAYS truncates. Sorted by mtime the files read as a timeline,
+    // and each thread id keeps its own column.
+    //
+    // The image id is in the name because the OS reuses thread ids: two images
+    // in one client produced byte-identical names and the second silently
+    // erased the first. Twelve bits of this function's own address is enough
+    // to tell one mapping from the next.
+    static unsigned int seq = 0;
+    char buf[96];
+    char* p = buf;
+    const char pre[] = "D:\\zendo\\work\\tr-";
+    for (unsigned i = 0; pre[i]; ++i) *p++ = pre[i];
+    unsigned long long img =
+        reinterpret_cast<unsigned long long>(&trace_open) >> 12 & 0xffffull;
+    p = append_hex(p, img);
+    *p++ = '-';
+    p = append_hex(p, __readgsqword(0x48));
+    *p++ = '-';
+    unsigned int v = ++seq;
+    char tmp[12]; int k = 0;
+    while (v) { tmp[k++] = static_cast<char>('0' + (v % 10)); v /= 10; }
+    while (k) *p++ = tmp[--k];
+    const char post[] = ".log";
+    for (unsigned i = 0; post[i]; ++i) *p++ = post[i];
+    *p = 0;
+    return a.CreateFileA(buf, GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+inline void trace_tag(Api& a, const char* tag) {
+    HANDLE f = trace_open(a);
+    if (f == INVALID_HANDLE_VALUE) return;
+    unsigned int n = 0;
+    while (tag[n] && n < 48) ++n;
+    DWORD wrote = 0;
+    a.WriteFile(f, tag, n, &wrote, nullptr);
+    a.CloseHandle(f);
+}
+
+inline void trace_text(Api& a, const char* text, unsigned int n) {
+    HANDLE f = trace_open(a);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    a.WriteFile(f, text, n, &wrote, nullptr);
+    a.CloseHandle(f);
+}
+
+// tag=hexdeadbeef. Numeric steps file the value where a human can read it
+// without a live pipe: a session that dies mid-call has no pipe left.
+inline void trace_kv(Api& a, const char* tag, unsigned long long v) {
+    HANDLE f = trace_open(a);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char buf[64];
+    char* p = buf;
+    unsigned int n = 0;
+    while (tag[n] && n < 24) { *p++ = tag[n]; ++n; }
+    *p++ = '=';
+    p = append_hex(p, v);
+    DWORD wrote = 0;
+    a.WriteFile(f, buf, static_cast<unsigned int>(p - buf), &wrote, nullptr);
+    a.CloseHandle(f);
+}
+
 inline DWORD beacon() {
     g_veh_tid = __readgsqword(0x48);
     // Claim the one-payload slot. Nothing else in the image created this
@@ -10037,14 +10816,16 @@ inline DWORD beacon() {
     // "a payload is parked here". The kernel abandons it when this thread
     // dies, so a dead payload reads as no session instead of blocking injects.
     //
-    // resolve_api first: the table is zeroed until someone fills it, and a
-    // null import here is not a failed call, it is a jump to address zero in
-    // the middle of a borrowed game thread.
+    // The mutex is created unowned and never waited on: an owned handle is
+    // abandoned only when its thread dies, and a session that ends cleanly
+    // leaves the thread alive - the next image would then wait forever on a
+    // mutex nobody is going to release. Ownership is not a liveness signal the
+    // host needs; the heartbeat file is.
     if (!api().CreateMutexA) resolve_api();
-    static HANDLE live = nullptr;
-    if (!live && api().CreateMutexA)
-        live = api().CreateMutexA(nullptr, TRUE, "zendo-live");
-    mutex_diag(api(), live);
+    if (!g_live_mutex && api().CreateMutexA) {
+        g_live_mutex = api().CreateMutexA(nullptr, FALSE, "zendo-live");
+    }
+    mutex_diag(api(), g_live_mutex);
 #if ZENDO_STAGE == 65
     return 111;
 #elif ZENDO_STAGE == 64
@@ -10246,12 +11027,24 @@ inline DWORD beacon() {
     return code;
 }
 
-// The hijack stub hands the saved CONTEXT over as the third DllMain argument,
-// so the borrowed game thread does not have to be released by the stub itself.
-// The session runs here, and when it ends we reload that context: the thread
-// continues in the wait it was taken from instead of staying pinned inside this
-// manually mapped image until the client notices and dies.
+// The hijack stub hands the saved CONTEXT over as the third DllMain argument.
+// That argument is still recorded, but the stub is now the one that reloads it:
+// DllMain starts a thread of our own and returns immediately, so the `call rax`
+// in the stub lands on the restore path within milliseconds. Keeping the game
+// thread parked here instead was the reason a frozen client could not be
+// terminated - one pinned thread and the loader lock were enough for
+// TerminateProcess to give up.
 static unsigned long long g_restore_ctx = 0;
+
+// The handle is created unowned, so this only exists for symmetry: a session
+// that ends cleanly must not leave the next image staring at a mutex nobody
+// owns. Nothing waits on it, nothing parks.
+inline void release_live() {
+    if (g_live_mutex && api().CloseHandle) {
+        api().CloseHandle(g_live_mutex);
+        g_live_mutex = nullptr;
+    }
+}
 
 inline void leave_thread() {
     if (!g_restore_ctx) return;
@@ -10265,14 +11058,94 @@ inline void leave_thread() {
     if (restore) restore(reinterpret_cast<void*>(ctx), 0);
 }
 
+// The whole session lives on this thread. DllMain used to host it, which meant
+// the borrowed client thread never returned to its wait; here the client gets
+// its thread back before the first pipe is even opened.
+//
+// When the seek loop ends (twenty minutes without a server, or an explicit
+// detach) the mutex is handed back and the thread parks instead of exiting.
+// Exiting would run the loader's thread-detach path, which this client has
+// already killed threads for (STATUS_BAD_TLS_INDEX); a parked thread costs one
+// stack and holds nothing, and because the mutex is free the host reads "no
+// session" and injects cleanly next time.
+inline DWORD WINAPI session_thread(void*) {
+    DWORD code = beacon();
+    Api& a = api();
+    // A duplicate image parks without releasing anything: it never owned the
+    // mutex, never installed a hook, and must not wake up to serve a session.
+    if (code == 222) {
+        if (a.Sleep) a.Sleep(0x7fffffff);
+        return code;
+    }
+    if (g_live_mutex && a.ReleaseMutex) a.ReleaseMutex(g_live_mutex);
+    if (a.Sleep) a.Sleep(0x7fffffff);
+    return code;
+}
+
+// A start routine inside a manually mapped image is not a legal call target.
+// Measured: CreateThread returned a handle, the handle read STILL_ACTIVE, the
+// thread never executed one byte of session_thread - and a control thread
+// whose start routine was kernel32!Sleep ran to completion in the same call.
+// The thread exists, it is simply stopped at the call-target check.
+//
+// A page allocated with PAGE_TARGETS_INVALID starts with no valid targets and
+// can opt individual offsets back in, which is the one path that worked for
+// the print hook. The thread starts on this trampoline - a legal target - and
+// the trampoline jumps into the real function with a raw jump no dispatcher
+// checks.
+inline unsigned long long thread_trampoline(void* fn) {
+    Api& a = api();
+    if (!a.VirtualAlloc || !a.SetProcessValidCallTargets || !fn) return 0;
+    constexpr DWORD kTargetsInvalid = 0x40000000;
+    unsigned char* page = static_cast<unsigned char*>(
+        a.VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                       PAGE_EXECUTE_READWRITE | kTargetsInvalid));
+    if (!page) return 0;
+    page[0] = 0x48;  // mov rax, imm64
+    page[1] = 0xB8;
+    unsigned long long target = reinterpret_cast<unsigned long long>(fn);
+    for (int i = 0; i < 8; ++i)
+        page[2 + i] = static_cast<unsigned char>(target >> (8 * i));
+    page[10] = 0xFF;  // jmp rax
+    page[11] = 0xE0;
+    HANDLE self = reinterpret_cast<HANDLE>(static_cast<long long>(-1));
+    if (a.FlushInstructionCache) a.FlushInstructionCache(self, page, 0x1000);
+    static CfgCallTargetInfo info[1];
+    info[0].Offset = 0;
+    info[0].Flags = 1;  // CFG_CALL_TARGET_VALID
+    if (!a.SetProcessValidCallTargets(self, page, 0x1000, 1, info)) {
+        a.VirtualFree(page, 0, MEM_RELEASE);
+        return 0;
+    }
+    return reinterpret_cast<unsigned long long>(page);
+}
+
 }  // namespace zendo
 
 extern "C" BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         zendo::g_restore_ctx = reinterpret_cast<unsigned long long>(reserved);
-        DWORD code = zendo::beacon();
-        zendo::leave_thread();
-        return code;
+        zendo::resolve_api();
+        // The borrowed thread is given back before the first byte hits the
+        // pipe. It may well be the client's main thread - the hijack prefers an
+        // alertable wait, and that is the message pump - so holding it for a
+        // session is a frozen window, not a session.
+        unsigned long long start =
+            zendo::thread_trampoline(reinterpret_cast<void*>(&zendo::session_thread));
+        zendo::stage_mark(zendo::api(), start ? "D2-TRAMP" : "D2-NOTRAMP");
+        DWORD tid = 0;
+        HANDLE worker = (start && zendo::api().CreateThread)
+            ? zendo::api().CreateThread(nullptr, 0,
+                  reinterpret_cast<LPTHREAD_START_ROUTINE>(start), nullptr, 0, &tid)
+            : nullptr;
+        zendo::stage_mark(zendo::api(), worker ? "D3-OK" : "D3-NULL");
+        if (worker) {
+            if (zendo::api().CloseHandle) zendo::api().CloseHandle(worker);
+            return TRUE;
+        }
+        // No worker means no session; run it inline rather than lose the
+        // injection. The stub reloads the context once this returns.
+        zendo::beacon();
     }
     return TRUE;
 }
