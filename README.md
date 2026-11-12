@@ -180,6 +180,16 @@ The host still reads `work/loop.bin` as a hint that an injection from the
 previous second is polling for its server, but the window is 300 ms and it is
 never a gate.
 
+After a deferred chunk the payload now gives the thread back after **one second**
+of waiting for the host's closing byte, instead of ten. The body it queued can
+only start on the client's scheduler once that thread is back in the client, so
+the wait was pure stall: a borrowed thread that the engine wanted kept the
+deferred body from running, the engine timed the script out at 24 s, and the
+place shut down. One second is 20x the host's round trip, and it caps the damage
+if the picker ever lands somewhere the engine needed. Completion is decided in
+one place only: the `zendo://done` line in the client's own log. `END` on the
+pipe means the payload handed the body over, not that it ran.
+
 ### 2. Control-flow guard
 
 This client runs with Control Flow Guard enabled, and the dispatcher that rejects
@@ -715,7 +725,7 @@ These exist because each one was learned the hard way.
 | Game freezes/crashes on Execute in a new place | payload ran inline on a hijacked client thread and then parked there in the seek loop; the place transition killed it inside `DllMain` | fixed: one injection serves one session, then the borrowed thread is restored; no resident thread, no lock left orphaned |
 | Fourth Execute freezes the window, client log says `Script has run for over 24 seconds` | the picker borrowed the client's scheduler thread (`0x2014`); the session parked it waiting on a sentinel only that thread could produce | fixed: threads that own a window or start at the image entry point are never candidates; every pick is logged to `%TEMP%\zendo-pick.log` |
 | Second Execute after switching games uses a dead DataModel | a resident payload decoded `L` once at injection and kept it across place changes | fixed by the same change: every Execute injects a fresh image, so `L` is always the current place's |
-| Deferred script reports no completion | payload left the session after 3 s of silence, before the scheduler printed the sentinel | payload waits 30 s after a `d` session; host polls the log 6 s after the pipe closes |
+| Deferred script reports no completion | payload left the session after 3 s of silence, before the scheduler printed the sentinel | the payload waits 1 s after a `d` session (it only needs the host's closing byte), and the host polls the client log for the sentinel for 15 s; a deferred run without the sentinel is an error, never a silent success |
 | Load-config probe leaves the client gone | session landed on a thread the protector already saw | relaunch before the next probe |
 
 ---

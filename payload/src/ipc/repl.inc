@@ -95,7 +95,16 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
         // image, and two payloads end up in one client.
         if (a.PeekNamedPipe && a.Sleep) {
             bool ready = false;
-            const int spins = deferred ? 200 : 60;
+            // After a deferred chunk there is exactly one thing left: the host
+            // closing the session. Give it a full second to do that, then go
+            // home. Holding a borrowed client thread longer than this is the
+            // difference between a clean run and a stalled scheduler: a
+            // deferred body can only start once this thread is back in the
+            // client, and the engine starts timing a script out at ~24 s. One
+            // second of grace is 20x the round trip the host actually needs,
+            // and it caps the damage if the borrowed thread turns out to be one
+            // the engine wanted.
+            const int spins = deferred ? 20 : 60;
             for (int spin = 0; spin < spins; ++spin) {
                 DWORD avail = 0;
                 if (!a.PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) {

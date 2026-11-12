@@ -327,6 +327,11 @@ fn payload_seeking() -> bool {
 
 fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, String> {
     let t0 = Instant::now();
+    // A deferred run completes on the client's scheduler, so the only proof it
+    // ran is the sentinel in the client's own log. `END` on the pipe means the
+    // payload finished handing the body over, not that the body ran.
+    let deferred = spec.trim().is_empty()
+        || spec.split(',').any(|t| matches!(t.trim(), "defer" | "d"));
     let path = temp_script(&source)?;
     // Deferred on purpose: the body is handed to the client's scheduler, so the
     // VM is never entered from the payload thread while the client runs it. A
@@ -501,7 +506,17 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
     // is already gone; a run that has it must not be reported as a failure just
     // because the payload got to CloseHandle first. A run that never reports
     // pays the longer wait exactly once.
-    let polls = if done.load(Ordering::Relaxed) { 2 } else { 24 };
+    let polls = if done.load(Ordering::Relaxed) {
+        2
+    } else if deferred {
+        // The payload gives the borrowed thread back one second after queueing
+        // the body, so the log line can land after the pipe is already gone.
+        // Fifteen seconds is the engine's own patience with a script before it
+        // starts complaining, and it is still inside the watchdog.
+        60
+    } else {
+        24
+    };
     for i in 0..polls {
         std::thread::sleep(std::time::Duration::from_millis(250));
         let raw = tail(log_start.clone());
@@ -526,12 +541,29 @@ fn run_blocking(app: AppHandle, source: String, spec: String) -> Result<RunOut, 
             // ERROR_NO_DATA (232) is the payload closing the pipe after END,
             // racing the host's last control byte. The run itself completed.
             runlog(&format!("pipe closed early ({e}); completion already seen"));
+        } else if deferred {
+            // The payload went home without the host's closing byte. That is
+            // expected now: it hands the body over and leaves within a second.
+            // The client log is the only completion signal left, so wait for it
+            // instead of calling this a broken pipe.
+            runlog(&format!("pipe closed early ({e}); waiting on the client log"));
         } else {
             return Err(format!("pipe: {e}"));
         }
-    } else if !done.load(Ordering::Relaxed) && !ended {
-        runlog("session ended without END or sentinel");
-        return Err("session ended before the script reported completion".into());
+    }
+    if !done.load(Ordering::Relaxed) && (deferred || !ended) {
+        // A deferred run is complete when the client writes the sentinel, not
+        // when the payload returns from its hand-off.
+        runlog(if deferred {
+            "deferred run never reported completion"
+        } else {
+            "session ended without END or sentinel"
+        });
+        return Err(if deferred {
+            "script did not report completion (no zendo://done in the client log)".into()
+        } else {
+            "session ended before the script reported completion".into()
+        });
     }
 
     let output = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
