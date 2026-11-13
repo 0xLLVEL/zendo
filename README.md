@@ -657,10 +657,13 @@ one client, one injection per run, client alive at the end:
 layout measurements behind items 30-36 live in `docs/re.md`.
 
 > `getgc` and `getnilinstances` are **not** counted. `gcfill` imports raw GCO
-> pointers into a Lua table, and the collector is free to run between the copy
-> and the script touching them: two live runs returned `139` functions and `887`
-> mixed objects, then the next run killed the client. Both names stay parked
-> until the walk can stop the collector for its own duration.
+> pointers into a Lua table with a type byte attached and creates no collector
+> reference for them. Parking the collector for the walk works (`197` functions,
+> then `1318` mixed objects, one body), but the next body froze the client: those
+> blocks are ordinary garbage to the collector, which may free and reuse them
+> while a table still holds the fake TValues, and then traces that table. Safe
+> import needs every imported object marked reachable for the life of the table.
+> Both names stay parked until that exists.
 
 ### Remaining 40, grouped by blocker
 

@@ -150,6 +150,10 @@ inline int native_api(void* L) {
             return zendo_gc_op(l, op_is(op, oplen, "zendo:gcpage"));
         }
 
+        // Park and re-arm the collector around a walk that imports raw objects.
+        if (op_is(op, oplen, "zendo:gclock")) return zendo_gclock_op(l, true);
+        if (op_is(op, oplen, "zendo:gcunlock")) return zendo_gclock_op(l, false);
+
         // Bulk collector read: writes objects straight into a Lua table array
         // instead of pushing each one through the frame. Same live-heap rules as
         // the page walk, but the imported surface is one table instead of a
@@ -174,6 +178,39 @@ inline int native_api(void* L) {
         // A raw window into a closure's Proto. Nothing here interprets the
         // fields - it hands back the first words so a script can show which
         // offset is which, and the reading is decided from that, not guessed.
+        // FNV-1a over the proto's instruction words. Two functions compiled from
+        // the same source have identical code and therefore the same hash; an
+        // edited body differs on the first changed instruction. Constants and
+        // constants order are deliberately not folded in: the sUNC contract is a
+        // stable identity for the bytecode, and a name or string constant can be
+        // mutated at runtime without changing what the function does.
+        if (op_is(op, oplen, "zendo:fnhash")) {
+            api_step('S', 27);
+            LuaArg a{};
+            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v) return 0;
+            unsigned long long proto = 0, code = 0;
+            if (!read_u64(a.v + 0x18, &proto) || !proto) return 0;
+            if (!read_u64(proto + 0x68, &code) || !code) return 0;
+            unsigned int sizecode = 0;
+            if (!read_u32(proto + 0xA8, &sizecode) || !sizecode) return 0;
+            if (sizecode > 0x40000) sizecode = 0x40000;
+            unsigned int h = 2166136261u;
+            for (unsigned int i = 0; i < sizecode; ++i) {
+                unsigned int w = 0;
+                if (!read_u32(code + 4ull * i, &w)) break;
+                h ^= w & 0xffu;
+                h *= 16777619u;
+                h ^= (w >> 8) & 0xffu;
+                h *= 16777619u;
+                h ^= (w >> 16) & 0xffu;
+                h *= 16777619u;
+                h ^= (w >> 24) & 0xffu;
+                h *= 16777619u;
+            }
+            api_step('E', 27);
+            return lua_ret_num(l, static_cast<double>(h));
+        }
+
         if (op_is(op, oplen, "zendo:proto")) {
             api_step('S', 26);
             LuaArg a{};
@@ -869,6 +906,15 @@ inline int native_api(void* L) {
         // by itself: the host answers with 'q', and the read loop breaks there.
         if (op_is(op, oplen, "zendo:done")) {
             api_step('S', 18);
+            // A body that raised the threshold and then errored must not leave
+            // the collector parked for the rest of the session.
+            {
+                unsigned long long gs = 0;
+                if (read_u64(l + 0x50, &gs) && gs && g_saved_threshold) {
+                    wr64(gs + 0x60, g_saved_threshold);
+                    g_saved_threshold = 0;
+                }
+            }
             HANDLE pipe = g_cap_pipe;
             if (pipe != INVALID_HANDLE_VALUE) {
                 DWORD w = 0;

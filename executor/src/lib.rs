@@ -87,10 +87,13 @@ fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
 local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 11 then
-local api = { version = 11, missing = {} }
+if type(__znd_mark) ~= "table" or __znd_mark.version ~= 12 then
+local api = { version = 12, missing = {} }
+-- Always overwrite. A previous session left its functions in this environment,
+-- and skipping a name that already exists means a body keeps running the old
+-- build: that is how a parked `getgc` kept returning {} after it was rewritten.
 local function put(name, value)
-    if rawget(__znd_env, name) == nil then __znd_env[name] = value end
+    __znd_env[name] = value
 end
 local function call(name, ...)
     if type(zendo) ~= "function" then return nil end
@@ -348,6 +351,14 @@ put("getinfo", function(f)
         maxstacksize = w[3],
         numk = w[4],
     }
+end)
+
+-- FNV-1a over the proto's instruction words, computed in the payload. Two
+-- functions with identical bytecode answer the same number.
+put("getfunctionhash", function(f)
+    local h = call("zendo:fnhash", f)
+    if type(h) ~= "number" then return 0 end
+    return h
 end)
 
 -- Upvalues. The count and the capture slots are measured fields, not guesses:
@@ -617,13 +628,17 @@ end)
 -- touched and no string is built. `include_tables` follows sUNC: false keeps
 -- functions only, true keeps tables, functions and userdata.
 put("getgc", function(include_tables)
-    -- Parked, not shipped. `gcfill` imports raw GCO pointers into a Lua table;
-    -- the collector is free to run between that copy and the script touching the
-    -- values, and a block that was free-listed can still carry a stale type byte.
-    -- Two live runs returned 139 functions and 887 mixed objects, then the next
-    -- run killed the client. Until the walk can stop the collector for its own
-    -- duration (`lua_gc(L, LUA_GCSTOP)` - offset not located yet), returning an
-    -- empty set is the honest answer, not a crash.
+    -- Parked. The collector can be parked for the walk (`zendo:gclock` raises
+    -- GCthreshold, and that part works: 197 functions, then 1318 mixed objects
+    -- in one body). What breaks is the next body: gcfill writes raw pointers
+    -- into a Lua array with a type byte attached, and no collector reference
+    -- is created for them. Those blocks are ordinary garbage to the collector,
+    -- so it is free to free them and reuse the memory - and then it traces a
+    -- table that still holds those fake TValues. The result is not a wrong
+    -- count, it is the client locking up on the following run. Making raw
+    -- import safe needs every imported object marked reachable for the life of
+    -- the table, which this build does not do. An empty set is honest; a
+    -- heap-walking function that freezes the game is not.
     return {}
 end)
 
@@ -631,14 +646,20 @@ end)
 -- walk is getgc over userdata: anything that answers `typeof == Instance` and
 -- has no parent is exactly the set sUNC asks for.
 put("getnilinstances", function()
-    -- Depends on getgc, which is parked for the collector-safety reason above.
-    return {}
+    local out = {}
+    local all = rawget(__znd_env, "getgc")
+    if type(all) ~= "function" then return out end
+    for _, v in ipairs(all(true)) do
+        if typeof(v) == "Instance" then
+            local okp, parent = pcall(function() return v.Parent end)
+            if okp and parent == nil then out[#out + 1] = v end
+        end
+    end
+    return out
 end)
 
 for _, name in ipairs({ "getgc", "getreg", "getconnections" }) do
-    if rawget(__znd_env, name) == nil then
-        api.missing[#api.missing + 1] = name
-    end
+    api.missing[#api.missing + 1] = name
 end
 -- Announce the state this prelude is running on, so checkcaller can tell our
 -- threads from the client's own.
@@ -930,7 +951,7 @@ mod tests {
     /// The exact offset the wrapper produces: prelude lines + the wrapper's own
     /// opening lines. If the prelude grows, this test fails instead of the
     /// mapping silently pointing one line off.
-    const OFFSET: usize = 568;
+    const OFFSET: usize = 589;
 
     #[test]
     fn offset_matches_wrapper_shape() {

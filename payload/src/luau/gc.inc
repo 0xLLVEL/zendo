@@ -235,6 +235,32 @@ inline unsigned int gc_room(unsigned long long L) {
     return static_cast<unsigned int>((limit - top) / 16);
 }
 
+// zendo:gclock / zendo:gcunlock
+//
+// The collector fires when totalbytes >= GCthreshold (global_State+0x60,
+// measured from the struct dump, not guessed from a disassembly). Raising the
+// threshold parks the collector without touching its state machine: nothing is
+// stopped, swept or invalidated, the trigger simply never arrives. Putting the
+// old value back re-arms it. One qword each way, no VM call, so it is safe to
+// do from inside a borrowed frame.
+int zendo_gclock_op(unsigned long long l, bool lock) {
+    unsigned long long gs = 0;
+    if (!read_u64(l + 0x50, &gs) || !gs) return 0;
+    if (lock) {
+        unsigned long long cur = 0, total = 0;
+        if (!read_u64(gs + 0x60, &cur)) return 0;
+        if (!read_u64(gs + 0x68, &total)) return 0;
+        g_saved_threshold = cur;
+        wr64(gs + 0x60, total + (1ull << 40));
+        return lua_ret_num(l, 1.0);
+    }
+    if (g_saved_threshold) {
+        wr64(gs + 0x60, g_saved_threshold);
+        g_saved_threshold = 0;
+    }
+    return lua_ret_num(l, 1.0);
+}
+
 // probe: stage, ttbyte, page, pageSize, blockSize, busy, head, pages, index, tag
 // page: page, startBlock, want -> n, nextBlock, nextPage, then the objects.
 int zendo_gc_op(unsigned long long l, bool walk) {

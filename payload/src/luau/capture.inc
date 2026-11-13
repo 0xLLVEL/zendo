@@ -139,6 +139,11 @@ static int g_api_live = 0;   // the closure slot currently carries our C functio
 // take the dispatcher away from it. cap_print's non-zendo branch is the game's
 // own function, so the client's print path pays one comparison and nothing else.
 static int g_door_perm = 0;
+// Saved global_State GCthreshold, parked while a walk imports raw objects.
+static unsigned long long g_saved_threshold = 0;
+// Defined in luau/gc.inc, which is included after this file. native.inc needs
+// the name before that point, so the declaration lives with the state it reads.
+int zendo_gclock_op(unsigned long long l, bool lock);
 static unsigned int g_cap_calls = 0;
 // The closure is swapped only for the window a chunk of ours is running, and
 // only on the thread running it. Everything else in the client - the game's own
