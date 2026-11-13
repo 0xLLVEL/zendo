@@ -134,6 +134,11 @@ static unsigned int g_loop_n = 0;
 static unsigned int g_seek_n = 0;
 static int g_cap_mode = 0;   // 0 = untouched, 1 = swap only, 2 = +read args, 3 = +pipe
 static int g_api_live = 0;   // the closure slot currently carries our C function
+// Set once the door is installed for good. A deferred body runs after the
+// window that ran its wrapper has closed, so restoring the entry pointer would
+// take the dispatcher away from it. cap_print's non-zendo branch is the game's
+// own function, so the client's print path pays one comparison and nothing else.
+static int g_door_perm = 0;
 static unsigned int g_cap_calls = 0;
 // The closure is swapped only for the window a chunk of ours is running, and
 // only on the thread running it. Everything else in the client - the game's own

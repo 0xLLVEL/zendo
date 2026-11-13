@@ -1,9 +1,28 @@
+inline bool state_is_ours(unsigned long long l) {
+    for (int i = 0; i < g_ours_n; ++i) {
+        if (g_ours[i] == l) return true;
+    }
+    return false;
+}
+
+// A call may reach the dispatcher from a marked state, or when it announces
+// itself. `mark` is the one op that has to work before the state is known -
+// it is what makes the state known - and it only appends an address.
+inline bool call_authorized(unsigned long long l) {
+    if (state_is_ours(l)) return true;
+    unsigned int oplen = 0;
+    char* op = lua_arg_str(l, 0, &oplen);
+    return op && op_is(op, oplen, "zendo:mark");
+}
+
 inline int native_api(void* L) {
     unsigned long long l = reinterpret_cast<unsigned long long>(L);
-    // Only meaningful while a chunk of ours is running on our own thread. A
-    // call that arrives outside that window is a stale reference from the
-    // client, and it gets nothing: no allocation, no Lua walk, no file.
-    if (!g_cap_capture) return 0;
+    // The window is the narrow answer: a chunk of ours is running right now.
+    // The wide answer is a state we have marked. A deferred body outlives the
+    // window its wrapper ran in, and the scheduler resumes it on a state the
+    // wrapper registered before handing it over. A call from anywhere else is
+    // a stale reference and still gets nothing.
+    if (!g_cap_capture && !call_authorized(l)) return 0;
     // A dedicated page, not a static in the image: the write op changes page
     // protection, and touching the page our own code lives on is a variable
     // this test does not need.
@@ -901,16 +920,11 @@ inline int native_loadbytecode(void* L) {
 inline int native_api(void* L);
 
 inline int cap_print(void* L) {
-    // Outside our window: hand straight back to the game's own print. No
-    // capture, no pipe, no file. This is the branch the client takes for every
-    // print it makes on its own.
-    if (!g_cap_capture) {
-        return g_cap_f ? reinterpret_cast<int (*)(void*)>(g_cap_f)(L) : 0;
-    }
     ++g_cap_calls;
     // Every script call that reaches our page passes through here, so this is
-    // also where `zendo:op` is recognised: the first argument names the op,
-    // anything else is ordinary print traffic and falls through to capture.
+    // also where `zendo:op` is recognised. It is checked before the window
+    // branch: a deferred body runs long after the window its wrapper ran in has
+    // closed, and this is the only place its call can arrive.
     {
         unsigned long long b = 0, t = 0;
         read_u64(reinterpret_cast<unsigned long long>(L) + 0x58, &b);
@@ -929,6 +943,12 @@ inline int cap_print(void* L) {
                 }
             }
         }
+    }
+    // Outside our window: hand straight back to the game's own print. No
+    // capture, no pipe, no file. This is the branch the client takes for every
+    // print it makes on its own.
+    if (!g_cap_capture) {
+        return g_cap_f ? reinterpret_cast<int (*)(void*)>(g_cap_f)(L) : 0;
     }
     if (g_cap_mode >= 2) {
         unsigned long long base = 0, top = 0;
@@ -1030,7 +1050,8 @@ inline void cap_restore() {
     // the two sees capture off and falls through to the original.
     g_cap_capture = 0;
     g_cap_tid = 0;
-    if (g_api_live && g_cap_closure && g_cap_f) wr64_live(g_cap_closure + 0x28, g_cap_f);
+    if (!g_door_perm && g_api_live && g_cap_closure && g_cap_f)
+        wr64_live(g_cap_closure + 0x28, g_cap_f);
     g_api_live = 0;
 }
 

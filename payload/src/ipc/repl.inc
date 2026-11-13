@@ -260,12 +260,27 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
                     continue;
                 }
             }
-            // Raw-only setup. A deferred session never reaches this branch, so
-            // it never swaps the print closure and never installs bindings:
-            // one VM entry, the wrapper, and nothing else.
+            // The door: one captured C closure of the client's own, with our
+            // dispatcher installed as its entry. It is installed for good, not
+            // for the window, because a deferred body runs after the window
+            // that handed it over has closed. cap_print falls back to the
+            // original function for anything that is not a zendo op, so the
+            // client's own print path is unchanged.
+            if (!g_cap_closure)
+                exec_raw(a, pipe, o, L, base, kChunkKCaptureBody, kChunkKCaptureLen, "zcapture");
+            if (g_cap_closure && g_cap_f && !g_door_perm) {
+                arm_cfg(a, o, reinterpret_cast<unsigned long long>(&cap_print), "door cfg");
+                g_door_perm = 1;
+                wr64_live(g_cap_closure + 0x28,
+                          reinterpret_cast<unsigned long long>(&cap_print));
+                o.str("door installed clo=");
+                o.hex(g_cap_closure);
+                o.str(" f=");
+                o.hex(g_cap_f);
+                o.nl();
+                flush_out(a, pipe, o);
+            }
             if (cmd[0] != 'd' && !g_bind_ready) {
-                if (!g_cap_closure)
-                    exec_raw(a, pipe, o, L, base, kChunkKCaptureBody, kChunkKCaptureLen, "zcapture");
                 if (g_cap_closure && g_cap_f)
                     arm_cfg(a, o, reinterpret_cast<unsigned long long>(&native_api), "api cfg");
                 if (g_cap_closure && g_cap_f)

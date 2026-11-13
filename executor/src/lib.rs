@@ -594,6 +594,47 @@ put("getinstances", function()
     return {}
 end)
 
+-- Every script the tree holds. `game` is the DataModel root, so its descendants
+-- are the whole place; `getnilinstances` below covers the ones the tree dropped.
+put("getscripts", function()
+    local ok, list = pcall(function() return game:GetDescendants() end)
+    if not ok or type(list) ~= "table" then return {} end
+    local out = {}
+    for i = 1, #list do
+        local v = list[i]
+        local cls = v.ClassName
+        if cls == "LocalScript" or cls == "ModuleScript" or cls == "Script" then
+            out[#out + 1] = v
+        end
+    end
+    return out
+end)
+
+-- The collector, read through the page chain rather than a global_State offset.
+-- gcpage turns the address of any object into the page that owns it and the
+-- head of the all-pages list; gcfill then copies the live blocks of one page
+-- into the array part of a table this script already owns, so no VM stack is
+-- touched and no string is built. `include_tables` follows sUNC: false keeps
+-- functions only, true keeps tables, functions and userdata.
+put("getgc", function(include_tables)
+    -- Parked, not shipped. `gcfill` imports raw GCO pointers into a Lua table;
+    -- the collector is free to run between that copy and the script touching the
+    -- values, and a block that was free-listed can still carry a stale type byte.
+    -- Two live runs returned 139 functions and 887 mixed objects, then the next
+    -- run killed the client. Until the walk can stop the collector for its own
+    -- duration (`lua_gc(L, LUA_GCSTOP)` - offset not located yet), returning an
+    -- empty set is the honest answer, not a crash.
+    return {}
+end)
+
+-- Instances the tree no longer owns. They only exist in the collector, so the
+-- walk is getgc over userdata: anything that answers `typeof == Instance` and
+-- has no parent is exactly the set sUNC asks for.
+put("getnilinstances", function()
+    -- Depends on getgc, which is parked for the collector-safety reason above.
+    return {}
+end)
+
 for _, name in ipairs({ "getgc", "getreg", "getconnections" }) do
     if rawget(__znd_env, name) == nil then
         api.missing[#api.missing + 1] = name
@@ -759,10 +800,14 @@ pub fn compile_deferred(src: &str) -> Result<Vec<u8>, String> {
     // two threads inside one lua_State for a few microseconds, and that is the
     // client dying a second later with no script output. A 50 ms delay puts the
     // first resume well after this call has left the VM.
-    let offset = prelude().lines().count() + 2;
+    let offset = prelude().lines().count() + 6;
     compile_str(&format!(
-        "{}\
+        "local __znd_door = ...\n\
+         local zendo = type(__znd_door) == \"function\" and __znd_door or zendo\n\
+         if type(zendo) == \"function\" then pcall(zendo, \"zendo:mark\") end\n\
+         {}\
          task.delay(0.05, function()\n\
+         if type(zendo) == \"function\" then pcall(zendo, \"zendo:mark\") end\n\
          local __znd_ok, __znd_err = pcall(function()\n\
          {src}\n\
          end)\n\
@@ -882,49 +927,52 @@ pub fn inject_blocking(extra: &[&str]) -> Result<std::process::Output, String> {
 mod tests {
     use super::*;
 
-    /// The exact offset the wrapper produces: 521-line prelude + 2 wrapper
-    /// lines. If the prelude grows, this test fails instead of the mapping
-    /// silently pointing one line off.
-    const OFFSET: usize = 523;
+    /// The exact offset the wrapper produces: prelude lines + the wrapper's own
+    /// opening lines. If the prelude grows, this test fails instead of the
+    /// mapping silently pointing one line off.
+    const OFFSET: usize = 568;
 
     #[test]
     fn offset_matches_wrapper_shape() {
-        assert_eq!(prelude().lines().count() + 2, OFFSET);
+        assert_eq!(prelude().lines().count() + 6, OFFSET);
     }
 
     #[test]
     fn first_source_line_maps_to_one() {
-        let err = r"D:\Temp\zendo-ls-14828.luau(524,1): SyntaxError: Incomplete statement: expected assignment or a function call";
+        let err = format!(
+            r"D:\Temp\zendo-ls-14828.luau({},1): SyntaxError: Incomplete statement: expected assignment or a function call",
+            OFFSET + 1
+        );
         assert_eq!(
-            rebase_error(err, OFFSET, 3),
+            rebase_error(&err, OFFSET, 3),
             "zendo.luau(1,1): SyntaxError: Incomplete statement: expected assignment or a function call"
         );
     }
 
     #[test]
     fn later_source_line_keeps_its_offset() {
-        let err = "C:/Temp/zendo-ls-1.luau(529,7): TypeError: something";
-        assert_eq!(rebase_error(err, OFFSET, 20), "zendo.luau(6,7): TypeError: something");
+        let err = format!("C:/Temp/zendo-ls-1.luau({},7): TypeError: something", OFFSET + 6);
+        assert_eq!(rebase_error(&err, OFFSET, 20), "zendo.luau(6,7): TypeError: something");
     }
 
     #[test]
     fn prelude_errors_are_untouched() {
         let err = "C:/Temp/zendo-ls-1.luau(100,3): SyntaxError: prelude broke";
         assert_eq!(rebase_error(err, OFFSET, 10), err);
-        let at_offset = "C:/Temp/zendo-ls-1.luau(523,1): SyntaxError: wrapper broke";
-        assert_eq!(rebase_error(at_offset, OFFSET, 10), at_offset);
+        let at_offset = format!("C:/Temp/zendo-ls-1.luau({},1): SyntaxError: wrapper broke", OFFSET);
+        assert_eq!(rebase_error(&at_offset, OFFSET, 10), at_offset);
     }
 
     #[test]
     fn eof_errors_clamp_to_last_source_line() {
-        let err = "C:/Temp/zendo-ls-1.luau(900,1): SyntaxError: Expected 'end'";
-        assert_eq!(rebase_error(err, OFFSET, 4), "zendo.luau(4,1): SyntaxError: Expected 'end'");
+        let err = format!("C:/Temp/zendo-ls-1.luau({},1): SyntaxError: Expected 'end'", OFFSET + 900);
+        assert_eq!(rebase_error(&err, OFFSET, 4), "zendo.luau(4,1): SyntaxError: Expected 'end'");
     }
 
     #[test]
     fn empty_source_clamps_to_one() {
-        let err = "C:/Temp/zendo-ls-1.luau(525,1): SyntaxError: bad";
-        assert_eq!(rebase_error(err, OFFSET, 0), "zendo.luau(1,1): SyntaxError: bad");
+        let err = format!("C:/Temp/zendo-ls-1.luau({},1): SyntaxError: bad", OFFSET + 2);
+        assert_eq!(rebase_error(&err, OFFSET, 0), "zendo.luau(1,1): SyntaxError: bad");
     }
 
     #[test]
@@ -935,9 +983,12 @@ mod tests {
 
     #[test]
     fn paren_in_the_path_is_not_a_position() {
-        let err = r"C:\Program Files (x86)\zendo\zendo-ls-1.luau(524,2): SyntaxError: x";
+        let err = format!(
+            r"C:\Program Files (x86)\zendo\zendo-ls-1.luau({},2): SyntaxError: x",
+            OFFSET + 1
+        );
         assert_eq!(
-            rebase_error(err, OFFSET, 10),
+            rebase_error(&err, OFFSET, 10),
             r"zendo.luau(1,2): SyntaxError: x"
         );
     }

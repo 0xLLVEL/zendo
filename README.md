@@ -650,15 +650,23 @@ one client, one injection per run, client alive at the end:
 | 35 | `getthreadidentity` | `8` |
 | 36 | `compareinstances` | `true, false, true` |
 | 37 | `request` | HTTPS 200 body 577 B, gzip 84 B, redirect, 404 |
+| 38 | `getscripts` | `36723` scripts (`36709` ModuleScript, `14` other) from the live place |
+| 39 | `getinstances` | `43616` descendants, `36709` of them ModuleScript |
 
-**37 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
-layout measurements behind items 30–36 live in `docs/re.md`.
+**39 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
+layout measurements behind items 30-36 live in `docs/re.md`.
 
-### Remaining 42, grouped by blocker
+> `getgc` and `getnilinstances` are **not** counted. `gcfill` imports raw GCO
+> pointers into a Lua table, and the collector is free to run between the copy
+> and the script touching them: two live runs returned `139` functions and `887`
+> mixed objects, then the next run killed the client. Both names stay parked
+> until the walk can stop the collector for its own duration.
+
+### Remaining 40, grouped by blocker
 
 | Blocker | Names |
 |---|---|
-| Instance/registry walk (one shared blocker: `CALL` with a `GETTABLEKS` result kills the client) | `getgc`, `getreg`, `getinstances`, `getnilinstances`, `getscripts`, `getrunningscripts`, `getloadedmodules`, `getcallingscript`, `getscriptfromthread`, `getscriptbytecode`, `getscriptclosure`, `getscripthash`, `filtergc`, `gethui`, `gethiddenproperty`, `sethiddenproperty`, `isscriptable`, `setscriptable`, `getcallbackvalue` |
+| Instance/registry walk (one shared blocker: `CALL` with a `GETTABLEKS` result kills the client) | `getgc`, `getreg`, `getnilinstances`, `getrunningscripts`, `getloadedmodules`, `getcallingscript`, `getscriptfromthread`, `getscriptbytecode`, `getscriptclosure`, `getscripthash`, `filtergc`, `gethui`, `gethiddenproperty`, `sethiddenproperty`, `isscriptable`, `setscriptable`, `getcallbackvalue` |
 | Signal layout (`RBXScriptSignal` / connections not measured) | `firesignal`, `getconnections`, `firetouchinterest`, `fireclickdetector`, `fireproximityprompt`, `replicatesignal` |
 | Closure allocation | `newcclosure`, `clonefunction`, `restorefunction`, `isexecutorclosure`, `getfunctionhash` |
 | Proto children / frame walking | `debug.getprotos`, `debug.getproto`, `debug.getstack`, `debug.setstack` |
@@ -677,7 +685,9 @@ layout measurements behind items 30–36 live in `docs/re.md`.
   whose address has not been measured in this build, so the tag is refused and
   the call reports `nil`/`false`.
 - **`getgc`, `getreg`, `getconnections`.** Absent rather than stubbed: a fake
-  would hand a script a function that lies about what it can see.
+  would hand a script a function that lies about what it can see. `getgc` was
+  built and measured, then parked: the walk imports raw pointers with no way to
+  stop the collector for its duration, and that killed the client.
 
 ---
 

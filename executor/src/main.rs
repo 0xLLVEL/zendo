@@ -39,7 +39,7 @@ fn player_log() -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-fn tail(path: &PathBuf, offset: u64, secs: u64) {
+fn tail(path: &PathBuf, offset: u64, secs: u64) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let mut pos = offset;
     let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
@@ -59,6 +59,13 @@ fn tail(path: &PathBuf, offset: u64, secs: u64) {
         let mut w = out.lock();
         for line in String::from_utf8_lossy(&buf).lines() {
             if let Some((_, r)) = line.split_once("[FLog::CreatorOutput] ") {
+                if r.trim() == zendo_core::DONE_SENTINEL {
+                    let _ = w.flush();
+                    return true;
+                }
+                if r.trim_start().starts_with("zendo://") {
+                    continue;
+                }
                 let _ = writeln!(w, "» {r}");
             } else if let Some((_, r)) = line.split_once("[FLog::CreatorWarning] Warning: ") {
                 let _ = writeln!(w, "» warn: {r}");
@@ -66,10 +73,14 @@ fn tail(path: &PathBuf, offset: u64, secs: u64) {
         }
         let _ = w.flush();
     }
+    false
 }
 
 fn usage() -> ! {
-    eprintln!("usage: zendo-exec <run|build|serve> <script.luau|blob.bin> [out.bin]");
+    eprintln!("usage: zendo-exec <run|defer|build|serve> <script.luau|blob.bin> [out.bin]");
+    eprintln!("  run <file>    raw chunk on the borrowed thread (prelude + script)");
+    eprintln!("  defer <file>  same wrapper the UI uses: body on the client scheduler,");
+    eprintln!("                place-gated, waits for the log sentinel and prints output");
     std::process::exit(2);
 }
 
@@ -145,11 +156,29 @@ fn main() {
     if args[1] == "serve" {
         serve(&src);
     }
-    let chunk = match build(&src) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("build failed: {e}");
-            std::process::exit(1);
+    let deferred = args[1] == "defer";
+    let chunk = if deferred {
+        let text = match std::fs::read_to_string(&src) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("read {}: {e}", src.display());
+                std::process::exit(1);
+            }
+        };
+        match zendo_core::compile_deferred(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("build failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match build(&src) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("build failed: {e}");
+                std::process::exit(1);
+            }
         }
     };
     if args[1] == "build" {
@@ -165,7 +194,7 @@ fn main() {
         println!("{}: {} bytes -> {}", src.display(), chunk.len(), dst.display());
         return;
     }
-    if args[1] != "run" {
+    if args[1] != "run" && args[1] != "defer" {
         usage();
     }
     println!("chunk {} bytes, injecting", chunk.len());
@@ -227,7 +256,9 @@ fn main() {
     }
     eprintln!("[z] payload connected");
     let stdout = std::io::stdout();
-    let mode = std::env::var("ZENDO_STEPS").unwrap_or_default();
+    let mode = std::env::var("ZENDO_STEPS").unwrap_or_else(|_| {
+        if deferred { "place,defer".to_string() } else { String::new() }
+    });
     let mut steps: Vec<pipe::Step> = Vec::new();
     if mode.is_empty() {
         steps.push(pipe::Step::Cmd(b'C'));
@@ -250,6 +281,21 @@ fn main() {
                 // read GuardCFDispatchFunctionPointer from the client load config
                 "loadcfg" | "y" => steps.push(pipe::Step::Cmd(b'y')),
                 "chunk" | "L" => steps.push(pipe::Step::Chunk(&chunk)),
+                "defer" | "d" => steps.push(pipe::Step::Defer(&chunk)),
+                // The same gate the UI sends: the place the client says it
+                // joined, so the payload can refuse a chunk that belongs to a
+                // DataModel the transition is still building.
+                "place" | "G" => match zendo_core::place_hint() {
+                    Ok(Some(id)) => {
+                        eprintln!("[z] place {id}");
+                        steps.push(pipe::Step::Place(id));
+                    }
+                    Ok(None) => eprintln!("[z] no place in the log tail"),
+                    Err(why) => {
+                        eprintln!("[z] {why}");
+                        std::process::exit(1);
+                    }
+                },
                 "ident" => {
                     let id: u8 = std::env::var("ZENDO_IDENT")
                         .ok()
@@ -285,9 +331,13 @@ fn main() {
         let secs = std::env::var("ZENDO_TAIL")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(8);
+            .unwrap_or(if deferred { 20 } else { 8 });
         if secs > 0 {
-            tail(&p, log_pos, secs);
+            let seen = tail(&p, log_pos, secs);
+            if deferred && !seen {
+                eprintln!("[z] no completion sentinel in {}s", secs);
+                std::process::exit(1);
+            }
         }
     }
 }
