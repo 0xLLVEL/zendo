@@ -652,8 +652,9 @@ one client, one injection per run, client alive at the end:
 | 37 | `request` | HTTPS 200 body 577 B, gzip 84 B, redirect, 404 |
 | 38 | `getscripts` | `36723` scripts (`36709` ModuleScript, `14` other) from the live place |
 | 39 | `getinstances` | `43616` descendants, `36709` of them ModuleScript |
+| 40 | `getfunctionhash` | identical `x+1` bodies both `1801831113`, `x+2` body `2734704020`, stable across restarts |
 
-**39 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
+**40 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
 layout measurements behind items 30-36 live in `docs/re.md`.
 
 > `getgc` and `getnilinstances` are **not** counted. `gcfill` imports raw GCO
@@ -665,13 +666,13 @@ layout measurements behind items 30-36 live in `docs/re.md`.
 > import needs every imported object marked reachable for the life of the table.
 > Both names stay parked until that exists.
 
-### Remaining 40, grouped by blocker
+### Remaining 39, grouped by blocker
 
 | Blocker | Names |
 |---|---|
 | Instance/registry walk (one shared blocker: `CALL` with a `GETTABLEKS` result kills the client) | `getgc`, `getreg`, `getnilinstances`, `getrunningscripts`, `getloadedmodules`, `getcallingscript`, `getscriptfromthread`, `getscriptbytecode`, `getscriptclosure`, `getscripthash`, `filtergc`, `gethui`, `gethiddenproperty`, `sethiddenproperty`, `isscriptable`, `setscriptable`, `getcallbackvalue` |
 | Signal layout (`RBXScriptSignal` / connections not measured) | `firesignal`, `getconnections`, `firetouchinterest`, `fireclickdetector`, `fireproximityprompt`, `replicatesignal` |
-| Closure allocation | `newcclosure`, `clonefunction`, `restorefunction`, `isexecutorclosure`, `getfunctionhash` |
+| Closure allocation | `newcclosure`, `clonefunction`, `restorefunction`, `isexecutorclosure` |
 | Proto children / frame walking | `debug.getprotos`, `debug.getproto`, `debug.getstack`, `debug.setstack` |
 | Drawing API (not implemented at all) | `cleardrawcache`, `isrenderobj`, `getrenderproperty`, `setrenderproperty` |
 | Host-side work | `getcustomasset` |

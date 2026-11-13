@@ -207,6 +207,41 @@ inline int native_api(void* L) {
                 h ^= (w >> 24) & 0xffu;
                 h *= 16777619u;
             }
+            // The instructions alone are not the function: `x + 1` and `x + 2`
+            // compile to the same ADDK with constant index 0, and only the
+            // constant table tells them apart. Fold the constants in after the
+            // code. Strings are hashed by bytes, not by pointer, or the same
+            // function would answer a different number in every session.
+            unsigned long long k = 0;
+            if (read_u64(proto + 0x60, &k) && k) {
+                unsigned int sizek = 0;
+                if (read_u32(proto + 0xAC, &sizek)) {
+                    if (sizek > 512) sizek = 512;
+                    for (unsigned int i = 0; i < sizek; ++i) {
+                        unsigned long long v = 0, w = 0;
+                        if (!read_u64(k + 16ull * i, &v) || !read_u64(k + 16ull * i + 8, &w)) break;
+                        unsigned int tag = static_cast<unsigned int>((w >> 32) & 0xff);
+                        h ^= tag;
+                        h *= 16777619u;
+                        if (tag == 3) {
+                            for (int b = 0; b < 8; ++b) {
+                                h ^= static_cast<unsigned int>((v >> (8 * b)) & 0xff);
+                                h *= 16777619u;
+                            }
+                        } else if (tag == 6 && v) {
+                            unsigned int len = 0;
+                            if (read_u32(v + 0x14, &len) && len < 4096) {
+                                for (unsigned int b = 0; b < len; ++b) {
+                                    unsigned int ch = 0;
+                                    if (!read_u32(v + 0x18 + b, &ch)) break;
+                                    h ^= ch & 0xffu;
+                                    h *= 16777619u;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             api_step('E', 27);
             return lua_ret_num(l, static_cast<double>(h));
         }
