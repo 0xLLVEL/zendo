@@ -690,8 +690,9 @@ lives in `docs/sunc.md`; the layout measurements behind items 30-36 live in
 | Signal layout (`RBXScriptSignal` / connections not measured) | `firesignal`, `getconnections`, `firetouchinterest`, `fireclickdetector`, `fireproximityprompt`, `replicatesignal` |
 | Closure allocation | `newcclosure`, `clonefunction`, `restorefunction`, `isexecutorclosure` |
 | Drawing API (not implemented at all) | `cleardrawcache`, `isrenderobj`, `getrenderproperty`, `setrenderproperty` |
-| Needs a capability mask, not just a byte | `setthreadidentity` |
-| Namecall state | `getnamecallmethod` |
+| Needs a capability mask, not just a byte | `setthreadidentity` - writing `extras+0x70` with a full capability mask answered `8 -> 2 -> 8 -> 1 -> 8` twice, then the client froze hard on the second run; parked |
+| Namecall state | `getnamecallmethod` - `lua_State+0x18` is measured but never proven; reading it outside a namecall walked an unvalidated pointer, and instance metatables are locked against our Lua-level `hookmetamethod`, so there is no safe context to read it in yet |
+| Instance identity | `cloneref` (a second userdata for the same instance; no allocator yet) |
 
 ### Deliberately not faked
 

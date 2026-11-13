@@ -276,60 +276,11 @@ static HANDLE zendo_pipe_any() {
     return g_ops_pipe;
 }
 
-int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen) {
-    HANDLE pipe = zendo_pipe_any();
+// One compiled answer from the host, loaded and called in the caller's frame,
+// with its values left where Lua expects them. Every answer that has to become
+// a string takes this road: the payload cannot build one, the VM can.
+static int zendo_reply_chunk(unsigned long long l, HANDLE pipe, unsigned int rlen) {
     Api& a = api();
-    g_file_pipe = reinterpret_cast<unsigned long long>(pipe);
-    g_file_err = 0;
-    if (pipe == INVALID_HANDLE_VALUE || !g_base) { g_file_err = 1; return 0; }
-    unsigned int plen = 0;
-    char* path = lua_arg_str(l, 1, &plen);
-    if (!path || !plen || plen > 4096) { g_file_err = 2; return 0; }
-
-    char cmd = 'F';
-    if (op_is(op, oplen, "zendo:isfile")) cmd = 'S';
-    else if (op_is(op, oplen, "zendo:isfolder")) cmd = 'T';
-    else if (op_is(op, oplen, "zendo:mkdir")) cmd = 'M';
-    else if (op_is(op, oplen, "zendo:del")) cmd = 'D';
-    else if (op_is(op, oplen, "zendo:listfiles")) cmd = 'L';
-    else if (op_is(op, oplen, "zendo:asset")) cmd = 'C';
-    else if (op_is(op, oplen, "zendo:filew")) cmd = 'G';
-
-    unsigned int dlen = 0;
-    char* data = nullptr;
-    if (cmd == 'G') {
-        data = lua_arg_str(l, 2, &dlen);
-        if (!data) dlen = 0;
-    }
-
-    char head[48];
-    unsigned int n = 0, q = 0;
-    char digits[12];
-    unsigned int v = 0;
-    head[n++] = cmd;
-    head[n++] = ' ';
-    v = plen;
-    do { digits[q++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v);
-    while (q) head[n++] = digits[--q];
-    if (cmd == 'G') {
-        head[n++] = ' ';
-        v = dlen;
-        do { digits[q++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v);
-        while (q) head[n++] = digits[--q];
-    }
-    head[n++] = '\n';
-
-    DWORD w = 0;
-    if (!a.WriteFile(pipe, head, n, &w, nullptr)) { g_file_err = 3; return 0; }
-    if (!a.WriteFile(pipe, path, plen, &w, nullptr)) { g_file_err = 3; return 0; }
-    if (cmd == 'G' && dlen && !a.WriteFile(pipe, data, dlen, &w, nullptr)) { g_file_err = 3; return 0; }
-
-    char line[64];
-    if (!pipe_line(a, pipe, line, sizeof(line))) { g_file_err = 4; return 0; }
-    if (line[0] == 'A') return lua_ret_num(l, parse_dec(line + 2) ? 1.0 : 0.0);
-    if (line[0] != 'K') { g_file_err = 5; return 0; }
-    unsigned int rlen = parse_dec(line + 2);
-    if (!rlen || rlen > (1u << 20) - 8) return 0;
     unsigned long long buf = load_stage(rlen + 8);
     if (!buf) return 0;
     if (!read_all(a, pipe, reinterpret_cast<void*>(buf + 8), rlen)) return 0;
@@ -392,6 +343,67 @@ int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen) {
     if (got > 4) got = 4;
     return static_cast<int>(got);
 }
+
+int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen) {
+    HANDLE pipe = zendo_pipe_any();
+    Api& a = api();
+    g_file_pipe = reinterpret_cast<unsigned long long>(pipe);
+    g_file_err = 0;
+    if (pipe == INVALID_HANDLE_VALUE || !g_base) { g_file_err = 1; return 0; }
+    unsigned int plen = 0;
+    char* path = lua_arg_str(l, 1, &plen);
+    if (!path || !plen || plen > 4096) { g_file_err = 2; return 0; }
+
+    char cmd = 'F';
+    if (op_is(op, oplen, "zendo:isfile")) cmd = 'S';
+    else if (op_is(op, oplen, "zendo:isfolder")) cmd = 'T';
+    else if (op_is(op, oplen, "zendo:mkdir")) cmd = 'M';
+    else if (op_is(op, oplen, "zendo:del")) cmd = 'D';
+    else if (op_is(op, oplen, "zendo:listfiles")) cmd = 'L';
+    else if (op_is(op, oplen, "zendo:asset")) cmd = 'C';
+    else if (op_is(op, oplen, "zendo:filew")) cmd = 'G';
+
+    unsigned int dlen = 0;
+    char* data = nullptr;
+    if (cmd == 'G') {
+        data = lua_arg_str(l, 2, &dlen);
+        if (!data) dlen = 0;
+    }
+
+    char head[48];
+    unsigned int n = 0, q = 0;
+    char digits[12];
+    unsigned int v = 0;
+    head[n++] = cmd;
+    head[n++] = ' ';
+    v = plen;
+    do { digits[q++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v);
+    while (q) head[n++] = digits[--q];
+    if (cmd == 'G') {
+        head[n++] = ' ';
+        v = dlen;
+        do { digits[q++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v);
+        while (q) head[n++] = digits[--q];
+    }
+    head[n++] = '\n';
+
+    DWORD w = 0;
+    if (!a.WriteFile(pipe, head, n, &w, nullptr)) { g_file_err = 3; return 0; }
+    if (!a.WriteFile(pipe, path, plen, &w, nullptr)) { g_file_err = 3; return 0; }
+    if (cmd == 'G' && dlen && !a.WriteFile(pipe, data, dlen, &w, nullptr)) { g_file_err = 3; return 0; }
+
+    char line[64];
+    if (!pipe_line(a, pipe, line, sizeof(line))) { g_file_err = 4; return 0; }
+    if (line[0] == 'A') return lua_ret_num(l, parse_dec(line + 2) ? 1.0 : 0.0);
+    if (line[0] != 'K') { g_file_err = 5; return 0; }
+    unsigned int rlen = parse_dec(line + 2);
+    if (!rlen || rlen > (1u << 20) - 8) return 0;
+    return zendo_reply_chunk(l, pipe, rlen);
+}
+
+// The namecall state is not read here: `lua_State+0x18` was measured but never
+// proven, and reading it outside a namecall context walked a pointer the payload
+// could not validate. Parked with the closure-allocation group.
 
 // Six strings in, one frame out: url, method, header block, body, body path,
 // header path. The host does the round trip and writes both files, so the only
