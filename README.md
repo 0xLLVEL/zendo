@@ -306,7 +306,7 @@ Ops implemented today (`payload/src/luau/native.inc`, dispatched by `native_api`
 | session | `ping`, `caller`, `mark`, `ident`, `done` |
 | memory | `read`, `readn`, `write`, `peek`, `poke`, `wr8`, `scratch`, `base`, `dm` |
 | instances | `svc`, `svcs` |
-| filesystem | `file`, `filew`, `isfile`, `isfolder`, `mkdir`, `listfiles`, `del` |
+| filesystem | `file`, `filew`, `isfile`, `isfolder`, `mkdir`, `listfiles`, `del`, `asset` |
 | closures | `probe`, `fninfo`, `fnset`, `ref`, `argsum`, `strinfo` |
 | proto / constants | `proto`, `protoscan`, `kget`, `kset` |
 | upvalues | `ucount`, `uget`, `uset` |
@@ -317,6 +317,12 @@ Every read goes through `readable()` (VirtualQuery, `MEM_COMMIT`, no
 `api_write()`, which only asks for a protection change when the page really is
 read-only, computes the range from the page the address sits in, and keeps
 `PAGE_TARGETS_NO_UPDATE` so the CFG bitmap stays intact.
+
+A deferred body runs on the client scheduler after the handshake pipe has closed,
+so file and asset requests made from it would have no stream. The host keeps a
+second server, `\\.\pipe\zendo-ops`, for the life of the process; the payload
+opens it on first use and every later request uses the same framing and the same
+host handlers. Without it `readfile` inside a deferred body answered `nil`.
 
 ### 6. The pipe protocol
 
@@ -342,7 +348,7 @@ Payload → host:
 | `C <len>` + source | the script called `loadstring`; compile now and answer on the same stream |
 | `Q <6 lens>` + six strings | HTTP request forwarded to the host (url, method, headers, body, body path, header path) |
 | `A <0|1>` | filesystem result |
-| `F/G/S/L/T/M/D ...` | filesystem request: read, write, is-file, list, is-folder, mkdir, delete |
+| `F/G/S/L/T/M/D/C ...` | filesystem request: read, write, is-file, list, is-folder, mkdir, delete, content-address an asset |
 
 `loadstring` is answered with `K <len>` + bytecode (or `E <len>` + message). The
 filesystem requests are answered with a *chunk* that returns the bytes as a
@@ -659,9 +665,13 @@ one client, one injection per run, client alive at the end:
 | 44 | `getreg` | VM global table, `160` keys, enumerable with `pairs`, same table as `_G` (Luau's registry *is* the main state's globals) |
 | 45 | `debug.getprotos` | `2` child protos of a closure returning two closures, each a handle `debug.getconstants` accepts |
 | 46 | `debug.getproto` | same handle as `debug.getprotos()[1]`, `debug.getconstants` on it returns `1` |
+| 47 | `getcustomasset` | `t.png` (70 B PNG) published as `content\zendo\5286f514e71b21cb.png` in the running client's version dir; returned `rbxasset://zendo/5286f514e71b21cb.png`; `PreloadAsync` resolves it |
 
-**46 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
-layout measurements behind items 30-36 live in `docs/re.md`.
+**47 / 79.** Items 1-9 and 47 were measured from a deferred body, over the ops
+pipe, twice each with the client alive; the earlier session-pipe evidence for
+the file family is superseded by those runs. The checklist with per-item notes
+lives in `docs/sunc.md`; the layout measurements behind items 30-36 live in
+`docs/re.md`.
 
 > `getgc` and `getnilinstances` are **not** counted. `gcfill` imports raw GCO
 > pointers into a Lua table with a type byte attached and creates no collector
@@ -672,7 +682,7 @@ layout measurements behind items 30-36 live in `docs/re.md`.
 > import needs every imported object marked reachable for the life of the table.
 > Both names stay parked until that exists.
 
-### Remaining 33, grouped by blocker
+### Remaining 32, grouped by blocker
 
 | Blocker | Names |
 |---|---|
@@ -680,7 +690,6 @@ layout measurements behind items 30-36 live in `docs/re.md`.
 | Signal layout (`RBXScriptSignal` / connections not measured) | `firesignal`, `getconnections`, `firetouchinterest`, `fireclickdetector`, `fireproximityprompt`, `replicatesignal` |
 | Closure allocation | `newcclosure`, `clonefunction`, `restorefunction`, `isexecutorclosure` |
 | Drawing API (not implemented at all) | `cleardrawcache`, `isrenderobj`, `getrenderproperty`, `setrenderproperty` |
-| Host-side work | `getcustomasset` |
 | Needs a capability mask, not just a byte | `setthreadidentity` |
 | Namecall state | `getnamecallmethod` |
 

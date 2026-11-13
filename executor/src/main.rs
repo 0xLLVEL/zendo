@@ -311,6 +311,10 @@ fn main() {
     }
     let log = player_log();
     let log_pos = log.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0);
+    // The session pipe dies with the handshake, and a deferred body runs after
+    // it. This second channel stays up for the whole run so a script's file or
+    // asset call still has somewhere to go.
+    pipe::spawn_ops();
     let driven = pipe::drive_wait(&server, &steps, stdout.lock(),
                                   std::env::var_os("ZENDO_RAW").is_none());
     // The payload parks itself after `END` and waits for the next server, so

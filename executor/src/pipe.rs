@@ -425,6 +425,205 @@ fn luau_literal(bytes: &[u8]) -> String {
 
 /// Everything a script names lives under one directory. A path that climbs out
 /// with `..` is rejected rather than resolved: the client is not a shell.
+/// Where `rbxasset://` resolves from. The client in this build reads the
+/// content folder that sits next to the executable it was launched from, so the
+/// newest installed version wins: two version folders can coexist and only one
+/// of them belongs to the process that is running now.
+fn content_root() -> Option<std::path::PathBuf> {
+    let mut parents: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        parents.push(std::path::Path::new(&local).join("Roblox").join("Versions"));
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        parents.push(std::path::Path::new(&home).join("Documents").join("exploitstrap").join("Versions"));
+    }
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for parent in parents {
+        let Ok(entries) = std::fs::read_dir(&parent) else { continue };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let content = dir.join("content");
+            if !content.is_dir() { continue }
+            let stamp = std::fs::metadata(dir.join("RobloxPlayerBeta.exe"))
+                .and_then(|m| m.modified())
+                .or_else(|_| entry.metadata().and_then(|m| m.modified()))
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if best.as_ref().map(|(t, _)| stamp > *t).unwrap_or(true) {
+                best = Some((stamp, content));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Copy one workspace file into the client's content folder and hand back the
+/// `rbxasset://` URI that resolves to it. The name is content-addressed so two
+/// callers publishing the same bytes share one file, and the extension is kept
+/// because the asset loader picks its parser from it.
+fn publish_asset(src: &std::path::Path, bytes: &[u8]) -> std::io::Result<String> {
+    let root = content_root()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no content dir"))?;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let ext = src.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+    let name = if ext.is_empty() {
+        format!("{:016x}", hash)
+    } else {
+        format!("{:016x}.{}", hash, ext)
+    };
+    let dir = root.join("zendo");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(&name), bytes)?;
+    Ok(format!("rbxasset://zendo/{}", name))
+}
+
+/// One filesystem request, answered the same way whoever asked: the payload's
+/// session pipe, or the ops pipe a deferred body uses when the session has
+/// already closed. `ok` is the "A" value, `blob` a chunk that returns the
+/// answer, `reply` an error line.
+struct FsReply {
+    ok: u8,
+    blob: Option<String>,
+    reply: Option<String>,
+}
+
+fn fs_dispatch(cmd: u8, target: Option<std::path::PathBuf>, data: &[u8]) -> FsReply {
+    let mut out = FsReply { ok: 0, blob: None, reply: None };
+    let Some(p) = target else {
+        out.reply = Some("E bad path\n".to_string());
+        return out;
+    };
+    let err = |e: std::io::Error| format!("E {}\n", e.to_string().replace('\n', " "));
+    match cmd {
+        b'F' => match std::fs::read(&p) {
+            Ok(bytes) => out.blob = Some(format!("return {}", luau_literal(&bytes))),
+            Err(e) => out.reply = Some(err(e)),
+        },
+        b'C' => match std::fs::read(&p) {
+            Ok(bytes) => match publish_asset(&p, &bytes) {
+                Ok(uri) => out.blob = Some(format!("return {}", luau_literal(uri.as_bytes()))),
+                Err(e) => out.reply = Some(err(e)),
+            },
+            Err(e) => out.reply = Some(err(e)),
+        },
+        b'S' => out.ok = if p.is_file() { 1 } else { 0 },
+        b'T' => out.ok = if p.is_dir() { 1 } else { 0 },
+        b'M' => out.ok = if std::fs::create_dir_all(&p).is_ok() { 1 } else { 0 },
+        b'D' => {
+            out.ok = if p.is_dir() {
+                std::fs::remove_dir_all(&p).is_ok() as u8
+            } else {
+                std::fs::remove_file(&p).is_ok() as u8
+            };
+        }
+        b'L' => match std::fs::read_dir(&p) {
+            Ok(rd) => {
+                let mut names: Vec<String> = Vec::new();
+                for ent in rd.flatten() {
+                    let name = ent.file_name().to_string_lossy().to_string();
+                    let is_dir = ent.path().is_dir();
+                    names.push(format!("{{\"{}\",{}}}", name.replace('\\', "\\\\").replace('"', "\\\""),
+                                       if is_dir { "true" } else { "false" }));
+                }
+                out.blob = Some(format!("return {{{}}}", names.join(",")));
+            }
+            Err(e) => out.reply = Some(err(e)),
+        },
+        b'G' => {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            out.ok = if std::fs::write(&p, data).is_ok() { 1 } else { 0 };
+        }
+        _ => out.reply = Some("E bad cmd\n".to_string()),
+    }
+    out
+}
+
+/// A second pipe, for requests a script makes after the session that injected
+/// it has ended. A deferred body runs on the client scheduler, seconds after
+/// the handshake closed, and the session pipe is gone by then; without this
+/// channel `readfile` inside such a body answers nil. The server lives in its
+/// own host thread so a script's file call never touches the game thread.
+pub fn spawn_ops() {
+    std::thread::spawn(|| loop {
+        let pipe = match Pipe::create(r"\\.\pipe\zendo-ops") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if pipe.accept().is_err() {
+            continue;
+        }
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        // A script's client dies with the session, not with the host: the next
+        // one connects a minute later. Leaving the accept loop here would end
+        // the thread and every later file call would hang on a dead name.
+        'session: loop {
+            while !acc.contains(&b'\n') {
+                let n = match pipe.read(&mut buf) {
+                    Ok(n) if n > 0 => n,
+                    _ => break 'session,
+                };
+                acc.extend_from_slice(&buf[..n]);
+            }
+            let nl = acc.iter().position(|&c| c == b'\n').unwrap();
+            let line: Vec<u8> = acc.drain(..=nl).collect();
+            let body = &line[..nl];
+            let Some(&cmd) = body.first() else { continue };
+            let fields: Vec<&[u8]> = body[1..]
+                .split(|&c| c == b' ')
+                .filter(|f| !f.is_empty())
+                .collect();
+            let num = |i: usize| -> usize {
+                fields.get(i).and_then(|f| std::str::from_utf8(f).ok())
+                    .and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+            };
+            let plen = num(0);
+            let dlen = if cmd == b'G' { num(1) } else { 0 };
+            if plen == 0 || plen > 4096 || dlen > (1 << 20) {
+                let _ = pipe.write_all(b"E 0\n");
+                continue;
+            }
+            let mut path = vec![0u8; plen];
+            let mut data = vec![0u8; dlen];
+            if take_bytes(&pipe, &mut acc, &mut path).is_err() {
+                break 'session;
+            }
+            if dlen > 0 && take_bytes(&pipe, &mut acc, &mut data).is_err() {
+                break 'session;
+            }
+            let r = fs_dispatch(cmd, fs_path(&path), &data);
+            if let Some(src) = r.blob {
+                match crate::compile_str(&src) {
+                    Ok(blob) => {
+                        if pipe.write_all(format!("K {}\n", blob.len()).as_bytes()).is_err()
+                            || pipe.write_all(&blob).is_err() {
+                            break 'session;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.into_bytes();
+                        if pipe.write_all(format!("E {}\n", msg.len()).as_bytes()).is_err()
+                            || pipe.write_all(&msg).is_err() {
+                            break 'session;
+                        }
+                    }
+                }
+            } else if let Some(line) = r.reply {
+                if pipe.write_all(line.as_bytes()).is_err() {
+                    break 'session;
+                }
+            } else if pipe.write_all(format!("A {}\n", r.ok).as_bytes()).is_err() {
+                break 'session;
+            }
+        }
+    });
+}
+
 fn fs_path(raw: &[u8]) -> Option<std::path::PathBuf> {
     let text = std::str::from_utf8(raw).ok()?;
     if text.is_empty() || text.contains("..") {
@@ -600,6 +799,7 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
             if body.first() == Some(&b'F') || body.first() == Some(&b'G')
                 || body.first() == Some(&b'S') || body.first() == Some(&b'L')
                 || body.first() == Some(&b'T') || body.first() == Some(&b'M')
+                || body.first() == Some(&b'C')
                 || body.first() == Some(&b'D')
             {
                 // Filesystem request from inside the client. The payload cannot
@@ -627,50 +827,10 @@ pub fn drive_until(pipe: &Pipe, steps: &[Step], mut sink: impl Write,
                         take_bytes(pipe, &mut acc, &mut data)?;
                     }
                     let target = fs_path(&path);
-                    let mut reply: Option<String> = None;
-                    let mut blob_src: Option<String> = None;
-                    let mut ok = 0u8;
-                    match (cmd, target) {
-                        (_, None) => {
-                            reply = Some("E bad path\n".to_string());
-                        }
-                        (b'F', Some(p)) => match std::fs::read(&p) {
-                            Ok(bytes) => blob_src = Some(format!("return {}", luau_literal(&bytes))),
-                            Err(e) => reply = Some(format!("E {}\n", e.to_string().replace('\n', " "))),
-                        },
-                        (b'S', Some(p)) => ok = if p.is_file() { 1 } else { 0 },
-                        (b'T', Some(p)) => ok = if p.is_dir() { 1 } else { 0 },
-                        (b'M', Some(p)) => {
-                            ok = if std::fs::create_dir_all(&p).is_ok() { 1 } else { 0 };
-                        }
-                        (b'D', Some(p)) => {
-                            ok = if p.is_dir() {
-                                std::fs::remove_dir_all(&p).is_ok() as u8
-                            } else {
-                                std::fs::remove_file(&p).is_ok() as u8
-                            };
-                        }
-                        (b'L', Some(p)) => match std::fs::read_dir(&p) {
-                            Ok(rd) => {
-                                let mut names: Vec<String> = Vec::new();
-                                for ent in rd.flatten() {
-                                    let name = ent.file_name().to_string_lossy().to_string();
-                                    let is_dir = ent.path().is_dir();
-                                    names.push(format!("{{\"{}\",{}}}", name.replace('\\', "\\\\").replace('"', "\\\""),
-                                                        if is_dir { "true" } else { "false" }));
-                                }
-                                blob_src = Some(format!("return {{{}}}", names.join(",")));
-                            }
-                            Err(e) => reply = Some(format!("E {}\n", e.to_string().replace('\n', " "))),
-                        },
-                        (b'G', Some(p)) => {
-                            if let Some(parent) = p.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            ok = if std::fs::write(&p, &data).is_ok() { 1 } else { 0 };
-                        }
-                        _ => reply = Some("E bad cmd\n".to_string()),
-                    }
+                    let r = fs_dispatch(cmd, target, &data);
+                    let reply = r.reply;
+                    let blob_src = r.blob;
+                    let ok = r.ok;
                     if let Some(src) = blob_src {
                         match crate::compile_str(&src) {
                             Ok(blob) => {

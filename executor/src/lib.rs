@@ -190,6 +190,16 @@ put("readfile", function(path)
     return call("zendo:file", path)
 end)
 
+put("fstate", function() return call("zendo:fstate") end)
+
+-- The client resolves `rbxasset://` against its own content folder, so the file
+-- has to exist there, and only the host can write outside the workspace. The
+-- host copies the bytes under a content address and hands back the URI.
+put("getcustomasset", function(path)
+    if type(path) ~= "string" then return nil end
+    return call("zendo:asset", path)
+end)
+
 put("writefile", function(path, data)
     if type(path) ~= "string" then return nil, "bad path" end
     return call("zendo:filew", path, tostring(data or "")) == 1
@@ -1005,7 +1015,7 @@ mod tests {
     /// The exact offset the wrapper produces: prelude lines + the wrapper's own
     /// opening lines. If the prelude grows, this test fails instead of the
     /// mapping silently pointing one line off.
-    const OFFSET: usize = 643;
+    const OFFSET: usize = 653;
 
     #[test]
     fn offset_matches_wrapper_shape() {
@@ -1120,6 +1130,8 @@ mod place_tests {
         assert_eq!(place_from_log(""), Ok(None));
     }
 }
+
+
 
 
 

@@ -259,13 +259,32 @@ inline int exec_raw(Api& a, HANDLE pipe, Out& o, unsigned long long L,
 // bytes: the payload still has no way to build a Luau string, but the VM builds
 // one from a literal. This op sends the request, loads the reply, calls it, and
 // leaves the result where the caller expects one.
+// A deferred body runs after the handshake that injected it has closed, so the
+// session pipe is gone by then. The ops pipe is the channel that outlives it:
+// same framing, same host handlers, opened on first use and kept.
+static HANDLE g_ops_pipe = INVALID_HANDLE_VALUE;
+
+static HANDLE zendo_pipe_any() {
+    if (g_cap_pipe != INVALID_HANDLE_VALUE) return g_cap_pipe;
+    if (g_ops_pipe == INVALID_HANDLE_VALUE) {
+        Api& a = api();
+        if (!a.CreateFileA) return INVALID_HANDLE_VALUE;
+        g_ops_pipe = a.CreateFileA("\\\\.\\pipe\\zendo-ops",
+                                   GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                   OPEN_EXISTING, 0, nullptr);
+    }
+    return g_ops_pipe;
+}
+
 int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen) {
-    HANDLE pipe = g_cap_pipe;
+    HANDLE pipe = zendo_pipe_any();
     Api& a = api();
-    if (pipe == INVALID_HANDLE_VALUE || !g_base) return 0;
+    g_file_pipe = reinterpret_cast<unsigned long long>(pipe);
+    g_file_err = 0;
+    if (pipe == INVALID_HANDLE_VALUE || !g_base) { g_file_err = 1; return 0; }
     unsigned int plen = 0;
     char* path = lua_arg_str(l, 1, &plen);
-    if (!path || !plen || plen > 4096) return 0;
+    if (!path || !plen || plen > 4096) { g_file_err = 2; return 0; }
 
     char cmd = 'F';
     if (op_is(op, oplen, "zendo:isfile")) cmd = 'S';
@@ -273,6 +292,7 @@ int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen) {
     else if (op_is(op, oplen, "zendo:mkdir")) cmd = 'M';
     else if (op_is(op, oplen, "zendo:del")) cmd = 'D';
     else if (op_is(op, oplen, "zendo:listfiles")) cmd = 'L';
+    else if (op_is(op, oplen, "zendo:asset")) cmd = 'C';
     else if (op_is(op, oplen, "zendo:filew")) cmd = 'G';
 
     unsigned int dlen = 0;
@@ -300,14 +320,14 @@ int zendo_file_op(unsigned long long l, const char* op, unsigned int oplen) {
     head[n++] = '\n';
 
     DWORD w = 0;
-    if (!a.WriteFile(pipe, head, n, &w, nullptr)) return 0;
-    if (!a.WriteFile(pipe, path, plen, &w, nullptr)) return 0;
-    if (cmd == 'G' && dlen && !a.WriteFile(pipe, data, dlen, &w, nullptr)) return 0;
+    if (!a.WriteFile(pipe, head, n, &w, nullptr)) { g_file_err = 3; return 0; }
+    if (!a.WriteFile(pipe, path, plen, &w, nullptr)) { g_file_err = 3; return 0; }
+    if (cmd == 'G' && dlen && !a.WriteFile(pipe, data, dlen, &w, nullptr)) { g_file_err = 3; return 0; }
 
     char line[64];
-    if (!pipe_line(a, pipe, line, sizeof(line))) return 0;
+    if (!pipe_line(a, pipe, line, sizeof(line))) { g_file_err = 4; return 0; }
     if (line[0] == 'A') return lua_ret_num(l, parse_dec(line + 2) ? 1.0 : 0.0);
-    if (line[0] != 'K') return 0;
+    if (line[0] != 'K') { g_file_err = 5; return 0; }
     unsigned int rlen = parse_dec(line + 2);
     if (!rlen || rlen > (1u << 20) - 8) return 0;
     unsigned long long buf = load_stage(rlen + 8);

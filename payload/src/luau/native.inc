@@ -124,7 +124,7 @@ inline int native_api(void* L) {
         if (op_is(op, oplen, "zendo:file") || op_is(op, oplen, "zendo:filew") ||
             op_is(op, oplen, "zendo:isfile") || op_is(op, oplen, "zendo:listfiles") ||
             op_is(op, oplen, "zendo:isfolder") || op_is(op, oplen, "zendo:mkdir") ||
-            op_is(op, oplen, "zendo:del")) {
+            op_is(op, oplen, "zendo:asset") || op_is(op, oplen, "zendo:del")) {
             api_step('S', 25);
             int r = zendo_file_op(l, op, oplen);
             api_step('E', 25);
@@ -295,6 +295,17 @@ inline int native_api(void* L) {
             wr64(l + 0x60, top + 16);
             api_step('E', 32);
             return 1;
+        }
+
+        // Filesystem state, for when a call comes back nil: the pipe handle, the
+        // module base the payload resolved, and the code the last attempt left.
+        if (op_is(op, oplen, "zendo:fstate")) {
+            api_step('S', 35);
+            int r = lua_ret_num(l, static_cast<double>(static_cast<long long>(g_file_pipe)));
+            r += lua_ret_num(l, static_cast<double>(static_cast<long long>(g_base)));
+            r += lua_ret_num(l, static_cast<double>(g_file_err));
+            api_step('E', 35);
+            return r;
         }
 
         // FNV-1a over the proto's instruction words. Two functions compiled from

@@ -144,6 +144,12 @@ static unsigned long long g_saved_threshold = 0;
 // Defined in luau/gc.inc, which is included after this file. native.inc needs
 // the name before that point, so the declaration lives with the state it reads.
 int zendo_gclock_op(unsigned long long l, bool lock);
+
+// The last filesystem attempt, for the `zendo:fstate` probe. A refused call and
+// a call the host never answered both arrive in Lua as nil; this is what tells
+// them apart.
+static unsigned long long g_file_pipe = 0;
+static int g_file_err = 0;
 static unsigned int g_cap_calls = 0;
 // The closure is swapped only for the window a chunk of ours is running, and
 // only on the thread running it. Everything else in the client - the game's own
