@@ -213,7 +213,7 @@ fn main() {
     // instead of a second image.
     let pending = server.begin_accept();
     let mut hijack_child: Option<Child> = None;
-    // An idle payload parks in its reconnect loop for twenty minutes, so a run
+    // An idle payload parks in its reconnect loop for eight seconds, so a run
     // that finds one should join it instead of mapping another image into the
     // same client. The wait is only paid in full when there is no payload;
     // ZENDO_ACCEPT_MS covers a slow client without rebuilding.
