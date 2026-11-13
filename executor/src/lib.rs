@@ -93,8 +93,15 @@ local api = { version = 13, missing = {} }
 -- Always overwrite. A previous session left its functions in this environment,
 -- and skipping a name that already exists means a body keeps running the old
 -- build: that is how a parked `getgc` kept returning {} after it was rewritten.
+-- Every function this prelude installs counts as an executor closure; the weak
+-- table is what isexecutorclosure answers from. Weak keys so a dropped API
+-- function does not stay alive just because we marked it.
+local ours = setmetatable({}, { __mode = "k" })
+-- One restore per hooked closure; hookfunction hands the same closure back.
+local hooked = setmetatable({}, { __mode = "k" })
 local function put(name, value)
     __znd_env[name] = value
+    if type(value) == "function" then ours[value] = true end
 end
 local function call(name, ...)
     if type(zendo) ~= "function" then return nil end
@@ -157,11 +164,22 @@ put("hookfunction", function(old, new)
         return nil, "patch rejected"
     end
     local done = false
-    return old, function()
+    local restore = function()
         if done then return false end
         done = true
         return call("zendo:fnset", old, oe) == 1
     end
+    hooked[old] = restore
+    return old, restore
+end)
+
+-- The restore closure is the one hookfunction built; a second call after it has
+-- already run returns false instead of swapping a stale entry point back in.
+put("restorefunction", function(f)
+    local restore = hooked[f]
+    if restore == nil then return false end
+    hooked[f] = nil
+    return restore()
 end)
 
 -- What a closure IS, decided by where its entry point lives rather than by a
@@ -175,6 +193,9 @@ put("islclosure", function(f)
     local _, _, exec = call("zendo:probe", f)
     return exec == 0
 end)
+put("isexecutorclosure", function(f)
+    return type(f) == "function" and ours[f] == true
+end)
 
 -- `coroutine.wrap` is the only door to a real C closure: the VM allocates a
 -- 0x30+16*n object with tt 8 and isC set, and points f at its own trampoline.
@@ -183,7 +204,7 @@ end)
 put("newcclosure", function(f)
     if type(f) ~= "function" then return f end
     if iscclosure(f) then return f end
-    return coroutine.wrap(function(...)
+    local c = coroutine.wrap(function(...)
         local a = table.pack(...)
         while true do
             local r = table.pack(pcall(f, table.unpack(a, 1, a.n)))
@@ -191,6 +212,8 @@ put("newcclosure", function(f)
             a = table.pack(coroutine.yield(table.unpack(r, 2, r.n)))
         end
     end)
+    ours[c] = true
+    return c
 end)
 
 -- A thread the session gate lifted carries identity 8; a callback the game
@@ -1032,7 +1055,7 @@ mod tests {
     /// The exact offset the wrapper produces: prelude lines + the wrapper's own
     /// opening lines. If the prelude grows, this test fails instead of the
     /// mapping silently pointing one line off.
-    const OFFSET: usize = 670;
+    const OFFSET: usize = 693;
 
     #[test]
     fn offset_matches_wrapper_shape() {
