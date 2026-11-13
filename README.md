@@ -653,8 +653,9 @@ one client, one injection per run, client alive at the end:
 | 38 | `getscripts` | `36723` scripts (`36709` ModuleScript, `14` other) from the live place |
 | 39 | `getinstances` | `43616` descendants, `36709` of them ModuleScript |
 | 40 | `getfunctionhash` | identical `x+1` bodies both `1801831113`, `x+2` body `2734704020`, stable across restarts |
+| 41 | `gethui` | `CoreGui` userdata, `43` children, a `Folder` parented and destroyed there |
 
-**40 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
+**41 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
 layout measurements behind items 30-36 live in `docs/re.md`.
 
 > `getgc` and `getnilinstances` are **not** counted. `gcfill` imports raw GCO
@@ -666,11 +667,11 @@ layout measurements behind items 30-36 live in `docs/re.md`.
 > import needs every imported object marked reachable for the life of the table.
 > Both names stay parked until that exists.
 
-### Remaining 39, grouped by blocker
+### Remaining 38, grouped by blocker
 
 | Blocker | Names |
 |---|---|
-| Instance/registry walk (one shared blocker: `CALL` with a `GETTABLEKS` result kills the client) | `getgc`, `getreg`, `getnilinstances`, `getrunningscripts`, `getloadedmodules`, `getcallingscript`, `getscriptfromthread`, `getscriptbytecode`, `getscriptclosure`, `getscripthash`, `filtergc`, `gethui`, `gethiddenproperty`, `sethiddenproperty`, `isscriptable`, `setscriptable`, `getcallbackvalue` |
+| Instance/registry walk (one shared blocker: `CALL` with a `GETTABLEKS` result kills the client) | `getgc`, `getreg`, `getnilinstances`, `getrunningscripts`, `getloadedmodules`, `getcallingscript`, `getscriptfromthread`, `getscriptbytecode`, `getscriptclosure`, `getscripthash`, `filtergc`, `gethiddenproperty`, `sethiddenproperty`, `isscriptable`, `setscriptable`, `getcallbackvalue` |
 | Signal layout (`RBXScriptSignal` / connections not measured) | `firesignal`, `getconnections`, `firetouchinterest`, `fireclickdetector`, `fireproximityprompt`, `replicatesignal` |
 | Closure allocation | `newcclosure`, `clonefunction`, `restorefunction`, `isexecutorclosure` |
 | Proto children / frame walking | `debug.getprotos`, `debug.getproto`, `debug.getstack`, `debug.setstack` |
@@ -798,3 +799,4 @@ zendo/
 Built against one client build, measured field by field, and honest about what
 is missing. If a function is not on the verified list, it is because the
 structure behind it has not been read yet — not because a stub was good enough.
+
