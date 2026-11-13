@@ -468,6 +468,9 @@ if true then
         -- The client's own debug.getstack answers an empty table from our
         -- threads, so ours has to replace it rather than sit behind a nil check.
         rawset(dbg, "getstack", gstack)
+        rawset(dbg, "setstack", function(level, index, value)
+            return call("zendo:stackset", (level or 1) + 2, index, value) == 1
+        end)
     end)
     if not ok then
         local proxy = setmetatable({}, { __index = dbg })
@@ -480,6 +483,9 @@ if true then
         if rawget(dbg, "setupvalue") == nil then proxy.setupvalue = suv end
         if rawget(dbg, "setconstant") == nil then proxy.setconstant = sk end
         proxy.getstack = gstack
+        proxy.setstack = rawget(dbg, "setstack") or function(level, index, value)
+            return call("zendo:stackset", (level or 1) + 2, index, value) == 1
+        end
         rawset(__znd_env, "debug", proxy)
     end
     if fresh_debug then rawset(__znd_env, "debug", dbg) end
@@ -979,7 +985,7 @@ mod tests {
     /// The exact offset the wrapper produces: prelude lines + the wrapper's own
     /// opening lines. If the prelude grows, this test fails instead of the
     /// mapping silently pointing one line off.
-    const OFFSET: usize = 617;
+    const OFFSET: usize = 623;
 
     #[test]
     fn offset_matches_wrapper_shape() {
@@ -1094,6 +1100,7 @@ mod place_tests {
         assert_eq!(place_from_log(""), Ok(None));
     }
 }
+
 
 
 

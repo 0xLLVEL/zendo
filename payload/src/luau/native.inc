@@ -230,6 +230,51 @@ inline int native_api(void* L) {
             return 1;
         }
 
+        // debug.setstack. A stack slot is a real TValue of a live frame, so the
+        // store is a plain 16-byte copy; the only care is the write barrier, or
+        // an incremental collector can miss the new reference and free a value
+        // that the frame is still using.
+        if (op_is(op, oplen, "zendo:stackset")) {
+            api_step('S', 31);
+            double lvf = 0, idxf = 0;
+            LuaArg val{};
+            if (!lua_arg_num(l, 1, &lvf) || lvf < 1 || lvf > 64) { api_step('E', 31); return 0; }
+            if (!lua_arg_num(l, 2, &idxf) || idxf < 1) { api_step('E', 31); return 0; }
+            if (!lua_arg(l, 3, &val)) { api_step('E', 31); return 0; }
+            unsigned long long ci = 0, base_ci = 0;
+            if (!read_u64(l + 0x70, &ci) || !ci) { api_step('E', 31); return 0; }
+            read_u64(l + 0x28, &base_ci);
+            for (unsigned int k = 0; k < static_cast<unsigned int>(lvf); ++k) {
+                if (ci < 0x10000 + 0x30 || (base_ci && ci <= base_ci)) { api_step('E', 31); return 0; }
+                ci -= 0x30;
+            }
+            unsigned long long base = 0, ftop = 0, ltop = 0;
+            if (!read_u64(ci + 0x0, &base) || !base) { api_step('E', 31); return 0; }
+            if (!read_u64(ci + 0x8, &ftop)) { api_step('E', 31); return 0; }
+            if (!read_u64(l + 0x60, &ltop)) { api_step('E', 31); return 0; }
+            unsigned long long end = ftop && ltop && ltop < ftop ? ltop : ftop;
+            if (end <= base) { api_step('E', 31); return 0; }
+            unsigned long long n = (end - base) / 16;
+            if (idxf > static_cast<double>(n)) { api_step('E', 31); return 0; }
+            unsigned long long slot = base + 16ull * (static_cast<unsigned int>(idxf) - 1);
+            unsigned int tag = static_cast<unsigned int>((val.w >> 32) & 0xff);
+            if (tag >= 6 && val.v && g_base) {
+                unsigned long long gs = 0;
+                if (read_u64(l + 0x50, &gs) && gs) {
+                    typedef void (*BarFn)(void*, void*);
+                    BarFn bar = reinterpret_cast<BarFn>(g_base + 0x2659BA0);
+                    bar(reinterpret_cast<void*>(gs), reinterpret_cast<void*>(val.v));
+                }
+            }
+            if (!wr64_live(slot, val.v) || !wr64_live(slot + 8, val.w)) {
+                api_step('E', 31);
+                return 0;
+            }
+            int r = lua_ret_num(l, 1.0);
+            api_step('E', 31);
+            return r;
+        }
+
         // FNV-1a over the proto's instruction words. Two functions compiled from
         // the same source have identical code and therefore the same hash; an
         // edited body differs on the first changed instruction. Constants and
