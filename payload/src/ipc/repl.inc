@@ -1393,13 +1393,15 @@ inline DWORD serve_session(Api& a, HANDLE pipe, unsigned long long base,
     return 0;
 }
 
-// One injection, as many sessions as the image survives. The session thread
-// waits for the next pipe server instead of ending after one chunk, so a
-// second Execute can reuse the image instead of mapping another one. It is a
-// best-effort reuse: this client kills or suspends foreign threads within
-// seconds of DllMain returning (measured: loop.bin frozen 4 s after a clean
-// session while the process kept running), and when that happens the host
-// injects again, which is safe because the pipe admits one client at a time.
+// One injection, one deferred body. Raw chunks can drive several commands in
+// one session, but `d` hands the body to the client scheduler and breaks: the
+// queue owns that closure from then on, so serving another chunk from this
+// thread would put two writers beside the client's own scheduler. Batching
+// belongs inside the body, not across injections. Measured on 20508: a fifth
+// injection into one process never started its stub (`hijack failed: stub
+// never started`); on 21496 a second injection never connected (`thread gone
+// after patch`, os error 31). One client, one injection, every suite in that
+// one body is the flow that holds.
 inline DWORD run_repl() {
     DWORD st = resolve_api();
     if (st) {
