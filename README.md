@@ -656,8 +656,9 @@ one client, one injection per run, client alive at the end:
 | 41 | `gethui` | `CoreGui` userdata, `43` children, a `Folder` parented and destroyed there |
 | 42 | `debug.getstack` | level 1 window of a function with `a=2, b=3` starts `2, 3, 23` |
 | 43 | `debug.setstack` | slot 3 goes `23` → `999`, and the function itself then returns `999` |
+| 44 | `getreg` | VM global table, `160` keys, enumerable with `pairs`, same table as `_G` (Luau's registry *is* the main state's globals) |
 
-**43 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
+**44 / 79.** The checklist with per-item notes lives in `docs/sunc.md`; the
 layout measurements behind items 30-36 live in `docs/re.md`.
 
 > `getgc` and `getnilinstances` are **not** counted. `gcfill` imports raw GCO
@@ -669,11 +670,11 @@ layout measurements behind items 30-36 live in `docs/re.md`.
 > import needs every imported object marked reachable for the life of the table.
 > Both names stay parked until that exists.
 
-### Remaining 36, grouped by blocker
+### Remaining 35, grouped by blocker
 
 | Blocker | Names |
 |---|---|
-| Instance/registry walk (one shared blocker: `CALL` with a `GETTABLEKS` result kills the client) | `getgc`, `getreg`, `getnilinstances`, `getrunningscripts`, `getloadedmodules`, `getcallingscript`, `getscriptfromthread`, `getscriptbytecode`, `getscriptclosure`, `getscripthash`, `filtergc`, `gethiddenproperty`, `sethiddenproperty`, `isscriptable`, `setscriptable`, `getcallbackvalue` |
+| Instance/registry walk (one shared blocker: `CALL` with a `GETTABLEKS` result kills the client) | `getgc`, `getnilinstances`, `getrunningscripts`, `getloadedmodules`, `getcallingscript`, `getscriptfromthread`, `getscriptbytecode`, `getscriptclosure`, `getscripthash`, `filtergc`, `gethiddenproperty`, `sethiddenproperty`, `isscriptable`, `setscriptable`, `getcallbackvalue` |
 | Signal layout (`RBXScriptSignal` / connections not measured) | `firesignal`, `getconnections`, `firetouchinterest`, `fireclickdetector`, `fireproximityprompt`, `replicatesignal` |
 | Closure allocation | `newcclosure`, `clonefunction`, `restorefunction`, `isexecutorclosure` |
 | Proto children / frame walking | `debug.getprotos`, `debug.getproto` |
@@ -691,7 +692,7 @@ layout measurements behind items 30-36 live in `docs/re.md`.
   nil. A string stored into a GC object needs a write barrier (`luaC_barrier*`)
   whose address has not been measured in this build, so the tag is refused and
   the call reports `nil`/`false`.
-- **`getgc`, `getreg`, `getconnections`.** Absent rather than stubbed: a fake
+- **`getgc`, `getconnections`.** Absent rather than stubbed: a fake
   would hand a script a function that lies about what it can see. `getgc` was
   built and measured, then parked: the walk imports raw pointers with no way to
   stop the collector for its duration, and that killed the client.
@@ -801,6 +802,7 @@ zendo/
 Built against one client build, measured field by field, and honest about what
 is missing. If a function is not on the verified list, it is because the
 structure behind it has not been read yet — not because a stub was good enough.
+
 
 
 

@@ -418,6 +418,13 @@ put("compareinstances", function(a, b)
     return a == b
 end)
 
+-- The registry itself. `_G` here is the script environment, which is not the
+-- table the VM keeps its own references in; this is g->gt, handed over as the
+-- live table it is.
+put("getreg", function()
+    return call("zendo:getreg")
+end)
+
 -- sUNC scores `debug.getconstants`; the native read behind `getconstants` is
 -- the same one. The debug table the client ships may be read-only, so a denied
 -- rawset falls back to a proxy that keeps every other debug field reachable.
@@ -985,7 +992,7 @@ mod tests {
     /// The exact offset the wrapper produces: prelude lines + the wrapper's own
     /// opening lines. If the prelude grows, this test fails instead of the
     /// mapping silently pointing one line off.
-    const OFFSET: usize = 623;
+    const OFFSET: usize = 630;
 
     #[test]
     fn offset_matches_wrapper_shape() {
@@ -1100,6 +1107,7 @@ mod place_tests {
         assert_eq!(place_from_log(""), Ok(None));
     }
 }
+
 
 
 

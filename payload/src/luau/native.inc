@@ -275,6 +275,28 @@ inline int native_api(void* L) {
             return r;
         }
 
+        // The registry is a real LuaTable: it is g->gt, reachable from
+        // lua_State+0x10. Nothing is scanned and nothing is forged - the table
+        // pointer already has a type, so the same 16-byte push `getconstant`
+        // uses hands the script a live reference the collector will mark.
+        if (op_is(op, oplen, "zendo:getreg")) {
+            api_step('S', 32);
+            unsigned long long gt = 0;
+            if (!read_u64(l + 0x10, &gt) || !gt) { api_step('E', 32); return 0; }
+            unsigned long long top = 0, last = 0, cur = 0, citop = 0;
+            if (!read_u64(l + 0x60, &top) || !top) { api_step('E', 32); return 0; }
+            read_u64(l + 0x68, &last);
+            if (read_u64(l + 0x70, &cur) && cur) read_u64(cur + 0x8, &citop);
+            unsigned long long limit = last;
+            if (citop && citop < limit) limit = citop;
+            if (limit && top + 16 > limit) { api_step('E', 32); return 0; }
+            wr64(top, gt);
+            wr64(top + 8, 7ull << 32);
+            wr64(l + 0x60, top + 16);
+            api_step('E', 32);
+            return 1;
+        }
+
         // FNV-1a over the proto's instruction words. Two functions compiled from
         // the same source have identical code and therefore the same hash; an
         // edited body differs on the first changed instruction. Constants and
