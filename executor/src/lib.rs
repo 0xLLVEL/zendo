@@ -86,9 +86,10 @@ pub fn compile(src: &Path) -> Result<Vec<u8>, String> {
 fn prelude() -> &'static str {
     r#"do
 local __znd_env = (getfenv and getfenv()) or _G or {}
-local __znd_mark = rawget(__znd_env, "__zendo_api")
-if type(__znd_mark) ~= "table" or __znd_mark.version ~= 12 then
-local api = { version = 12, missing = {} }
+-- Install on every body, never once per client. A cached table kept running the
+-- previous build's functions; that is how a rewritten `getgc` still answered {}.
+if true then
+local api = { version = 13, missing = {} }
 -- Always overwrite. A previous session left its functions in this environment,
 -- and skipping a name that already exists means a body keeps running the old
 -- build: that is how a parked `getgc` kept returning {} after it was rewritten.
@@ -423,7 +424,15 @@ end)
 -- The upvalue trio rides the same path: it is the same measured read, exposed
 -- under the names sUNC asks for.
 local dbg = rawget(__znd_env, "debug")
-if type(dbg) == "table" then
+local fresh_debug = false
+if type(dbg) ~= "table" then
+    -- Luau inside the client may not expose a debug table at all. Create one
+    -- rather than skip the install, otherwise debug.getconstants and
+    -- debug.getstack simply do not exist for the script.
+    dbg = {}
+    fresh_debug = true
+end
+if true then
     local gc = rawget(__znd_env, "getconstants")
     local one = function(f, i)
         local k = gc(f)
@@ -433,6 +442,20 @@ if type(dbg) == "table" then
     local guv = rawget(__znd_env, "getupvalue")
     local suv = rawget(__znd_env, "setupvalue")
     local sk = rawget(__znd_env, "setconstant")
+    -- debug.getstack: the payload reads the frame window [base, top) and pushes
+    -- each slot back through the same marshal path `getconstant` uses, so every
+    -- value is a real TValue the VM handed over. The client's own debug.getstack
+    -- answers an empty table from our threads, and a skipped install would leave
+    -- that answer in place. +2 skips this wrapper and `call`.
+    local gstack = function(level, index)
+        local lv = (level or 1) + 2
+        if index ~= nil then return call("zendo:stackget", lv, index) end
+        local n = call("zendo:stacklen", lv)
+        if type(n) ~= "number" or n < 1 then return {} end
+        local out = table.create(n)
+        for i = 1, n do out[i] = call("zendo:stackget", lv, i) end
+        return out
+    end
     local ok = pcall(function()
         if rawget(dbg, "getconstants") == nil then
             rawset(dbg, "getconstants", gc)
@@ -442,6 +465,9 @@ if type(dbg) == "table" then
         if rawget(dbg, "getupvalue") == nil then rawset(dbg, "getupvalue", guv) end
         if rawget(dbg, "setupvalue") == nil then rawset(dbg, "setupvalue", suv) end
         if rawget(dbg, "setconstant") == nil then rawset(dbg, "setconstant", sk) end
+        -- The client's own debug.getstack answers an empty table from our
+        -- threads, so ours has to replace it rather than sit behind a nil check.
+        rawset(dbg, "getstack", gstack)
     end)
     if not ok then
         local proxy = setmetatable({}, { __index = dbg })
@@ -453,8 +479,10 @@ if type(dbg) == "table" then
         if rawget(dbg, "getupvalue") == nil then proxy.getupvalue = guv end
         if rawget(dbg, "setupvalue") == nil then proxy.setupvalue = suv end
         if rawget(dbg, "setconstant") == nil then proxy.setconstant = sk end
+        proxy.getstack = gstack
         rawset(__znd_env, "debug", proxy)
     end
+    if fresh_debug then rawset(__znd_env, "debug", dbg) end
 end
 
 put("cloneref", function(ref)
@@ -951,7 +979,7 @@ mod tests {
     /// The exact offset the wrapper produces: prelude lines + the wrapper's own
     /// opening lines. If the prelude grows, this test fails instead of the
     /// mapping silently pointing one line off.
-    const OFFSET: usize = 589;
+    const OFFSET: usize = 617;
 
     #[test]
     fn offset_matches_wrapper_shape() {
@@ -1066,3 +1094,10 @@ mod place_tests {
         assert_eq!(place_from_log(""), Ok(None));
     }
 }
+
+
+
+
+
+
+

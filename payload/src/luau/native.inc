@@ -178,6 +178,58 @@ inline int native_api(void* L) {
         // A raw window into a closure's Proto. Nothing here interprets the
         // fields - it hands back the first words so a script can show which
         // offset is which, and the reading is decided from that, not guessed.
+        // Frames grow upward from base_ci (lua_State+0x28) in 48-byte steps and
+        // lua_State+0x70 is the innermost frame, so a level is a subtraction:
+        // level 1 is the Lua function that called zendo. The window is
+        // [base, min(frameTop, L->top)); the guard keeps a frame whose top was
+        // not refreshed from handing out slots that belong to a newer frame.
+        if (op_is(op, oplen, "zendo:stacklen") || op_is(op, oplen, "zendo:stackget")) {
+            const bool get = op_is(op, oplen, "zendo:stackget");
+            const unsigned int step = get ? 29u : 30u;
+            api_step('S', step);
+            double lvf = 0, idxf = 0;
+            if (!lua_arg_num(l, 1, &lvf) || lvf < 1 || lvf > 64) { api_step('E', step); return 0; }
+            unsigned long long ci = 0, base_ci = 0;
+            if (!read_u64(l + 0x70, &ci) || !ci) { api_step('E', step); return 0; }
+            read_u64(l + 0x28, &base_ci);
+            for (unsigned int k = 0; k < static_cast<unsigned int>(lvf); ++k) {
+                if (ci < 0x10000 + 0x30 || (base_ci && ci <= base_ci)) { api_step('E', step); return 0; }
+                ci -= 0x30;
+            }
+            unsigned long long base = 0, ftop = 0, ltop = 0;
+            if (!read_u64(ci + 0x0, &base) || !base) { api_step('E', step); return 0; }
+            if (!read_u64(ci + 0x8, &ftop)) { api_step('E', step); return 0; }
+            if (!read_u64(l + 0x60, &ltop)) { api_step('E', step); return 0; }
+            unsigned long long end = ftop && ltop && ltop < ftop ? ltop : ftop;
+            if (end <= base) { api_step('E', step); return 0; }
+            unsigned long long n = (end - base) / 16;
+            if (n > 250) n = 250;
+            if (!get) {
+                int r = lua_ret_num(l, static_cast<double>(n));
+                api_step('E', step);
+                return r;
+            }
+            if (!lua_arg_num(l, 2, &idxf) || idxf < 1 || idxf > static_cast<double>(n)) {
+                api_step('E', step);
+                return 0;
+            }
+            unsigned long long slot = base + 16ull * (static_cast<unsigned int>(idxf) - 1);
+            unsigned long long v = 0, w = 0;
+            if (!read_u64(slot, &v) || !read_u64(slot + 8, &w)) { api_step('E', step); return 0; }
+            unsigned long long top = 0, last = 0, cur = 0, citop = 0;
+            if (!read_u64(l + 0x60, &top) || !top) { api_step('E', step); return 0; }
+            read_u64(l + 0x68, &last);
+            if (read_u64(l + 0x70, &cur) && cur) read_u64(cur + 0x8, &citop);
+            unsigned long long limit = last;
+            if (citop && citop < limit) limit = citop;
+            if (limit && top + 16 > limit) { api_step('E', step); return 0; }
+            wr64(top, v);
+            wr64(top + 8, w);
+            wr64(l + 0x60, top + 16);
+            api_step('E', step);
+            return 1;
+        }
+
         // FNV-1a over the proto's instruction words. Two functions compiled from
         // the same source have identical code and therefore the same hash; an
         // edited body differs on the first changed instruction. Constants and
@@ -1140,3 +1192,4 @@ static bool g_flush_next = false;
 
 // The `P` protocol: one line per captured print, written straight to the dev
 // pipe. The UI turns each into a `� ` line.
+
