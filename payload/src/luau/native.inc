@@ -365,12 +365,57 @@ inline int native_api(void* L) {
             return lua_ret_num(l, static_cast<double>(h));
         }
 
+        // Child protos. A Proto is not a Lua value — it has no tag — so the only
+        // honest way to hand one to a script is a handle: the address as a
+        // number, which debug.getconstants/debug.getinfo already accept. The
+        // array is p (+0x50) with sizep at +0xA0; index 0 asks for the count.
+        if (op_is(op, oplen, "zendo:protos")) {
+            api_step('S', 33);
+            LuaArg a{};
+            double idxf = 0;
+            if (!lua_arg(l, 1, &a)) { api_step('E', 33); return 0; }
+            unsigned long long proto = 0;
+            if (((a.w >> 32) & 0xff) == 8 && a.v) {
+                if (!read_u64(a.v + 0x18, &proto)) proto = 0;
+            } else if (((a.w >> 32) & 0xff) == 3 && a.v > 0x10000) {
+                proto = static_cast<unsigned long long>(*reinterpret_cast<const double*>(&a.v));
+            }
+            if (!proto) { api_step('E', 33); return 0; }
+            unsigned int sizep = 0;
+            if (!read_u32(proto + 0xA0, &sizep)) { api_step('E', 33); return 0; }
+            if (sizep > 512) sizep = 512;
+            if (!lua_arg_num(l, 2, &idxf) || idxf < 0) { api_step('E', 33); return 0; }
+            if (idxf == 0) {
+                int r = lua_ret_num(l, static_cast<double>(sizep));
+                api_step('E', 33);
+                return r;
+            }
+            if (idxf > static_cast<double>(sizep)) { api_step('E', 33); return 0; }
+            unsigned long long p = 0;
+            if (!read_u64(proto + 0x50, &p) || !p) { api_step('E', 33); return 0; }
+            unsigned long long child = 0;
+            if (!read_u64(p + 8ull * (static_cast<unsigned int>(idxf) - 1), &child)) {
+                api_step('E', 33);
+                return 0;
+            }
+            int r = lua_ret_num(l, static_cast<double>(child));
+            api_step('E', 33);
+            return r;
+        }
+
         if (op_is(op, oplen, "zendo:proto")) {
             api_step('S', 26);
             LuaArg a{};
-            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v) return 0;
+            // A function is the usual argument; a number is a proto handle
+            // returned by debug.getprotos, so the same read works on children.
+            bool okarg = lua_arg(l, 1, &a);
             unsigned long long proto = 0;
-            if (!read_u64(a.v + 0x18, &proto) || !proto) return 0;
+            if (okarg && ((a.w >> 32) & 0xff) == 8 && a.v) {
+                if (!read_u64(a.v + 0x18, &proto)) proto = 0;
+            } else if (okarg && ((a.w >> 32) & 0xff) == 3 && a.v > 0x10000) {
+                proto = static_cast<unsigned long long>(*reinterpret_cast<const double*>(&a.v));
+            }
+            if (!proto) return 0;
             double startf = 0;
             unsigned int start = 0;
             if (lua_arg_num(l, 2, &startf) && startf > 0 && startf < 0x200) {
@@ -392,11 +437,16 @@ inline int native_api(void* L) {
         if (op_is(op, oplen, "zendo:kget")) {
             api_step('S', 28);
             LuaArg a{};
-            if (!lua_arg(l, 1, &a) || ((a.w >> 32) & 0xff) != 8 || !a.v) return 0;
+            if (!lua_arg(l, 1, &a)) return 0;
             double idxf = 0;
             if (!lua_arg_num(l, 2, &idxf) || idxf < 0 || idxf > 4096) return 0;
             unsigned long long proto = 0, k = 0;
-            if (!read_u64(a.v + 0x18, &proto) || !proto) return 0;
+            if (((a.w >> 32) & 0xff) == 8 && a.v) {
+                if (!read_u64(a.v + 0x18, &proto)) return 0;
+            } else if (((a.w >> 32) & 0xff) == 3 && a.v > 0x10000) {
+                proto = static_cast<unsigned long long>(*reinterpret_cast<const double*>(&a.v));
+            }
+            if (!proto) return 0;
             if (!read_u64(proto + 0x60, &k) || !k) return 0;
             unsigned int sizek = 0;
             read_u32(proto + 0xac, &sizek);
@@ -1259,4 +1309,5 @@ static bool g_flush_next = false;
 
 // The `P` protocol: one line per captured print, written straight to the dev
 // pipe. The UI turns each into a `� ` line.
+
 

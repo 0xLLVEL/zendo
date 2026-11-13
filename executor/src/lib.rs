@@ -478,6 +478,19 @@ if true then
         rawset(dbg, "setstack", function(level, index, value)
             return call("zendo:stackset", (level or 1) + 2, index, value) == 1
         end)
+        -- A proto has no Lua type, so it travels as a handle: the address as a
+        -- number. debug.getconstants and debug.getinfo accept that handle, so a
+        -- script can walk into a child proto without a fake value in the heap.
+        rawset(dbg, "getprotos", function(f)
+            local n = call("zendo:protos", f, 0)
+            if type(n) ~= "number" or n < 1 then return {} end
+            local out = table.create(n)
+            for i = 1, n do out[i] = call("zendo:protos", f, i) end
+            return out
+        end)
+        rawset(dbg, "getproto", function(f, i)
+            return call("zendo:protos", f, i or 1)
+        end)
     end)
     if not ok then
         local proxy = setmetatable({}, { __index = dbg })
@@ -992,7 +1005,7 @@ mod tests {
     /// The exact offset the wrapper produces: prelude lines + the wrapper's own
     /// opening lines. If the prelude grows, this test fails instead of the
     /// mapping silently pointing one line off.
-    const OFFSET: usize = 630;
+    const OFFSET: usize = 643;
 
     #[test]
     fn offset_matches_wrapper_shape() {
@@ -1107,6 +1120,7 @@ mod place_tests {
         assert_eq!(place_from_log(""), Ok(None));
     }
 }
+
 
 
 
