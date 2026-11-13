@@ -666,10 +666,11 @@ one client, one injection per run, client alive at the end:
 | 45 | `debug.getprotos` | `2` child protos of a closure returning two closures, each a handle `debug.getconstants` accepts |
 | 46 | `debug.getproto` | same handle as `debug.getprotos()[1]`, `debug.getconstants` on it returns `1` |
 | 47 | `getcustomasset` | `t.png` (70 B PNG) published as `content\zendo\5286f514e71b21cb.png` in the running client's version dir; returned `rbxasset://zendo/5286f514e71b21cb.png`; `PreloadAsync` resolves it |
+| 48 | `newcclosure` | real C closure (`tt 8`, `isC 1`, `f` inside the image) taken from `coroutine.wrap`; the thread is kept alive by yielding the results back out, so the same closure answers later calls — `8/8` PASS twice |
 
-**47 / 79.** Items 1-9 and 47 were measured from a deferred body, over the ops
-pipe, twice each with the client alive; the earlier session-pipe evidence for
-the file family is superseded by those runs. The checklist with per-item notes
+**48 / 79.** Items 1-9, 47 and 48 were measured from a deferred body, over the
+ops pipe, twice each with the client alive; the earlier session-pipe evidence
+for the file family is superseded by those runs. The checklist with per-item notes
 lives in `docs/sunc.md`; the layout measurements behind items 30-36 live in
 `docs/re.md`.
 
@@ -682,13 +683,13 @@ lives in `docs/sunc.md`; the layout measurements behind items 30-36 live in
 > import needs every imported object marked reachable for the life of the table.
 > Both names stay parked until that exists.
 
-### Remaining 32, grouped by blocker
+### Remaining 31, grouped by blocker
 
 | Blocker | Names |
 |---|---|
 | Instance/registry walk (one shared blocker: `CALL` with a `GETTABLEKS` result kills the client) | `getgc`, `getnilinstances`, `getrunningscripts`, `getloadedmodules`, `getcallingscript`, `getscriptfromthread`, `getscriptbytecode`, `getscriptclosure`, `getscripthash`, `filtergc`, `gethiddenproperty`, `sethiddenproperty`, `isscriptable`, `setscriptable`, `getcallbackvalue` |
 | Signal layout (`RBXScriptSignal` / connections not measured) | `firesignal`, `getconnections`, `firetouchinterest`, `fireclickdetector`, `fireproximityprompt`, `replicatesignal` |
-| Closure allocation | `newcclosure`, `clonefunction`, `restorefunction`, `isexecutorclosure` |
+| Closure allocation | `clonefunction`, `restorefunction`, `isexecutorclosure` |
 | Drawing API (not implemented at all) | `cleardrawcache`, `isrenderobj`, `getrenderproperty`, `setrenderproperty` |
 | Needs a capability mask, not just a byte | `setthreadidentity` - writing `extras+0x70` with a full capability mask answered `8 -> 2 -> 8 -> 1 -> 8` twice, then the client froze hard on the second run; parked |
 | Namecall state | `getnamecallmethod` - `lua_State+0x18` is measured but never proven; reading it outside a namecall walked an unvalidated pointer, and instance metatables are locked against our Lua-level `hookmetamethod`, so there is no safe context to read it in yet |

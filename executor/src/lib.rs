@@ -176,6 +176,23 @@ put("islclosure", function(f)
     return exec == 0
 end)
 
+-- `coroutine.wrap` is the only door to a real C closure: the VM allocates a
+-- 0x30+16*n object with tt 8 and isC set, and points f at its own trampoline.
+-- Its thread dies after the first return, so the body below yields the results
+-- back out instead of returning: the same closure keeps answering later calls.
+put("newcclosure", function(f)
+    if type(f) ~= "function" then return f end
+    if iscclosure(f) then return f end
+    return coroutine.wrap(function(...)
+        local a = table.pack(...)
+        while true do
+            local r = table.pack(pcall(f, table.unpack(a, 1, a.n)))
+            if not r[1] then error(r[2], 0) end
+            a = table.pack(coroutine.yield(table.unpack(r, 2, r.n)))
+        end
+    end)
+end)
+
 -- A thread the session gate lifted carries identity 8; a callback the game
 -- invokes on its own runs at its own level. That is the whole test.
 put("checkcaller", function()
@@ -1015,7 +1032,7 @@ mod tests {
     /// The exact offset the wrapper produces: prelude lines + the wrapper's own
     /// opening lines. If the prelude grows, this test fails instead of the
     /// mapping silently pointing one line off.
-    const OFFSET: usize = 653;
+    const OFFSET: usize = 670;
 
     #[test]
     fn offset_matches_wrapper_shape() {
